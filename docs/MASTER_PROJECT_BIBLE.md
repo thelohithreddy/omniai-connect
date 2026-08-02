@@ -115,9 +115,16 @@ omniai-connect/
 
 ## 9. Documentation index
 
+Root-level companions: **CLAUDE.md** (AI engineering instruction manual — read before
+every AI coding session), **AGENTS.md** (specialized engineering agent roles),
+**PROJECT_STATUS.md** (living tracker — read at session start, updated every milestone).
+
 | Doc | Purpose |
 |---|---|
 | MASTER_PROJECT_BIBLE.md | This file. Source of truth. |
+| ENGINEERING_PRINCIPLES.md | Engineering constitution (numbered principles; conflict order below Bible/ADRs) |
+| CONNECTOR_SPECIFICATION.md | Authoritative Connector Engine spec (expands CONNECTOR_ENGINE.md) |
+| OBSERVABILITY.md | Monitoring strategy: logging, metrics, tracing, alerts, SLOs/error budgets |
 | PRD.md | Product requirements, personas, user journeys |
 | SYSTEM_ARCHITECTURE.md | Components, data flows, deployment topology |
 | DATABASE_DESIGN.md | Schema conventions, core ERD, migration rules |

@@ -11,6 +11,16 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ## [Unreleased]
 
+### Added
+
+- Engineering-foundation documents: `CLAUDE.md` (AI engineering instruction manual),
+  `AGENTS.md` (specialized engineering agent roles), `PROJECT_STATUS.md` (living project
+  tracker) at the repository root; `docs/ENGINEERING_PRINCIPLES.md` (engineering
+  constitution, P-1…P-71), `docs/CONNECTOR_SPECIFICATION.md` (authoritative Connector
+  Engine specification expanding CONNECTOR_ENGINE.md), and `docs/OBSERVABILITY.md`
+  (monitoring strategy, SLOs/SLIs/error budgets). Documentation index updated in the
+  Bible §9. No code, architecture, or business logic changed.
+
 ## [0.1.0] - 2026-08-02
 
 ### Added

@@ -4,6 +4,11 @@
 > storage model per docs/DATABASE_DESIGN.md (`connectors`, `connector_versions`,
 > `tools`, `credentials`).
 >
+> **This document is the overview.** The authoritative engineering specification —
+> full Tool Schema, lifecycle state machine, auth models, retries, rate limiting,
+> plugin architecture — is [CONNECTOR_SPECIFICATION.md](CONNECTOR_SPECIFICATION.md);
+> on conflict for connector internals, the specification wins.
+>
 > Version 1.0 · 2026-08-02
 
 The Connector Engine is product pillar 1 (Bible §3): it ingests any API description,

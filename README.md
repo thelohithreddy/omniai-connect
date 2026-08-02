@@ -58,6 +58,9 @@ Security rules (read before touching credentials): [`docs/SECURITY.md`](docs/SEC
 ## Documentation
 
 Full index in the [Project Bible §9](docs/MASTER_PROJECT_BIBLE.md#9-documentation-index).
+Engineering constitution: [`docs/ENGINEERING_PRINCIPLES.md`](docs/ENGINEERING_PRINCIPLES.md).
+Current state and priorities: [`PROJECT_STATUS.md`](PROJECT_STATUS.md).
+AI engineers (Claude Code, Cursor, etc.) start with [`CLAUDE.md`](CLAUDE.md) and [`AGENTS.md`](AGENTS.md).
 
 ## License
 
