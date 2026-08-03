@@ -15,6 +15,11 @@ dependencies = [
     "redis>=5.2",
     "celery>=5.4",
     "structlog>=24.4",
+    # UUIDv7 primary keys (DATABASE_DESIGN.md §1). Not in the stdlib until Python 3.14.
+    # uuid6 is pure Python (no Rust toolchain, no wheel-availability risk in slim images)
+    # and returns a real uuid.UUID, so it binds directly to SQLAlchemy's Uuid type —
+    # uuid-utils returns a foreign type needing conversion at every boundary. (P-60)
+    "uuid6>=2024.7.10",
 ]
 
 [dependency-groups]

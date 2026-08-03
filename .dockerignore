@@ -1,0 +1,55 @@
+# Build context hygiene. Without this, `docker build .` uploads ~450 MB of node_modules
+# to the daemon on every build — twice per CI run — and busts the layer cache whenever
+# any ignored file changes.
+#
+# Every pattern is `**/`-prefixed. Docker's ignore patterns are ROOT-ANCHORED: a bare
+# `.env` excludes only `./.env` and happily copies `apps/api/.env` into the image. That is
+# a secret-leak vector, not a tidiness issue — verified by building a probe image and
+# finding a nested env file inside it.
+
+# Dependencies (reinstalled inside the image from lockfiles)
+**/node_modules/
+**/.pnpm-store/
+**/.venv/
+**/venv/
+**/__pycache__/
+**/*.py[cod]
+
+# Build output
+**/.next/
+**/out/
+**/dist/
+**/build/
+**/.turbo/
+**/*.egg-info/
+**/*.tsbuildinfo
+
+# Secrets — belt and braces with .gitignore; a build context is not a git checkout
+**/.env
+**/.env.*
+!.env.example
+**/*.pem
+**/*.key
+
+# VCS, CI, docs, and tooling: none of it is needed to build a runnable image
+.git/
+.github/
+docs/
+*.md
+!apps/api/app/domains/README.md
+
+# Test and cache artifacts
+**/coverage/
+**/.coverage
+**/htmlcov/
+**/.pytest_cache/
+**/.ruff_cache/
+**/.mypy_cache/
+
+# Local/editor
+**/.DS_Store
+**/.idea/
+**/.vscode/
+**/*.log
+**/.vercel
+**/.railway

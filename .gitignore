@@ -13,6 +13,9 @@ dist/
 build/
 *.egg-info/
 .turbo/
+# tsc --incremental cache. Machine-specific, ~130 KB, and regenerated on every
+# typecheck — committing it produces noisy diffs and merge conflicts for zero value.
+*.tsbuildinfo
 
 # Env & secrets — NEVER commit
 .env

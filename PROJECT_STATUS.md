@@ -4,17 +4,24 @@
 > AI engineers: read this at session start (per CLAUDE.md). Detail lives in the linked
 > docs — this file is the dashboard, not the archive.
 >
-> **Last updated:** 2026-08-02 · **Updated by:** CTO Agent
+> **Last updated:** 2026-08-04 · **Updated by:** CTO Agent
 
 ## Current phase
 
-**M0 — Foundation: COMPLETE.** Awaiting founder approval to start **M1 — Core platform
-loop** (see docs/ROADMAP.md). No business features exist yet, by design.
+**M1 — Core platform: IN PROGRESS.** M0 complete. M1.1 (tenancy foundation + machine
+identity) merged; the API now authenticates a workspace-scoped token, binds tenant
+context, and serves `GET /v1/workspaces/me` with tenant isolation enforced by repository
+scoping, Postgres RLS (`FORCE`d, transaction-local GUC), and role separation.
+
+**Deliberate sequencing change:** M1 starts with *machine* identity rather than Better
+Auth. The runtime authenticates with workspace-scoped API tokens, not human sessions
+(MCP_RUNTIME.md §2, AI_RUNTIME.md §2.1), so tokens unblock the product's actual hot path
+while leaving the contested half of ADR-0002 — the cross-language shared-secret split —
+open until dashboard work forces the decision. Better Auth moves to M1.2.
 
 ## Current sprint
 
-Sprint 0 (2026-07-27 → 2026-08-02) closed — see docs/SPRINTS.md. Sprint 1 is drafted,
-scoped to M1's first vertical slice, pending kickoff approval.
+Sprint 1 (2026-08-03 → 2026-08-07) in progress — see docs/SPRINTS.md.
 
 ## Completed work
 
@@ -24,12 +31,19 @@ scoped to M1's first vertical slice, pending kickoff approval.
 - Documentation set: 21 docs in docs/ + CLAUDE.md, AGENTS.md, PROJECT_STATUS.md at root
 - Engineering standards locked: coding, API, security, database, branching (ADR-0005)
 - Git repo initialized; foundation committed
+- **M1.1 — tenancy foundation + machine identity** (2026-08-04): `workspaces` and
+  `api_tokens` tables with UUIDv7 PKs and RLS (`ENABLE` + `FORCE`); least-privileged
+  `omniai_app` role; `auth.resolve_api_token` SECURITY DEFINER carve-out; application
+  spine (UnitOfWork, structlog + `request_id`, domain exceptions, error envelope,
+  middleware); `GET /v1/workspaces/me`; Alembic scaffolding; 26 tests including the
+  cross-tenant and connection-reuse isolation suite; CI integration lane on real Postgres
 
 ## Pending work (next up)
 
-All M1 scope — docs/ROADMAP.md is authoritative: workspaces + tenancy plumbing, Better
-Auth integration (ADR-0002), OpenAPI ingestion with api_key auth, Execution Runtime v1,
-audit log, minimal dashboard slice.
+**M1.2** — Better Auth in apps/web + FastAPI session verification (ADR-0002), `members`
+table and role matrix, `api_tokens` issue/revoke endpoints, `/health/ready`.
+**M1.3+** — OpenAPI ingestion with api_key auth, Execution Runtime v1, audit log, minimal
+dashboard slice. docs/ROADMAP.md remains authoritative for M1 scope.
 
 ## Architecture decisions
 
@@ -49,7 +63,11 @@ Full records: docs/DECISIONS.md.
 
 | Item | Why accepted | Pay down by |
 |---|---|---|
-| No lockfiles committed yet (pnpm-lock.yaml, uv.lock) | Generated on first `make setup`; CI uses --no-frozen-lockfile | Sprint 1, then freeze CI installs |
+| ~~No lockfiles committed~~ | **Paid down 2026-08-04**: `uv.lock` committed, CI frozen for both ecosystems | done |
+| `api_tokens` has no `created_by_member_id` | The `members` table lands in M1.2; adding the column + FK later is additive (P-43), and an unconstrained UUID nothing populates is dead weight | M1.2 |
+| Token `scopes` stored but not enforced | Enforcement belongs to the runtime's policy stage, which does not exist yet. Any valid token currently has full workspace access | M1.3 (Execution Runtime v1) |
+| `api_tokens.last_used_at` never written | A write on every authenticated request is write amplification on the hot path; needs throttling or batching before it earns its place | M2, with rate-limit work |
+| `scripts/bootstrap_workspace.py` is a privileged seeding path | Refuses to run when `APP_ENV=production`; deleted once the dashboard can create Workspaces | M1.2 |
 | @omniai/types hand-written | OpenAPI not stable yet | Generate from spec at M2 |
 | packages/config is a placeholder | Only one consumer per config today | When second consumer appears |
 | CI also triggers on `develop` | Transition allowance (ADR-0005) | Remove once staging auto-deploy is live |
@@ -62,18 +80,26 @@ GraphQL + public launch → M5 scale/enterprise. Exit criteria per milestone: do
 
 ## High-priority tasks
 
-1. Founder review + approval of foundation (this gate)
-2. Create GitHub repository and push (blocked — see below); enable branch protection on `main`
-3. Sprint 1 kickoff: tenancy plumbing + Better Auth spike (riskiest integration, do first)
-4. Generate and commit lockfiles; switch CI to frozen installs
+1. **Push to GitHub and confirm CI actually passes.** CI has never executed — the remote
+   exists but nothing has been pushed. The `web` lint job was broken from M0 (no ESLint
+   config; `next lint` prompts interactively and exits non-zero with stdin closed) and was
+   only found by running it locally. Assume more of the same until a run is green.
+2. Enable branch protection on `main` (CODEOWNERS is inert without it).
+3. M1.2: Better Auth + `members` + role matrix; revisit ADR-0002 before writing code
+   against the cross-language shared-secret split.
+4. Decide the private-network egress strategy (ADR-0008). The stated wedge — internal APIs
+   no catalog carries — is currently unimplementable: `CONNECTOR_SPECIFICATION.md` §11
+   hard-fails RFC 1918 hosts at ingestion, and there is no static egress IP pool, VPC
+   peering, or tunnel agent anywhere in the design.
 
 ## Blocked tasks
 
 | Task | Blocked on |
 |---|---|
-| GitHub repo creation + push | GitHub auth on founder's machine (`gh repo create omniai-connect --private --source=. --push`) |
-| Sprint 1 start | Founder approval of M1 scope |
+| CI verification on GitHub | Push to `origin` (remote configured; never pushed) |
+| Branch protection on `main` | Repo being pushed first |
 | Sentry/PostHog/Better Stack project setup | Account provisioning (founder) |
+| Production `omniai_app` role provisioning | Neon project creation; the role is created outside Alembic (it needs a password — P-18) |
 
 ## Known risks
 
@@ -96,8 +122,8 @@ See CLAUDE.md "Folder structure" (kept in one place deliberately). Docs index: B
 
 | Signal | Status |
 |---|---|
-| CI | 🟢 defined; runs on first push to GitHub |
-| Tests | 🟢 API smoke test passing locally |
-| Docs ↔ reality drift | 🟢 none (docs-first stage) |
-| Security posture | 🟢 standards defined; no secrets in repo; enforcement starts with M1 code |
+| CI | 🟡 defined incl. integration lane on real Postgres; still unverified on GitHub (repo not pushed) |
+| Tests | 🟢 26 passing; isolation suite mutation-tested (reintroducing session-scoped `SET` fails it) |
+| Docs ↔ reality drift | 🟡 DATABASE_DESIGN §6 corrected (specified a cross-tenant leak); SPRINTS Sprint 0 corrected (claimed a worker service that does not exist) |
+| Security posture | 🟢 tenant isolation enforced and tested in three layers; no secrets in repo; credential vault still unbuilt (M2) |
 | Delivery risk | 🟡 single engineer-founder pair; bus factor tracked in RISKS.md |
