@@ -13,7 +13,60 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
-- Engineering-foundation documents: `CLAUDE.md` (AI engineering instruction manual),
+- **Tenancy foundation and machine identity (M1.1).** First vertical slice of M1: a
+  workspace-scoped API token authenticates a caller, binds tenant context, and returns the
+  Workspace — with tenant isolation enforced by three independent layers.
+  - Schema (`alembic/versions/0001_tenancy_foundation.py`): `workspaces` and `api_tokens`
+    with UUIDv7 primary keys, `workspace_id NOT NULL`, and indexes leading with
+    `workspace_id`. Row-Level Security is `ENABLE`d **and** `FORCE`d on both, with
+    `tenant_isolation` policies keyed on a transaction-local `app.workspace_id`.
+  - The application connects as `omniai_app` — neither superuser nor table owner, no
+    `BYPASSRLS` — so RLS actually constrains it. The migration refuses to run if that role
+    is missing or is a superuser.
+  - `auth.resolve_api_token`: a single `SECURITY DEFINER` function with a pinned
+    `search_path`, owned by a `NOLOGIN` role, resolving bearer tokens before a workspace is
+    known. The only RLS exemption in the schema.
+  - Application spine: `core/db.py` (async engine, `UnitOfWork`), `core/logging.py`
+    (structlog + `request_id`/`workspace_id` contextvars + secret redaction),
+    `core/exceptions.py`, `core/middleware.py`, `core/security.py`, `core/ids.py`.
+  - `GET /v1/workspaces/me`, the `workspaces` domain (router → service → repository), and
+    the API error envelope applied to every failure path including FastAPI's own.
+  - Alembic scaffolding (async `env.py`); `scripts/bootstrap_workspace.py` for local seeding.
+  - 26 tests: tenant-isolation integration suite (superuser guard, `FORCE` assertion,
+    cross-tenant read/write, connection-reuse leak), token-hashing unit tests, and contract
+    tests for the error envelope.
+
+### Changed
+
+- `Settings` now declares every `.env.example` variable and uses `extra="forbid"` with
+  `SecretStr`; a misspelled or renamed variable is a boot failure rather than a silent
+  fallback to a development default.
+- `api.Dockerfile` split into `dev`/`prod` targets. Production no longer runs
+  `uvicorn --reload`, installs from `uv.lock` with `--frozen`, and omits dev tooling.
+- CI: Postgres + Redis service containers for the integration tier; frozen lockfiles for
+  both ecosystems; single-`alembic heads` check; migration up/down/up verification;
+  Docker jobs now build the **prod** targets.
+- `GET /health` no longer returns `app_env` — it is unauthenticated, so every field is public.
+
+### Fixed
+
+- **`DATABASE_DESIGN.md` §6 specified a cross-tenant leak.** The RLS section called for a
+  *session-scoped* `app.workspace_id`, which survives a pooled connection's return to the
+  pool and is inherited by the next tenant's request; it is also unsupported under
+  transaction-mode poolers (PgBouncer, Neon's pooled endpoint). Corrected to
+  transaction-local `SET LOCAL`, with `FORCE ROW LEVEL SECURITY`, role separation, and the
+  token-resolution exemption documented. A regression test asserts the behavior.
+- **The web production image could never build.** `web.Dockerfile`'s `prod` stage copies
+  `.next/standalone`, which Next.js only emits when `output: "standalone"` is configured —
+  it was not. CI built only the `dev` target, so this was invisible.
+- `.dockerignore` added: build context dropped from ~453 MB to ~5 kB.
+- Credential master key naming reconciled to `CREDENTIAL_MASTER_KEY` across `.env.example`
+  and `SECURITY.md` (was `CREDENTIAL_ENCRYPTION_KEY` in the former).
+- `apps/api/app/db/` removed in favour of `core/db.py` as specified in BACKEND_SPEC.md §1.
+
+### Added — engineering-foundation documents
+
+- `CLAUDE.md` (AI engineering instruction manual),
   `AGENTS.md` (specialized engineering agent roles), `PROJECT_STATUS.md` (living project
   tracker) at the repository root; `docs/ENGINEERING_PRINCIPLES.md` (engineering
   constitution, P-1…P-71), `docs/CONNECTOR_SPECIFICATION.md` (authoritative Connector

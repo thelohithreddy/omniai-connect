@@ -5,10 +5,11 @@ WORKDIR /repo
 
 # ---- deps ----
 FROM base AS deps
-COPY package.json pnpm-workspace.yaml ./
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
 COPY apps/web/package.json apps/web/
 COPY packages/types/package.json packages/types/
-RUN pnpm install --no-frozen-lockfile
+# --frozen-lockfile: reproducible builds are the point of committing a lockfile (P-59).
+RUN pnpm install --frozen-lockfile
 
 # ---- dev (used by docker-compose) ----
 FROM deps AS dev

@@ -7,10 +7,16 @@ services:
       POSTGRES_USER: omniai
       POSTGRES_PASSWORD: omniai
       POSTGRES_DB: omniai
+      # Consumed by the init script below to provision the least-privileged app role.
+      APP_DB_USER: omniai_app
+      APP_DB_PASSWORD: omniai_app
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      # Runs once, on first initialisation of an empty data directory. After changing
+      # anything here: docker compose down -v && make dev
+      - ./infra/docker/postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U omniai"]
       interval: 5s
@@ -31,9 +37,13 @@ services:
     build:
       context: .
       dockerfile: infra/docker/api.Dockerfile
+      target: dev
     env_file: .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://omniai:omniai@db:5432/omniai
+      # The app connects as the non-superuser, non-owner role so RLS actually applies.
+      DATABASE_URL: postgresql+asyncpg://omniai_app:omniai_app@db:5432/omniai
+      # Alembic only. Owns the schema; never serves a request.
+      DATABASE_ADMIN_URL: postgresql+asyncpg://omniai:omniai@db:5432/omniai
       REDIS_URL: redis://redis:6379/0
     ports:
       - "8000:8000"
@@ -44,6 +54,12 @@ services:
         condition: service_healthy
     volumes:
       - ./apps/api:/app
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   web:
     build:
@@ -54,7 +70,8 @@ services:
     ports:
       - "3000:3000"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
     volumes:
       - ./apps/web:/repo/apps/web
       - /repo/apps/web/node_modules

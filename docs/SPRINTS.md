@@ -33,19 +33,47 @@ Owners: Uday (CEO), Claude (CTO).
 
 ---
 
-## Sprint 1 (2026-08-03 → 2026-08-07) · Milestone M1 — *planned*
+## Sprint 1 (2026-08-03 → 2026-08-07) · Milestone M1 — *in progress*
 
-**Goal:** *(to set Monday 2026-08-03)* First vertical slice of M1: Better Auth in
-apps/web, FastAPI token verification producing a Member + Workspace context, and the
-Workspace/Member tables with `workspace_id` scoping in place.
+**Goal:** M1.1 — tenancy foundation and machine identity: a workspace-scoped API token
+authenticates a caller, binds tenant context, and returns its Workspace, with isolation
+proven by an automated cross-tenant suite.
 
-**Candidate scope (from ROADMAP.md M1):**
-- Better Auth setup in apps/web (email + one social provider).
-- FastAPI middleware: verify signed session token → Member + Workspace context (ADR-0002).
-- Alembic migrations: `workspaces`, `members` with the tenancy mixin; RLS enabled.
-- Skeleton of the `connectors` domain package + event bus wiring.
+**Scope change from the plan.** The drafted sprint opened with Better Auth. Reordered to
+machine identity first: the runtime authenticates with workspace-scoped tokens rather than
+human sessions (MCP_RUNTIME.md §2), so tokens unblock the product's real hot path, and
+deferring keeps the contested half of ADR-0002 — the cross-language shared-secret split —
+open until dashboard work forces it. Better Auth and `members` move to M1.2.
 
-**Shipped / Partial / Learnings / Carry-over:** — *(filled Friday 2026-08-07)*
+**Shipped:**
+- `workspaces` + `api_tokens` (UUIDv7 PKs, `workspace_id NOT NULL`, workspace-leading
+  indexes); RLS `ENABLE` + `FORCE` with transaction-local `app.workspace_id`.
+- Least-privileged `omniai_app` role (non-superuser, non-owner, no `BYPASSRLS`); migration
+  preflight refuses to run otherwise.
+- `auth.resolve_api_token` — one `SECURITY DEFINER` function, pinned `search_path`, owned
+  by a `NOLOGIN` role — resolving the bootstrap paradox of looking up a token before the
+  workspace it names is known.
+- Application spine: UnitOfWork, structlog with `request_id`/`workspace_id` contextvars and
+  secret redaction, domain exception hierarchy, uniform error envelope, request middleware.
+- `GET /v1/workspaces/me`; Alembic scaffolding; 26 tests; CI integration lane on real
+  Postgres with migration up/down/up verification.
+
+**Also fixed (found during implementation, not planned):**
+- DATABASE_DESIGN.md §6 specified a *session-scoped* RLS GUC — a cross-tenant leak.
+- `web.Dockerfile`'s prod stage could never build (`output: "standalone"` was unset).
+- No `.dockerignore`: every build shipped ~453 MB of context.
+
+**Carry-over to M1.2:** Better Auth, `members` + role matrix, api-token issue/revoke
+endpoints, `/health/ready`.
+
+**Learnings:**
+- Postgres RLS has two bypasses, not one — superuser *and* table owner. A suite that only
+  asserts positive cases, run as either, passes while the system leaks. The guard test and
+  role separation are what make the isolation suite mean anything.
+- Mutation-testing the security tests (reintroducing the bug and watching them fail) was
+  worth more than adding more of them.
+- Doc-first design caught the right architecture and still shipped a specified leak. Specs
+  need executable assertions, not just review.
 
 ---
 
@@ -62,7 +90,10 @@ foundational tooling decisions.
 - Documentation set: MASTER_PROJECT_BIBLE, SYSTEM_ARCHITECTURE, DECISIONS
   (ADR-0001…0007), PRD, ROADMAP, SPRINTS, COMPETITOR_ANALYSIS, RISKS.
 - CI on GitHub Actions: lint, type-check, tests, Gitleaks secret scanning; green on `main`.
-- Docker: local development stack builds and runs (web, api, worker, Postgres, Redis).
+- Docker: local development stack builds and runs (web, api, Postgres, Redis).
+  *(Corrected 2026-08-04: this line originally claimed a `worker` service. No Celery worker
+  exists in docker-compose.yml and none was written. Recorded rather than quietly edited —
+  a sprint log that overstates what shipped is worse than no sprint log.)*
 - Tooling locked: uv for Python deps (ADR-0006); trunk-based branching (ADR-0005).
 
 **Partial / Dropped:** none — M0 exit criteria met (see ROADMAP.md).

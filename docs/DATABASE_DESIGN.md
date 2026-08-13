@@ -74,7 +74,8 @@ request; machine identity does not (see `api_tokens`).
 Workspace-scoped machine credentials for AI clients and Interfaces (MCP, REST, SDKs) —
 distinct from human sessions per ADR-0002. Columns: `id`, `workspace_id`,
 `created_by_member_id`, `name`, `token_hash` (SHA-256 of the secret; plaintext shown
-once at creation, never stored), `token_prefix` (first 8 chars, for display and lookup),
+once at creation, never stored), `token_prefix` (first 12 chars — the `omc_` marker plus
+8 random chars — for display; lookup is by `token_hash`),
 `scopes` (`jsonb`), `last_used_at NULL`, `expires_at NULL`, `revoked_at NULL`,
 timestamps. Unique on `token_hash`.
 
@@ -194,11 +195,65 @@ From milestone M1, every tenant table gets:
 
 ```sql
 ALTER TABLE tools ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tools FORCE  ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON tools
-  USING (workspace_id = current_setting('app.workspace_id')::uuid);
+  USING      (workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid)
+  WITH CHECK (workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid);
 ```
 
-The session-scoped `app.workspace_id` GUC is set by the UnitOfWork when a request's
-workspace context is bound. Application roles do not hold `BYPASSRLS`; only the
-migration role does. RLS policies are created in Alembic migrations like any other DDL
-and covered by integration tests that assert cross-tenant reads return zero rows.
+This is the exact expression the migrations use; copy it verbatim. Each piece is
+load-bearing:
+
+- **`current_setting(..., true)`** — the second argument is `missing_ok`. Without it, an
+  unset GUC *raises*, so every query outside a bound request becomes a 500 instead of an
+  empty result set.
+- **`NULLIF(..., '')`** — `current_setting` can yield `''` rather than `NULL`, and
+  `''::uuid` raises. `NULLIF` converts it to `NULL`, and `workspace_id = NULL` is `NULL`,
+  which the policy treats as false. Fail closed to zero rows.
+- **`WITH CHECK`** — `USING` alone filters reads. Without `WITH CHECK`, a bound tenant can
+  still *insert* rows attributed to another workspace: a write-side leak that read-only
+  tests never catch.
+
+**`FORCE` is not optional.** `ENABLE` alone exempts the table *owner* from its own
+policies. Without `FORCE`, an app connecting as the owner reads every tenant's rows while
+the policy sits there looking correct.
+
+**The `app.workspace_id` GUC is transaction-local (`SET LOCAL`), never session-scoped.**
+The UnitOfWork issues `SET LOCAL app.workspace_id = …` inside the request's transaction,
+so the value dies at COMMIT/ROLLBACK. A session-scoped `SET` survives the connection's
+return to the pool, and the next checkout — a different tenant — silently inherits it;
+that is a cross-tenant read with a green test suite. Transaction-local scoping is also the
+only variant that works through a transaction-mode pooler (PgBouncer, and therefore Neon's
+pooled endpoint), where session state is not preserved between transactions.
+
+**Role separation.** Tables are owned by the migration role; the application connects as a
+separate role that is neither superuser nor owner. There are **two** unconditional RLS
+bypasses and both must be excluded:
+
+| Bypass | Stopped by `FORCE`? | How we exclude it |
+|---|---|---|
+| `rolsuper` (superuser) | No | App role is not a superuser; migration preflight refuses otherwise |
+| `rolbypassrls` | No | App role does not hold `BYPASSRLS`; migration preflight refuses otherwise |
+| Table ownership | Yes | App role owns nothing, *and* `FORCE` is set anyway |
+
+`BYPASSRLS` is the easy one to miss: a role can be a non-superuser, own nothing, and still
+read every tenant's rows. A suite that asserts only `rolsuper = false` passes green while
+isolation is entirely disabled. The integration suite therefore asserts **both** flags are
+false for its own connection before asserting anything about isolation.
+
+**Documented exemption.** Credentials that arrive without a workspace context (§4:
+`api_tokens.token_hash`) cannot be resolved under RLS, since the policy needs the workspace
+the lookup is trying to discover. Exactly one `SECURITY DEFINER` function per such lookup
+performs it, and its shape is deliberate: the function is owned by a dedicated **`NOLOGIN`
+role** (`omniai_auth`) that no one can connect as, and the table carries a second policy
+targeted `TO` that role alone. This grants the exemption through ordinary policy targeting
+rather than through `BYPASSRLS` — which needs superuser to grant and is frequently
+unavailable on managed Postgres. The function pins `SET search_path`, without which a
+caller controlling `search_path` could shadow the target table and have the function read
+it under another role's privileges. `EXECUTE` is revoked from `PUBLIC` and granted only to
+the application role. No other code path is exempt, and each exemption is reviewed as a
+security change.
+
+RLS policies are created in Alembic migrations like any other DDL and covered by
+integration tests that assert cross-tenant reads return zero rows, including after
+connection reuse.

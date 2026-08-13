@@ -33,14 +33,29 @@ Prereqs: Docker, Node 20+, pnpm 9, Python 3.11+, [uv](https://docs.astral.sh/uv/
 
 ```bash
 cp .env.example .env        # fill in local values
-make setup                  # install JS + Python deps
 make dev                    # full stack via Docker (db, redis, api, web)
+make migrate                # apply schema migrations
+make seed                   # create a Workspace + API token (printed once)
 ```
 
-Or run pieces individually: `make dev-api`, `make dev-web`. All commands: `make help`.
+Then call the API with the token it printed:
+
+```bash
+curl -H "Authorization: Bearer omc_…" http://localhost:8000/v1/workspaces/me
+```
 
 - Web: http://localhost:3000
 - API: http://localhost:8000 (docs at /docs)
+
+All commands: `make help`. `make db-reset` recreates the database volume from scratch —
+needed after changing anything in `infra/docker/postgres-init/`, since Postgres runs those
+scripts only when initialising an empty data directory.
+
+> **Why two database roles?** The app connects as `omniai_app`, which is neither a
+> superuser nor the owner of any table. Postgres exempts both from Row-Level Security, so
+> connecting as either would silently disable tenant isolation while every policy still
+> looked correct. Migrations run as the owner via `DATABASE_ADMIN_URL`.
+> See [`docs/DATABASE_DESIGN.md`](docs/DATABASE_DESIGN.md) §6.
 
 ## Development
 
