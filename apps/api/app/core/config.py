@@ -9,9 +9,23 @@ Two rules this module enforces mechanically rather than by convention:
    is a hard boot failure, not a shrug. Previously `extra="ignore"` meant a renamed or
    misspelled variable fell back to a default silently, which for `database_url` means
    "quietly connect to localhost in production".
-2. `SecretStr` on every secret — its repr is `**********`, so a stray f-string, a
-   `model_dump()` in a debug log, or a Sentry frame local cannot leak the value
-   (SECURITY.md §2.3: omission is the design, redaction is the backstop).
+2. `SecretStr` on every secret **that is consumed as a bare value** — its repr is
+   `**********`, so a stray f-string, a `model_dump()` in a debug log, or a Sentry frame
+   local cannot leak it (SECURITY.md §2.3: omission is the design, redaction is the
+   backstop).
+
+   Two deliberate exceptions, called out because SECURITY.md §1.1 classifies DB URLs as
+   secret assets and a Postgres DSN embeds the role password: `database_url` and
+   `database_admin_url` are plain `str`. They are handed straight to
+   `create_async_engine`, so `SecretStr` would mean `.get_secret_value()` at every
+   construction site — including Alembic's env and the test fixtures — which trades a
+   real leak surface for six easy-to-forget unwrapping calls.
+
+   Be aware of what that costs: the log redactor in `core.logging` matches on *key
+   names*, and neither `database_url` nor `database_admin_url` contains one of its
+   markers, so a `settings.model_dump()` written to a log would emit both DSNs verbatim.
+   Nothing in the codebase does that today. Do not add it, and do not assume the backstop
+   covers these two fields.
 """
 
 from typing import Literal

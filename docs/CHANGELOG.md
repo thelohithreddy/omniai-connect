@@ -32,7 +32,7 @@ entries move into a versioned section at release tag time (ADR-0005).
   - `GET /v1/workspaces/me`, the `workspaces` domain (router → service → repository), and
     the API error envelope applied to every failure path including FastAPI's own.
   - Alembic scaffolding (async `env.py`); `scripts/bootstrap_workspace.py` for local seeding.
-  - 26 tests: tenant-isolation integration suite (superuser guard, `FORCE` assertion,
+  - 42 tests: tenant-isolation integration suite (superuser guard, `FORCE` assertion,
     cross-tenant read/write, connection-reuse leak), token-hashing unit tests, and contract
     tests for the error envelope.
 
