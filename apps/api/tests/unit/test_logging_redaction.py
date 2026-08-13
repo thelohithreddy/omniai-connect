@@ -15,15 +15,34 @@ import io
 import pytest
 import structlog
 
+from app.core.config import settings
 from app.core.logging import REDACTED, configure_logging, redact_secrets
 
 
-def _emit(**kwargs: object) -> str:
+@pytest.fixture(autouse=True)
+def _verbose_logging() -> object:
+    """Force a permissive log level for the duration of each test.
+
+    Without this the suite is environment-dependent: CI sets LOG_LEVEL=warning, structlog's
+    filtering bound logger drops `.info()` entirely, and every assertion runs against an
+    empty string — which passes the "secret not in output" half and fails the rest for the
+    wrong reason.
+    """
+    original = settings.log_level
+    settings.log_level = "debug"
     configure_logging()
+    yield
+    settings.log_level = original
+    configure_logging()
+
+
+def _emit(**kwargs: object) -> str:
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         structlog.get_logger("test").info("event", **kwargs)
-    return buf.getvalue()
+    out = buf.getvalue()
+    assert out, "nothing was emitted — the log level filtered the event out"
+    return out
 
 
 def test_secret_named_keys_are_redacted() -> None:
@@ -45,7 +64,6 @@ def test_exception_text_is_redacted() -> None:
 
     If `redact_secrets` runs before it, this leaks.
     """
-    configure_logging()
     buf = io.StringIO()
     try:
         raise ValueError("upstream rejected: api_key=SUPERSECRET123")
