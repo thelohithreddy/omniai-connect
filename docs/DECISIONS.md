@@ -105,3 +105,48 @@ usage aggregation. All tasks idempotent.
 
 **Consequences:** Celery's asyncio story is imperfect; long-running/stateful agent
 workflows may justify a workflow engine later — that would be a new ADR.
+
+---
+
+## ADR-0008 — Database role separation and a single SECURITY DEFINER exemption for tenancy
+**Status:** Accepted · 2026-08-13
+
+**Context:** ADR-0004 chose shared-schema tenancy with `workspace_id` + RLS, but did not
+say *which database role the application connects as*, and did not anticipate the
+bootstrap paradox in credential lookup. Both turned out to be load-bearing.
+
+Postgres has **two** unconditional RLS bypasses, and `FORCE ROW LEVEL SECURITY` stops
+neither: `rolsuper` and `rolbypassrls`. Table ownership is a third bypass that `FORCE`
+*does* stop. An application connecting as a superuser, as `BYPASSRLS`, or as the table
+owner without `FORCE` reads every tenant's rows while the policies sit there looking
+correct — and an isolation test suite run on such a connection passes green.
+
+Separately: resolving a workspace-scoped API token is what *discovers* the workspace, so
+the lookup cannot run under a policy that already requires it. The tempting workaround —
+`USING (... OR current_setting('app.workspace_id', true) IS NULL)` — disables isolation
+for every unbound query in the system.
+
+**Decision:**
+
+1. **Three roles.** The migration role owns the schema and runs Alembic. The application
+   connects as `omniai_app`: not a superuser, not an owner, no `BYPASSRLS`. A third role,
+   `omniai_auth`, is `NOLOGIN` and exists only to own the token-resolution function.
+   `omniai_app` is provisioned outside Alembic because it needs a password, and a password
+   in a migration is a secret in git (P-18).
+2. **`FORCE ROW LEVEL SECURITY` on every tenant table**, in addition to `ENABLE`.
+3. **The migration refuses to run** if `omniai_app` is missing, is a superuser, or holds
+   `BYPASSRLS`. The integration suite asserts the same two flags before asserting anything
+   about isolation.
+4. **Exactly one RLS exemption**, and it is granted through ordinary policy targeting
+   rather than `BYPASSRLS`: a policy `TO omniai_auth` plus a `SECURITY DEFINER` function
+   owned by that role, with `SET search_path` pinned and `EXECUTE` revoked from `PUBLIC`.
+   Deliberately avoids `BYPASSRLS`, which requires superuser to grant and is frequently
+   unavailable on managed Postgres (Neon).
+5. **Every future exemption requires an ADR** and is reviewed as a security change.
+
+**Consequences:** Deploying to a new environment now has a prerequisite step — creating
+`omniai_app` — which belongs in the platform runbook, not in a migration. `SET search_path`
+on the function is mandatory: without it a caller controlling `search_path` could shadow
+the target table and have the function read it under another role's privileges. The
+mechanism generalises to any future lookup that must run before a tenant is known
+(SECURITY.md §3, DATABASE_DESIGN.md §6).

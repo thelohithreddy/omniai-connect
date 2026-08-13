@@ -55,7 +55,7 @@ open until dashboard work forces it. Better Auth and `members` move to M1.2.
   workspace it names is known.
 - Application spine: UnitOfWork, structlog with `request_id`/`workspace_id` contextvars and
   secret redaction, domain exception hierarchy, uniform error envelope, request middleware.
-- `GET /v1/workspaces/me`; Alembic scaffolding; 26 tests; CI integration lane on real
+- `GET /v1/workspaces/me`; Alembic scaffolding; 42 tests; CI integration lane on real
   Postgres with migration up/down/up verification.
 
 **Also fixed (found during implementation, not planned):**

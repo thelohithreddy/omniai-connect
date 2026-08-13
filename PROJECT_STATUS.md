@@ -21,7 +21,7 @@ open until dashboard work forces the decision. Better Auth moves to M1.2.
 
 ## Current sprint
 
-Sprint 1 (2026-08-03 → 2026-08-07) in progress — see docs/SPRINTS.md.
+Sprint 1 (2026-08-03 → 2026-08-07): M1.1 merged to `main` as 35e1e91; CI green — see docs/SPRINTS.md.
 
 ## Completed work
 
@@ -35,7 +35,7 @@ Sprint 1 (2026-08-03 → 2026-08-07) in progress — see docs/SPRINTS.md.
   `api_tokens` tables with UUIDv7 PKs and RLS (`ENABLE` + `FORCE`); least-privileged
   `omniai_app` role; `auth.resolve_api_token` SECURITY DEFINER carve-out; application
   spine (UnitOfWork, structlog + `request_id`, domain exceptions, error envelope,
-  middleware); `GET /v1/workspaces/me`; Alembic scaffolding; 26 tests including the
+  middleware); `GET /v1/workspaces/me`; Alembic scaffolding; 42 tests including the
   cross-tenant and connection-reuse isolation suite; CI integration lane on real Postgres
 
 ## Pending work (next up)
@@ -80,11 +80,9 @@ GraphQL + public launch → M5 scale/enterprise. Exit criteria per milestone: do
 
 ## High-priority tasks
 
-1. **Push to GitHub and confirm CI actually passes.** CI has never executed — the remote
-   exists but nothing has been pushed. The `web` lint job was broken from M0 (no ESLint
-   config; `next lint` prompts interactively and exits non-zero with stdin closed) and was
-   only found by running it locally. Assume more of the same until a run is green.
-2. Enable branch protection on `main` (CODEOWNERS is inert without it).
+1. Enable branch protection on `main` (CODEOWNERS is inert without it). Note: branch
+   protection is unavailable on this plan for a private repo — either upgrade or accept
+   that merges are unguarded.
 3. M1.2: Better Auth + `members` + role matrix; revisit ADR-0002 before writing code
    against the cross-language shared-secret split.
 4. Decide the private-network egress strategy (ADR-0008). The stated wedge — internal APIs
@@ -96,8 +94,7 @@ GraphQL + public launch → M5 scale/enterprise. Exit criteria per milestone: do
 
 | Task | Blocked on |
 |---|---|
-| CI verification on GitHub | Push to `origin` (remote configured; never pushed) |
-| Branch protection on `main` | Repo being pushed first |
+| Branch protection on `main` | GitHub plan — unavailable for private repos on the current tier |
 | Sentry/PostHog/Better Stack project setup | Account provisioning (founder) |
 | Production `omniai_app` role provisioning | Neon project creation; the role is created outside Alembic (it needs a password — P-18) |
 
@@ -122,7 +119,7 @@ See CLAUDE.md "Folder structure" (kept in one place deliberately). Docs index: B
 
 | Signal | Status |
 |---|---|
-| CI | 🟡 defined incl. integration lane on real Postgres; still unverified on GitHub (repo not pushed) |
+| CI | 🟢 4 jobs green on `main` @ 35e1e91 (run 31727376094), incl. the integration lane on real Postgres |
 | Tests | 🟢 26 passing; isolation suite mutation-tested (reintroducing session-scoped `SET` fails it) |
 | Docs ↔ reality drift | 🟡 DATABASE_DESIGN §6 corrected (specified a cross-tenant leak); SPRINTS Sprint 0 corrected (claimed a worker service that does not exist) |
 | Security posture | 🟢 tenant isolation enforced and tested in three layers; no secrets in repo; credential vault still unbuilt (M2) |

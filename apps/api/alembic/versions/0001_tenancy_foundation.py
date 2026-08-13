@@ -104,9 +104,14 @@ def upgrade() -> None:
             server_default=sa.text("now()"),
             nullable=False,
         ),
-        sa.CheckConstraint(
-            "plan IN ('free', 'pro', 'team', 'enterprise')", name="ck_workspaces_plan_valid"
-        ),
+        # Named `plan_valid`, NOT `ck_workspaces_plan_valid`. Base.metadata's naming
+        # convention renders `ck_%(table_name)s_%(constraint_name)s` and is applied on top
+        # of whatever name is passed here, so the longer form produced
+        # `ck_workspaces_ck_workspaces_plan_valid` in the database while the ORM model
+        # rendered `ck_workspaces_plan_valid` — a silent ORM/schema divergence that
+        # `alembic check` does not catch, because autogenerate does not compare CHECK
+        # constraints.
+        sa.CheckConstraint("plan IN ('free', 'pro', 'team', 'enterprise')", name="plan_valid"),
         sa.PrimaryKeyConstraint("id", name="pk_workspaces"),
         sa.UniqueConstraint("slug", name="uq_workspaces_slug"),
     )
