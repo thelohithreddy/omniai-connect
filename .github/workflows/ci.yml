@@ -117,6 +117,15 @@ jobs:
   security:
     name: Security — secret scan
     runs-on: ubuntu-latest
+    # This repository's default GITHUB_TOKEN is read-only over contents/metadata/packages.
+    # On a `pull_request` event gitleaks-action calls GET /repos/{o}/{r}/pulls/{n}/commits
+    # to scan only the PR's commits, which needs `pull-requests: read` — without it the
+    # action dies on a 403 ("Resource not accessible by integration") *before scanning
+    # anything*, so the job fails without ever having looked for a secret.
+    # Granted at job level, not workflow level, so no other job gains the scope.
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
         with:
