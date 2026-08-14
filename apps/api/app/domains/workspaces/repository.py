@@ -242,6 +242,29 @@ class MemberRepository:
         member: Member | None = await self._session.scalar(stmt)
         return member
 
+    async def list_page(self, *, limit: int, after: CursorPosition | None = None) -> list[Member]:
+        """One page of this Workspace's Members, newest first.
+
+        Added rather than paginating `list_for_workspace`, which stays exactly as M1.2-B
+        shipped it: that method is unpaginated and ascending, other code depends on it, and
+        API_GUIDELINES.md §3 governs *endpoints*, not every internal read.
+
+        Ordered `(created_at DESC, id DESC)` per §4's default sort, with `id` as the
+        tiebreak because a keyset predicate over a non-unique key skips or repeats rows —
+        two members added in the same microsecond would tie. `id` is UUIDv7, so it orders in
+        agreement with creation time, and `(workspace_id, id)` is already unique.
+
+        `ix_members_workspace_id` narrows to the tenant; no `(workspace_id, created_at)`
+        composite is added because members-per-workspace is bounded by team size, and an
+        index chosen for a table that will hold tens of rows is speculative (P-44 is
+        satisfied by the existing workspace-leading index).
+        """
+        stmt = select(Member).where(Member.workspace_id == self._ctx.workspace_id)
+        if after is not None:
+            stmt = stmt.where(tuple_(Member.created_at, Member.id) < (after.created_at, after.id))
+        stmt = stmt.order_by(Member.created_at.desc(), Member.id.desc()).limit(limit)
+        return list((await self._session.scalars(stmt)).all())
+
     async def list_for_workspace(self) -> list[Member]:
         """Every Member of the current Workspace.
 

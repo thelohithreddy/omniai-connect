@@ -114,3 +114,54 @@ class ApiTokenList(BaseModel):
         description="Opaque; pass back as `?cursor=`. Null when `has_more` is false.",
     )
     has_more: bool
+
+
+class MemberRead(BaseModel):
+    """A Member as returned to a caller holding `members:manage`.
+
+    Deliberately narrow. `invited_by` is omitted for the same reason `ApiTokenRead` omits
+    `created_by_member_id`: exposing provenance is an information-disclosure decision no
+    canonical document has made, and it is not needed to manage a Workspace's members.
+    Adding it later is additive; removing it after clients depend on it is not.
+
+    `user_id` is the Better Auth subject (DATABASE_DESIGN.md §3). It is the only handle an
+    administrator has for identifying who a Member is, so a management API that withheld it
+    could not be used to manage anything.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    user_id: str
+    role: str
+    created_at: datetime
+
+
+class MemberRoleUpdate(BaseModel):
+    """The entire mutable surface of a Member: its role.
+
+    `role` is typed as a plain `str`, not an enum or `Literal`, on purpose. The canonical
+    role domain already exists twice — the `members.role` CHECK constraint and
+    `models.MEMBER_ROLES` — and `MemberService._require_valid_role` validates against the
+    latter. Restating the four values here would create a third copy that could drift from
+    the database, and the failure mode of drift is a role that validates at the door and is
+    rejected by the constraint as a 500.
+
+    `extra="forbid"` so an attempt to PATCH `user_id`, `workspace_id`, or `invited_by` is a
+    400 rather than a silent no-op that leaves the caller believing it worked.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    role: str = Field(description="One of the canonical member roles.")
+
+
+class MemberList(BaseModel):
+    """The list envelope from API_GUIDELINES.md §3 — identical in shape to `ApiTokenList`."""
+
+    data: list[MemberRead]
+    next_cursor: str | None = Field(
+        default=None,
+        description="Opaque; pass back as `?cursor=`. Null when `has_more` is false.",
+    )
+    has_more: bool

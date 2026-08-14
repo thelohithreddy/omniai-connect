@@ -21,6 +21,7 @@ Version 1.0 · 2026-08-02
 | `/v1/connections` | Connection |
 | `/v1/tools` | Tool |
 | `/v1/tool-calls` | Tool Call |
+| `/v1/members` | Member (a user's membership in a Workspace, with a role) |
 | `/v1/api-tokens` | Workspace-scoped API token (machine identity, ADR-0002) |
 
 - Nesting is shallow: at most one level (`/v1/connections/{id}/tools`); deeper

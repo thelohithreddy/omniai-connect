@@ -198,7 +198,29 @@ they resolve no role and every check denies. Treating a token as its workspace's
 as the member who created it, would be a confused deputy. Machine authorization is the
 token's own `scopes` field — a separate mechanism, not yet enforced.
 
-### 4.3 API token issuance
+### 4.3 Member management
+
+`GET /v1/members`, `PATCH /v1/members/{id}` and `DELETE /v1/members/{id}` require
+`members:manage`, so only an `owner` or `admin` may read the roster or change it.
+
+- **A role change binds on the target's very next request.** Authorization reads the role
+  from the persisted row every time (§4.2), so a demotion takes effect immediately — there
+  is no cached role and nothing to invalidate.
+- **No role-transition rules are enforced**, and none are invented: whether an admin may
+  re-role an owner, and whether the last owner may be demoted or removed, are open
+  questions §4.1 does not answer. Recorded rather than decided.
+- **A machine token cannot read or change the roster.** Listing members is reconnaissance,
+  re-roling one is escalation, and removing one is denial of service; machine identity
+  resolves to no membership (ADR-0002), so all three deny.
+- **A Member from another Workspace is byte-identical to one that never existed** (`404`,
+  §3) on both mutating endpoints, so the API is not an existence oracle for other tenants.
+- **Removing a Member does not revoke the API tokens they created.** Those are
+  workspace-owned credentials; the composite FK clears provenance with
+  `ON DELETE SET NULL` and revocation stays a separate, explicit act (§4.5).
+- The response exposes `id`, `user_id`, `role` and `created_at` only — never `workspace_id`
+  or `invited_by`.
+
+### 4.4 API token issuance
 
 `POST /v1/api-tokens` requires `api_tokens:manage`, so only an `owner` or `admin` may mint
 a machine credential. Three properties hold at that endpoint:
@@ -220,7 +242,7 @@ Tokens are currently issued **unscoped** (`scopes = []`). A scope vocabulary is 
 defined (ADR-0010) — and `[]` is the deny-by-default
 value, not a placeholder meaning "everything".
 
-### 4.4 API token listing
+### 4.5 API token listing
 
 `GET /v1/api-tokens` requires `api_tokens:manage` — the same capability as issuance, because
 no separate read capability exists in §4.1 and inventing one would widen the policy without
@@ -242,7 +264,7 @@ a decision. It is treated as an information-disclosure boundary:
   names a Workspace, and the pagination cursor carries a position rather than an authority
   (ADR-0011), so a forged cursor cannot cross a tenant boundary.
 
-### 4.5 API token revocation
+### 4.6 API token revocation
 
 `DELETE /v1/api-tokens/{id}` requires `api_tokens:manage` and returns 204.
 

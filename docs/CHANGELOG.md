@@ -13,6 +13,22 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Member management endpoints (M1.3-A).** `GET /v1/members`, `PATCH /v1/members/{id}`,
+  `DELETE /v1/members/{id}` behind `members:manage` — the router layer M1.2-C deliberately
+  left unbuilt. No migration; no change to `MemberService`'s business rules.
+  - Keyset cursor pagination per API_GUIDELINES.md §3, ordered `(created_at DESC, id DESC)`,
+    reusing `core/pagination.py` from M1.2-G. Unknown query parameters are a
+    `validation_error` (§4).
+  - `MemberRoleUpdate.role` is a plain `str`, not a `Literal`: the canonical role domain
+    already exists as the `members.role` CHECK constraint and `MEMBER_ROLES`, and a third
+    copy in a schema could drift from the database.
+  - A role change binds on the target's next request — proven by promoting a member and
+    watching a previously-403 call return 200.
+  - `DELETE` answers 404 for a Member that is absent *or* foreign, byte-identical. §2's
+    "deleting a deleted resource is 204" cannot hold simultaneously with its own
+    cross-tenant-404 rule for a hard-deleted row; security wins, matching ADR-0012.
+  - 53 tests; 22 adversarial mutations with zero survivors.
+
 - **Readiness probe (M1.2-K).** `GET /health/ready` verifies the two dependencies
   OBSERVABILITY.md §6 names — PostgreSQL `SELECT 1` and a Redis `PING` — each bounded at 2 s
   and run concurrently. 200 `{"status":"ready"}` / 503 `{"status":"not_ready"}`.

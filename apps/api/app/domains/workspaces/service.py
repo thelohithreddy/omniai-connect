@@ -101,6 +101,34 @@ class MemberService:
             raise NotFoundError("Member not found.")
         return member
 
+    async def list_members_page(
+        self, *, limit: int = DEFAULT_LIMIT, cursor: str | None = None
+    ) -> MemberPage:
+        """One page of this Workspace's Members, newest first.
+
+        Mirrors `ApiTokenService.list_tokens` exactly, including the over-fetch: asking for
+        `limit + 1` and discarding the extra answers "is there another page?" from the same
+        snapshot as the page itself, which a separate `count(*)` cannot do — it would be a
+        second scan taken at a different instant, and a member added between the two makes
+        them disagree.
+
+        The cursor is decoded before the query runs, so an unusable one is a
+        `ValidationFailedError` rather than a silently empty page (§3).
+        """
+        position = decode_cursor(cursor) if cursor is not None else None
+        page_size = resolve_limit(limit)
+
+        rows = await self._repository.list_page(limit=page_size + 1, after=position)
+
+        has_more = len(rows) > page_size
+        members = rows[:page_size]
+        next_cursor = (
+            encode_cursor(CursorPosition(created_at=members[-1].created_at, id=members[-1].id))
+            if has_more and members
+            else None
+        )
+        return MemberPage(members=members, next_cursor=next_cursor, has_more=has_more)
+
     async def list_members(self) -> list[Member]:
         """Every Member of this Workspace.
 
@@ -192,6 +220,15 @@ def _require_valid_role(role: str) -> str:
             details={"role": role, "allowed": list(MEMBER_ROLES)},
         )
     return role
+
+
+@dataclass(frozen=True, slots=True)
+class MemberPage:
+    """One page of Members plus the cursor that continues it (API_GUIDELINES.md §3)."""
+
+    members: list[Member]
+    next_cursor: str | None
+    has_more: bool
 
 
 @dataclass(frozen=True, slots=True)
