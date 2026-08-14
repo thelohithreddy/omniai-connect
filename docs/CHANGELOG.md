@@ -13,6 +13,20 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Readiness probe (M1.2-K).** `GET /health/ready` verifies the two dependencies
+  OBSERVABILITY.md §6 names — PostgreSQL `SELECT 1` and a Redis `PING` — each bounded at 2 s
+  and run concurrently. 200 `{"status":"ready"}` / 503 `{"status":"not_ready"}`.
+  - `/health` is unchanged and still checks nothing external, which is the point: a
+    dependency blip must withdraw a process from the load balancer, not convince the
+    orchestrator to kill every healthy process. Proven by stopping PostgreSQL and Redis for
+    real — liveness stayed 200 while readiness returned 503, and both recovered.
+  - Unauthenticated, no tenant context, no writes, no transaction left open, and no
+    `app.workspace_id` left on a pooled connection.
+  - The failure body names no dependency; diagnosis goes to the structured log (ADR-0013).
+  - `check_readiness` is total: a probe that raises yields 503, never a 500 with a traceback
+    on an unauthenticated endpoint. That defect was found by this module's own tests.
+  - 21 tests; 19 adversarial mutations with zero survivors.
+
 - **Token lifecycle verification (M1.2-J).** 18 integration tests exercising create →
   authenticate → list → revoke → denied as one system, through the real endpoints, the real
   resolver and real PostgreSQL. Test-only: no production code changed.

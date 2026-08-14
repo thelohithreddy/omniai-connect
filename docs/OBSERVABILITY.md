@@ -107,9 +107,14 @@ not tribal memory; test alerts fire monthly so silence means healthy, not broken
 
 - **Now:** `GET /health` liveness on the API — process up, event loop responsive. No
   dependency checks, so a Neon blip doesn't restart-loop healthy processes.
-- **M1:** `GET /health/ready` readiness — verifies DB connectivity (cheap `SELECT 1`)
-  and Redis ping. Railway uses readiness for deploy gating; liveness for restarts.
-  Workers expose health via Celery inspect ping wired to the same monitor.
+- **Now:** `GET /health/ready` readiness — verifies DB connectivity (cheap `SELECT 1`)
+  and Redis ping, each bounded and run concurrently. Railway uses readiness for deploy
+  gating; liveness for restarts. Returns `200 {"status":"ready"}` or
+  `503 {"status":"not_ready"}`; the body names no dependency, because the endpoint is
+  unauthenticated and monitored from the public internet — which dependency failed is
+  recorded in the structured log instead (ADR-0013).
+- **Still outstanding:** workers exposing health via Celery inspect ping wired to the same
+  monitor. The API halves of §6 are delivered; the worker half is not.
 - **Better Stack uptime monitors per environment:** production `/health`,
   production `/health/ready` (M1), the MCP Interface endpoint, the Vercel dashboard,
   and staging equivalents (notify-only). Production monitors feed the public status

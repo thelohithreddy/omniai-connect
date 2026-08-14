@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -21,6 +21,7 @@ from app.core.config import settings
 from app.core.exceptions import DomainError
 from app.core.logging import configure_logging, get_logger
 from app.core.middleware import REQUEST_ID_HEADER, RequestContextMiddleware
+from app.core.readiness import check_readiness
 from app.domains.workspaces.router import api_tokens_router
 from app.domains.workspaces.router import router as workspaces_router
 
@@ -123,6 +124,45 @@ async def handle_unexpected_error(request: Request, exc: Exception) -> JSONRespo
         message="An unexpected error occurred.",
         request_id=_request_id(request),
     )
+
+
+@app.get(
+    "/health/ready",
+    tags=["ops"],
+    responses={
+        200: {"description": "Every required dependency answered."},
+        503: {"description": "A required dependency is unavailable; send no traffic here."},
+    },
+)
+async def readiness(response: Response) -> dict[str, str]:
+    """Readiness probe: can this process actually serve production traffic?
+
+    Verifies the two dependencies OBSERVABILITY.md §6 names — PostgreSQL with a cheap
+    `SELECT 1`, and a Redis `PING` — and reports one boolean. §6 assigns the two probes
+    different jobs: *"Railway uses readiness for deploy gating; liveness for restarts."*
+    Failing readiness withdraws this process from the load balancer; failing liveness gets
+    it killed. That is why `/health` above checks nothing external and this one does.
+
+    **503 on failure**, because deploy gating requires an unready process to answer
+    non-2xx and RFC 9110 §15.6.4 defines 503 as exactly "temporarily unable to handle the
+    request". `Retry-After` is deliberately omitted: nothing here can honestly predict when
+    a dependency will return, and a wrong hint is worse than none.
+
+    **The body names no dependency.** This endpoint is unauthenticated and, per §6,
+    monitored from the public internet; which dependency is failing is diagnosis, and
+    diagnosis belongs in the structured log the probes already emit. The orchestrator needs
+    the status code, and an operator needs the log line.
+
+    No authentication, no tenant context, no database *state*. Infrastructure must be able
+    to call this before any credential exists, and a probe that bound a workspace would
+    leave that binding on a pooled connection for the next request to inherit.
+    """
+    report = await check_readiness()
+    if not report.ready:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        log.warning("readiness.not_ready", **report.as_log_fields())
+        return {"status": "not_ready"}
+    return {"status": "ready"}
 
 
 @app.get("/health", tags=["ops"])

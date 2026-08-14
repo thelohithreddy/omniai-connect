@@ -328,3 +328,57 @@ credential is dead either way. Operators who need to know *when* a token was cut
 Revocation is not retroactive: an in-flight request that already authenticated completes.
 Making it retroactive would require a mechanism to interrupt running requests, which
 nothing in the architecture provides and no canonical document asks for.
+
+## ADR-0013 — Readiness answers 503 with a dependency-free body; ops endpoints sit outside the /v1 contract
+
+**Status:** Accepted (2026-08-14) · **Context:** M1.2-K
+
+**Context:** OBSERVABILITY.md §6 defines the health split completely — `/health` is
+liveness with no dependency checks, `/health/ready` verifies "DB connectivity (cheap
+`SELECT 1`) and Redis ping", and "Railway uses readiness for deploy gating; liveness for
+restarts". It does not state the failure status code, the response body, or a probe
+timeout, and those cannot be left undefined in an implementation.
+
+**Decision:**
+
+1. **503 when not ready.** Deploy gating functionally requires an unready process to answer
+   non-2xx; RFC 9110 §15.6.4 defines 503 as exactly "currently unable to handle the request"
+   with the condition expected to be temporary. This is applying an HTTP standard to satisfy
+   a canonically stated requirement, not choosing product policy. `Retry-After` is omitted:
+   nothing here can honestly predict when a dependency returns, and a wrong hint is worse
+   than none.
+2. **The body is `{"status": "ready"}` / `{"status": "not_ready"}` and names no dependency.**
+   §6 has these endpoints monitored from the public internet, and they are unauthenticated.
+   Which dependency is down is diagnosis — useful to an operator, and useful to an attacker
+   choosing a moment — so it goes to the structured log the probes already emit, which is
+   where OBSERVABILITY.md routes diagnosis anyway.
+3. **Ops endpoints are outside the `/v1` API contract**, so a readiness failure does **not**
+   use the `ApiError` envelope. API_GUIDELINES.md governs the versioned API at `/v1` and its
+   error taxonomy has no code that fits "a dependency is down"; inventing one would widen a
+   canonical contract to describe something that is not an API error but an infrastructure
+   signal. The precedent already exists: `/health` returns a bare `{"status": "ok"}`.
+4. **Each probe is bounded at 2 seconds and both run concurrently.** A readiness probe that
+   can hang is worse than one that fails — the orchestrator's own timeout fires instead,
+   every probe occupies a worker until it does, and a slow dependency becomes an outage of
+   the process checking it. No canonical value exists; 2 s is derived from the in-repo
+   precedent (docker-compose's API healthcheck uses `timeout: 5s`) and sits below it so the
+   endpoint answers before the caller gives up even with both dependencies degraded.
+5. **Redis is readiness-critical**, because §6 names it explicitly. It is not otherwise
+   integrated — no application request path uses it — so this probe is the only place its
+   availability currently matters. That is a faithful implementation of §6, not Redis
+   integration.
+6. **`check_readiness` is total.** Any exception escaping a probe is treated as "not ready"
+   rather than propagating: a 500 from a readiness endpoint is ambiguous to an orchestrator
+   and would render a traceback on an unauthenticated endpoint.
+
+**Consequences:** An operator cannot tell from the HTTP response which dependency is down
+and must read the logs. That is the intended trade and the reason the probes log
+`readiness.database_unavailable` / `readiness.redis_unavailable` at warning level.
+
+Because Redis is readiness-critical while nothing else uses it, a Redis outage withdraws
+the API from the load balancer even though every implemented request path would still work.
+That follows §6 as written. If it proves operationally wrong once real traffic exists, §6 is
+the document to change — not this implementation.
+
+The docker-compose API healthcheck deliberately still targets `/health`, not
+`/health/ready`: compose health gates container restarts, which §6 assigns to liveness.
