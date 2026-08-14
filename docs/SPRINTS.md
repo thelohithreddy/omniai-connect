@@ -66,6 +66,44 @@ open until dashboard work forces it. Better Auth and `members` move to M1.2.
 **Carry-over to M1.2:** Better Auth, `members` + role matrix, api-token issue/revoke
 endpoints, `/health/ready`.
 
+---
+
+## M1.2 — Membership, RBAC, token lifecycle, readiness
+
+**Shipped:**
+- `members` with a composite intra-tenant self-FK, RLS `ENABLE` + `FORCE`, and a
+  workspace-scoped repository and service (M1.2-A/B/C).
+- Workspace RBAC as a single static table plus a request-boundary dependency — policy and
+  enforcement deliberately separate (ADR-0009, M1.2-D/E).
+- API token lifecycle: creation with issuance-only plaintext (ADR-0010), keyset-paginated
+  listing (ADR-0011), and idempotent revocation as a state transition (ADR-0012) —
+  M1.2-F/G/H.
+- Token lifecycle integration tests (M1.2-J) and `GET /health/ready` (ADR-0013, M1.2-K).
+- 451 tests. Every module CI-verified on its own branch before the next began.
+
+**Not shipped, and why:**
+- **Better Auth remains outstanding.** Production authentication still issues machine
+  identity only, so no production caller holds `api_tokens:manage`. Token management is
+  implemented, tested and currently reachable only by a human plane that does not yet exist.
+- **M1.2-I (token scope enforcement) is BLOCKED, not skipped.** PRD.md FR-IF-3 defines a
+  scope as "a subset of Connections"; Connections do not exist, and no canonical document
+  defines a scope grammar, matching rule, or endpoint mapping. Implementing it would require
+  inventing the authorization vocabulary it is meant to enforce. See ADR-0010.
+
+**Known repository drift:** CLAUDE.md instructs reading and updating `docs/PROJECT_STATUS.md`,
+which has never existed. Recorded here rather than resolved by inventing the file — whether
+the document or the instruction is authoritative is the founder's call.
+
+**Learnings:**
+- A green suite proves nothing until each protection is deliberately removed and a
+  *behavioural* test fails. Mutation testing found real gaps in every module, including two
+  vacuous assertions written by the author of the tests.
+- Test suites can mask themselves: a security assertion against an empty log buffer passed
+  locally and failed in CI, because structlog freezes a logger's level filter on first use.
+- Postgres neutralises careless mutations. Several "surviving" mutations were inert because
+  RLS or transactional `SET` semantics undid them — which is evidence for the architecture
+  and against the mutation, and worth distinguishing rather than counting as a pass.
+
 **Learnings:**
 - Postgres RLS has two bypasses, not one — superuser *and* table owner. A suite that only
   asserts positive cases, run as either, passes while the system leaks. The guard test and

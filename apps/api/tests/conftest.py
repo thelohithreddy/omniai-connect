@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from app.core import readiness
 from app.core.config import settings
 from app.core.db import UnitOfWork, get_uow
 from app.core.ids import new_id
@@ -78,6 +79,28 @@ def _pin_log_level() -> Iterator[None]:
     yield
     settings.log_level = original
     configure_logging()
+
+
+@pytest.fixture(autouse=True)
+def _readiness_probe_uses_the_per_test_engine(app_engine: AsyncEngine) -> Iterator[None]:
+    """Point the readiness probe at this test's engine.
+
+    Production is right to probe `app.core.db.engine`: readiness must exercise the pool the
+    application actually serves from, not a private one that could be healthy while the real
+    pool is exhausted. But that engine is created at import and binds its pooled connections
+    to whichever event loop first touches them, and pytest-asyncio gives every test a fresh
+    loop — so the second test to reach `/health/ready` finds connections owned by a closed
+    loop.
+
+    Suite-wide rather than file-local because any test that touches the readiness endpoint
+    needs it, and the failure mode when it is missing is an unrelated-looking
+    `RuntimeError: Event loop is closed` rather than an assertion. It changes nothing about
+    what the probe does: still the application pool, still `SELECT 1`, still returned clean.
+    """
+    original = readiness.engine
+    readiness.engine = app_engine
+    yield
+    readiness.engine = original
 
 
 @pytest.fixture
