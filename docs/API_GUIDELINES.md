@@ -88,6 +88,13 @@ api-tokens) accepts an **`Idempotency-Key`** header (client-generated UUID):
 
 Retries are safe by construction; SDK adapters set the key automatically.
 
+> **Exception — credential-issuing endpoints.** `POST /v1/api-tokens` does not accept
+> `Idempotency-Key`. Replaying a stored response means storing a plaintext bearer token in
+> Redis for 24 hours, which contradicts the "shown exactly once" guarantee in SECURITY.md
+> §4.3. Retrying without a key issues a second token, which is safe and revocable. See
+> ADR-0010; this section needs amending to either exempt such endpoints or store a
+> key → resource-id marker instead of the response body.
+
 ## 6. Error envelope
 
 Exactly the `ApiError` shape in `packages/types/src/index.ts` — no other error format

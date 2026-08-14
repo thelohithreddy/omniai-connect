@@ -198,6 +198,28 @@ they resolve no role and every check denies. Treating a token as its workspace's
 as the member who created it, would be a confused deputy. Machine authorization is the
 token's own `scopes` field — a separate mechanism, not yet enforced.
 
+### 4.3 API token issuance
+
+`POST /v1/api-tokens` requires `api_tokens:manage`, so only an `owner` or `admin` may mint
+a machine credential. Three properties hold at that endpoint:
+
+- **The plaintext is emitted exactly once**, in the 201 response, with
+  `Cache-Control: no-store` (RFC 6749 §5.1). Only the SHA-256 digest and a 12-character
+  display prefix are persisted; nothing in the system can reconstruct the secret, and a
+  lost token must be reissued.
+- **Provenance is taken from the authenticated Member**, never the request body. The
+  creation schema forbids unknown fields, so an attempt to supply `created_by_member_id`,
+  `scopes`, or a chosen `token` is a `400 validation_error` rather than a silent no-op.
+- **A token cannot mint another token.** Machine identity resolves to no membership
+  (ADR-0002), so a leaked credential cannot issue a successor that would survive revoking
+  the original. This is a deliberate consequence of the two identity planes, not an
+  oversight: until human authentication lands (M1.2-G), the only way to issue a token is
+  the bootstrap script.
+
+Tokens are currently issued **unscoped** (`scopes = []`). A scope vocabulary is not yet
+defined (ADR-0010) — and `[]` is the deny-by-default
+value, not a placeholder meaning "everything".
+
 ## 5. Secrets handling rules
 
 1. Secrets live in `.env` files (local) and platform secret stores (Railway/Vercel) —

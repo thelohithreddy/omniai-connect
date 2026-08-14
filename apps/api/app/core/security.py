@@ -23,7 +23,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Annotated, Literal
 
@@ -48,9 +48,18 @@ log = structlog.get_logger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class GeneratedToken:
-    """The only object that ever holds token plaintext. Never persist or log it."""
+    """The only object that ever holds token plaintext. Never persist or log it.
 
-    plaintext: str
+    `repr=False` on `plaintext` is not cosmetic. A dataclass's generated `__repr__` prints
+    every field, so `log.info("issued", token=generated)`, an f-string in an exception
+    message, or a traceback frame rendering local variables would each emit a live
+    credential — and structlog calls `repr()` on non-primitive values. Excluding the field
+    means the accident is not available: the object renders as
+    `GeneratedToken(token_hash='...', token_prefix='omc_...')`, and reaching the secret
+    requires naming `.plaintext` deliberately.
+    """
+
+    plaintext: str = field(repr=False)
     token_hash: str
     token_prefix: str
 

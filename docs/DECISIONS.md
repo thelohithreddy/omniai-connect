@@ -194,3 +194,46 @@ rather than granted to someone by accident. Adding a role denies everything unti
 mapped, so an incomplete role is inert rather than dangerous. The `viewer` question stays
 open and blocks nothing: a viewer can currently be stored but can do nothing, which is
 safe but not useful, and needs either real values in §4.1 or removal from the role domain.
+
+## ADR-0010 — API tokens are issued unscoped, without idempotency, until their vocabularies exist
+
+**Status:** Accepted (2026-08-14) · **Context:** M1.2-F
+
+**Context:** `POST /v1/api-tokens` is the first write endpoint in the system, and two
+canonical documents describe behaviour for it that cannot yet be implemented honestly.
+
+1. **Scopes.** PRD.md FR-IF-3 describes a token scope as "read/invoke, subset of
+   Connections". Connections do not exist yet, so there is no vocabulary a submitted scope
+   could be validated against and no runtime that could enforce one.
+2. **Idempotency.** API_GUIDELINES.md §5 states that any POST with side effects — naming
+   api-token issuance explicitly — accepts an `Idempotency-Key` header, with the response
+   stored in Redis under a 24 h TTL.
+
+**Decision:**
+
+1. **Tokens are issued unscoped.** The endpoint does not accept a `scopes` field at all;
+   the column keeps its `[]` default. Accepting free-form strings would manufacture a
+   permission language by accident and mint credentials whose recorded authority means
+   nothing — and, worse, would create an audit trail that *looks* like enforcement. `[]` is
+   the deny-by-default value, not a placeholder meaning "everything". Machine authorization
+   is deferred whole to the module that introduces Connections.
+2. **`Idempotency-Key` is not implemented for this endpoint.** The canonical design stores
+   the *response* against the key, and this response contains a bearer credential in
+   plaintext. Implementing §5 as written would put a live secret in Redis for 24 hours —
+   a second copy of the one thing the whole design keeps to a single moment in time — and
+   would do so in a store with no encryption at rest, no RLS, and a much wider blast radius
+   than Postgres. Retrying a creation without a key simply issues a second token, which is
+   safe: tokens are not unique by name and the extra one can be revoked.
+
+**Consequences:** A client cannot express least privilege for a token today; every token
+carries the full authority of the workspace's machine plane. That is acceptable only
+because there is currently nothing for a token to *do* beyond reading its own Workspace,
+and it must be revisited before Connections ship — a token minted now would silently gain
+authority as capabilities are added. Recorded as a blocking dependency for the Connections
+milestone rather than a nice-to-have.
+
+The idempotency deviation makes this endpoint inconsistent with API_GUIDELINES.md §5. The
+resolution is a document change, not an implementation: §5 needs to state that
+credential-issuing endpoints are exempt, or specify storing an idempotency *marker* (key →
+token id) rather than the response body. Until then the guideline and the code disagree,
+and the code is deliberately the stricter of the two.

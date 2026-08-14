@@ -13,6 +13,28 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **API token creation (M1.2-F).** `POST /v1/api-tokens` mints a workspace-scoped machine
+  credential and returns its plaintext exactly once.
+  - Schema (`alembic/versions/0003_api_token_creator.py`): `api_tokens.created_by_member_id`
+    with a **composite** intra-tenant foreign key
+    `(workspace_id, created_by_member_id) → members (workspace_id, id)` and column-scoped
+    `ON DELETE SET NULL (created_by_member_id)`. Foreign keys are validated with RLS
+    bypassed, so a single-column reference would have permitted a creator owned by another
+    Workspace. Index leads with `workspace_id` and serves the FK's delete-time scan.
+  - `ApiTokenService.issue` generates the secret, hashes it with SHA-256, and persists only
+    the digest and a 12-character display prefix. `ApiTokenRepository.create` has no
+    parameter capable of accepting a plaintext or a `workspace_id`, so neither storing a
+    usable credential nor writing into another tenant is expressible.
+  - The endpoint requires `api_tokens:manage` (ADR-0009), so only an `owner` or `admin` may
+    mint. A machine token resolves to no membership and is therefore denied: **a token
+    cannot mint another token**, so a leaked credential cannot issue a successor that
+    outlives revoking the original.
+  - Provenance comes from the authenticated Member, never the request. `ApiTokenCreate`
+    forbids unknown fields, so supplying `created_by_member_id`, `scopes`, or a chosen
+    `token` is a `400 validation_error` rather than a silent no-op.
+  - `Cache-Control: no-store` on the creation response (RFC 6749 §5.1).
+  - 49 tests, and 36 adversarial mutations run against them with zero survivors.
+
 - **Tenancy foundation and machine identity (M1.1).** First vertical slice of M1: a
   workspace-scoped API token authenticates a caller, binds tenant context, and returns the
   Workspace — with tenant isolation enforced by three independent layers.
@@ -50,6 +72,16 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Fixed
 
+- **A security test was asserting against an empty buffer.** The first version of the
+  token log-leak test used pytest's `caplog`, but `configure_logging` installs
+  `structlog.PrintLoggerFactory`, which writes to stdout and never reaches stdlib logging —
+  so it captured nothing and passed vacuously. Found by mutation testing (deliberately
+  logging the secret left the suite green). Now redirects stdout, forces a debug level, and
+  asserts that something was emitted before asserting the secret was not.
+- **`GeneratedToken` rendered its plaintext in `repr()`.** A dataclass's generated `repr`
+  prints every field, and structlog calls `repr()` on non-primitive values, so
+  `log.info("issued", token=generated)` or a traceback rendering locals would have emitted
+  a live credential. `plaintext` is now excluded from both carriers' reprs.
 - **`DATABASE_DESIGN.md` §6 specified a cross-tenant leak.** The RLS section called for a
   *session-scoped* `app.workspace_id`, which survives a pooled connection's return to the
   pool and is inherited by the next tenant's request; it is also unsupported under

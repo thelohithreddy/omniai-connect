@@ -127,16 +127,19 @@ class Member(UUIDPrimaryKeyMixin, WorkspaceScopedMixin, TimestampMixin, Base):
 
 
 class ApiToken(UUIDPrimaryKeyMixin, WorkspaceScopedMixin, TimestampMixin, Base):
-    """A workspace-scoped machine credential (SECURITY.md §4, ADR-0002).
-
-    `created_by_member_id` from DATABASE_DESIGN.md is deliberately still absent: wiring
-    tokens to members is token-lifecycle work (M1.2-F/G/H), and adding the column plus
-    its FK later is additive (P-43).
-    """
+    """A workspace-scoped machine credential (SECURITY.md §4, ADR-0002)."""
 
     __tablename__ = "api_tokens"
 
     name: Mapped[str] = mapped_column(String(120), nullable=False)
+    # Which Member issued this token (DATABASE_DESIGN.md §3). Nullable and staying that
+    # way: the bootstrap script mints a workspace's first token before any Member exists,
+    # and `ON DELETE SET NULL` clears the reference when a creator is removed rather than
+    # taking their tokens with them — those are workspace-owned credentials, and revoking
+    # them is a separate explicit act.
+    created_by_member_id: Mapped[UUID | None] = mapped_column(
+        postgresql.UUID(as_uuid=True), nullable=True
+    )
     token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
     token_prefix: Mapped[str] = mapped_column(String(16), nullable=False)
     scopes: Mapped[list[Any]] = mapped_column(
@@ -158,6 +161,22 @@ class ApiToken(UUIDPrimaryKeyMixin, WorkspaceScopedMixin, TimestampMixin, Base):
             "ix_api_tokens_workspace_id_created_at",
             "workspace_id",
             text("created_at DESC"),
+        ),
+        # Leads with workspace_id (P-44) and serves the FK's ON DELETE scan, which binds
+        # both columns when a Member is removed.
+        Index(
+            "ix_api_tokens_workspace_id_created_by_member_id",
+            "workspace_id",
+            "created_by_member_id",
+        ),
+        # COMPOSITE, per the intra-tenant FK convention (DATABASE_DESIGN.md §1): FK checks
+        # run with RLS bypassed, so carrying workspace_id into the key is what prevents a
+        # creator reference pointing at another tenant's Member.
+        ForeignKeyConstraint(
+            ["workspace_id", "created_by_member_id"],
+            ["members.workspace_id", "members.id"],
+            name="fk_api_tokens_created_by_member_id",
+            ondelete="SET NULL (created_by_member_id)",
         ),
     )
 

@@ -8,10 +8,16 @@ the logic (BACKEND_SPEC.md §2).
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass, field
 
 from app.core.exceptions import NotFoundError, ValidationFailedError
-from app.domains.workspaces.models import MEMBER_ROLES, Member, Workspace
-from app.domains.workspaces.repository import MemberRepository, WorkspaceRepository
+from app.core.security import generate_token
+from app.domains.workspaces.models import MEMBER_ROLES, ApiToken, Member, Workspace
+from app.domains.workspaces.repository import (
+    ApiTokenRepository,
+    MemberRepository,
+    WorkspaceRepository,
+)
 
 
 class WorkspaceService:
@@ -178,3 +184,103 @@ def _require_valid_role(role: str) -> str:
             details={"role": role, "allowed": list(MEMBER_ROLES)},
         )
     return role
+
+
+@dataclass(frozen=True, slots=True)
+class IssuedApiToken:
+    """A newly created token *plus* its plaintext — a return value, never a stored one.
+
+    The plaintext lives in this object for the width of a single request: minted in
+    `ApiTokenService.issue`, carried to the router, serialized into the response, and then
+    unreachable. It is not written to the row, not cached, not held in module state.
+
+    `repr=False` mirrors `GeneratedToken`: a dataclass repr would print the secret into any
+    log line, exception message, or traceback frame that happens to render this object.
+    """
+
+    token: ApiToken
+    plaintext: str = field(repr=False)
+
+
+class ApiTokenService:
+    """Issuance of workspace-scoped machine credentials (SECURITY.md §4, ADR-0002).
+
+    Constructed from an `ApiTokenRepository` alone, like the other services here: it holds
+    no `WorkspaceContext` and no `workspace_id`, so there is no expression this class can
+    form that writes a token into another tenant.
+
+    **This layer performs no authorization.** Whether the caller may mint credentials is
+    decided at the request boundary by `require_permission(Permission.API_TOKENS_MANAGE)`
+    (M1.2-E). Nothing here branches on who is asking — which is exactly why the endpoint
+    must not be the only guard for anything this class does not itself enforce.
+    """
+
+    def __init__(self, repository: ApiTokenRepository) -> None:
+        self._repository = repository
+
+    async def issue(
+        self,
+        *,
+        name: str,
+        created_by_member_id: uuid.UUID | None,
+    ) -> IssuedApiToken:
+        """Mint a token for this Workspace and return it with its one-time plaintext.
+
+        The secret is generated here and hashed immediately; only the hash and the display
+        prefix travel onward to persistence. `ApiTokenRepository.create` has no parameter
+        capable of accepting a plaintext, so "forgot to hash it" is not a mistake this
+        codebase can make — the plaintext leaves this method only in the return value.
+
+        There is no second read-back path: nothing in the domain can reconstruct the secret
+        from the stored row, because SHA-256 is one-way and the prefix is 8 random
+        characters of a 43-character secret. If the caller loses the response, the token is
+        gone and a new one must be issued.
+
+        `created_by_member_id` is a **required** keyword argument even though it is
+        nullable. A default of `None` would let a future call site omit provenance silently
+        and record an unattributed credential; making it required forces every caller to
+        state, in the code, whose authority the token was minted under. The endpoint passes
+        the authenticated member; the bootstrap script — which mints a workspace's first
+        token before any Member exists — passes `None` explicitly.
+        """
+        # Validate *before* minting. Generating first would create a live secret for a
+        # request that is about to fail, leaving it in a stack frame that a traceback
+        # renderer can walk. Nothing high-entropy exists until the request is known good.
+        validated_name = _require_token_name(name)
+        generated = generate_token()
+        token = await self._repository.create(
+            name=validated_name,
+            token_hash=generated.token_hash,
+            token_prefix=generated.token_prefix,
+            created_by_member_id=created_by_member_id,
+        )
+        return IssuedApiToken(token=token, plaintext=generated.plaintext)
+
+
+def _require_token_name(name: str) -> str:
+    """Reject a nameless token before it reaches persistence.
+
+    Duplicated from the Pydantic schema on purpose. The schema guards the HTTP door; this
+    guards the service, which an MCP adapter, a Celery task, or a script calls directly
+    (BACKEND_SPEC.md §2). A token labelled `"   "` is unidentifiable in a revocation UI,
+    which is a real operational hazard for a credential you can only revoke by picking it
+    out of a list.
+
+    Names are deliberately **not** unique. Two CI runners may both be called "ci", and a
+    uniqueness constraint would make the failure mode of issuance a confusing 409 rather
+    than a second working credential.
+    """
+    cleaned = name.strip()
+    if not cleaned:
+        raise ValidationFailedError("An API token requires a name.")
+    if len(cleaned) > _TOKEN_NAME_MAX_LEN:
+        raise ValidationFailedError(
+            "API token name is too long.",
+            details={"max_length": _TOKEN_NAME_MAX_LEN},
+        )
+    return cleaned
+
+
+#: Matches `api_tokens.name` (String(120)). Over-length input is a domain error here rather
+#: than a `DataError` surfacing from the driver (BACKEND_SPEC.md §6).
+_TOKEN_NAME_MAX_LEN = 120

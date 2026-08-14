@@ -58,6 +58,35 @@ class ApiTokenRepository:
         token: ApiToken | None = await self._session.scalar(stmt)
         return token
 
+    async def create(
+        self,
+        *,
+        name: str,
+        token_hash: str,
+        token_prefix: str,
+        created_by_member_id: uuid.UUID | None = None,
+    ) -> ApiToken:
+        """Persist a token's hash and metadata into the current Workspace.
+
+        Takes `token_hash`, never the plaintext — the secret is generated and hashed one
+        layer up and this method has no parameter that could accept it, so there is no
+        path by which persistence code could store a usable credential.
+
+        `workspace_id` is taken from the context and is not a parameter, exactly as
+        `MemberRepository.create` works: a caller cannot supply a foreign tenant because
+        there is nowhere to put one.
+        """
+        token = ApiToken(
+            workspace_id=self._ctx.workspace_id,
+            name=name,
+            token_hash=token_hash,
+            token_prefix=token_prefix,
+            created_by_member_id=created_by_member_id,
+        )
+        self._session.add(token)
+        await self._session.flush()
+        return token
+
 
 class MemberRepository:
     """Data access for Members, scoped to one Workspace by construction.

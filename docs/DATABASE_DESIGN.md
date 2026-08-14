@@ -98,6 +98,17 @@ once at creation, never stored), `token_prefix` (first 12 chars — the `omc_` m
 `scopes` (`jsonb`), `last_used_at NULL`, `expires_at NULL`, `revoked_at NULL`,
 timestamps. Unique on `token_hash`.
 
+`created_by_member_id` is nullable and stays nullable: a Workspace's first token is minted
+before any Member exists, so requiring a creator would make bootstrap impossible. It uses
+the composite intra-tenant foreign key convention (§1) —
+`(workspace_id, created_by_member_id) REFERENCES members (workspace_id, id)` — because
+foreign keys are validated with RLS bypassed, so a single-column reference to `members.id`
+would let one Workspace record a creator owned by another. The referential action is
+`ON DELETE SET NULL (created_by_member_id)`, column-scoped (PG 15+): a bare `SET NULL`
+would also target `NOT NULL` `workspace_id` and make member removal fail, while `CASCADE`
+would silently revoke every token an offboarded member issued. Tokens are workspace-owned;
+revocation is a separate, explicit act.
+
 ### connectors
 A definition of an external API: its Tools, auth requirements, and base config
 (Bible §4). Columns: `id`, `workspace_id`, `name`, `slug` (unique per workspace),

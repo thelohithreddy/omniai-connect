@@ -38,3 +38,57 @@ class ApiTokenRead(BaseModel):
     expires_at: datetime | None
     revoked_at: datetime | None
     created_at: datetime
+
+
+class ApiTokenCreate(BaseModel):
+    """The entire client-controlled surface of token issuance: a display name.
+
+    `extra="forbid"` is load-bearing. Pydantic's default is to *ignore* unknown fields, so
+    a client posting `{"name": "ci", "created_by_member_id": "<someone else>"}` would get
+    a silent 201 and be left believing the value was honoured. Forbidding turns every
+    attempt to supply a server-owned field — `workspace_id`, `token_hash`, `token_prefix`,
+    `created_by_member_id`, `revoked_at` — into a 422 instead of a quiet no-op. The
+    security property comes from the field's absence; this makes the absence audible.
+
+    `scopes` is deliberately not accepted. PRD.md FR-IF-3 describes a token scope as a
+    "subset of Connections", and Connections do not exist yet, so there is no vocabulary
+    against which a submitted scope could be validated. Accepting free-form strings would
+    manufacture a permission language by accident and mint tokens whose recorded authority
+    means nothing. Tokens are issued unscoped (`[]`) until the vocabulary is defined.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(
+        min_length=1,
+        max_length=120,
+        description="Human-readable label, e.g. 'ci-deploy'. Not a secret and not unique.",
+    )
+
+
+class ApiTokenCreated(BaseModel):
+    """The creation response — the **only** place token plaintext is ever emitted.
+
+    Deliberately not `from_attributes`: there is no `plaintext` column to read, and the
+    field cannot be populated by validating an ORM row. Construction requires the caller to
+    hand over the secret explicitly, so nothing can accidentally serialize a stored token.
+
+    Separate from `ApiTokenRead` for the same reason. `ApiTokenRead` is what every list and
+    detail response returns and it has no `token` field at all; if one model served both,
+    a future read endpoint would only ever be one forgotten `exclude` away from emitting
+    credentials it does not even possess.
+    """
+
+    id: uuid.UUID
+    name: str
+    token: str = Field(
+        description=(
+            "The plaintext token. Shown exactly once, in this response. It is stored only "
+            "as a SHA-256 hash, so it cannot be recovered — issue a new token if lost."
+        )
+    )
+    token_prefix: str
+    scopes: list[str]
+    created_by_member_id: uuid.UUID | None
+    expires_at: datetime | None
+    created_at: datetime
