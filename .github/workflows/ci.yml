@@ -1,13 +1,31 @@
 name: CI
 
 on:
+  # Every branch, not just the trunk. The development process is module-based —
+  # implement, verify locally, push, get CI green, audit, next module — and that only
+  # works if a push to `feat/*` or `fix/*` is actually verified. Previously the trigger
+  # listed [main, develop], so a feature-branch push dispatched nothing and a module was
+  # first seen by CI at PR time, long after it was declared done.
+  #
+  # `'**'` matches all branch names including those with slashes. It deliberately does
+  # not match tags: there is no release pipeline yet, and a tag push should not silently
+  # start running jobs that were written for branches.
   push:
-    branches: [main, develop]
+    branches: ['**']
+  # Unchanged. PRs are still verified against their target, which is what a merge gate
+  # needs — the push trigger above verifies the branch, this verifies the merge.
   pull_request:
     branches: [main, develop]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Keyed on `head_ref || ref` rather than `ref` alone, which is what stops the broader
+  # push trigger from doubling the work. Once a branch has an open PR, one commit fires
+  # both `push` (ref = refs/heads/my-branch) and `pull_request` (ref =
+  # refs/pull/N/merge). Under the old key those are different groups, so both runs
+  # proceed and every PR commit costs two full CI runs. `head_ref` is the source branch
+  # on a PR event and empty on a push, so this expression collapses both events for the
+  # same branch into one group and `cancel-in-progress` retires the superseded run.
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 jobs:
