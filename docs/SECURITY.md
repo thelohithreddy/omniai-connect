@@ -112,17 +112,45 @@ Two identity planes, per ADR-0002 — never mixed:
 
 Roles attach to the **Member** (a user's membership in a Workspace, per Bible §4).
 
-| Capability | owner | admin | member |
-|---|:---:|:---:|:---:|
-| Manage billing, delete Workspace | ✅ | ❌ | ❌ |
-| Manage Members and roles | ✅ | ✅ | ❌ |
-| Create/delete Connections, manage Credentials | ✅ | ✅ | ❌ |
-| Create/revoke workspace API tokens | ✅ | ✅ | ❌ |
-| Execute Tool Calls, view Tools and own logs | ✅ | ✅ | ✅ |
-| View full audit log | ✅ | ✅ | ❌ |
+This table is the authoritative policy. It is transcribed row-for-row into
+`apps/api/app/core/authz.py` as the `Permission` enum and `ROLE_PERMISSIONS` mapping —
+one `Permission` per row, identical values. **If the two disagree, the code is wrong.**
+Adding a capability means editing this table and that mapping in the same change (ADR-0009).
 
-Authorization is enforced in the service layer (not in adapters — adapters are thin,
-Bible §6.4) and denied-by-default: an unlisted capability requires owner.
+| Capability | Permission | owner | admin | member | viewer |
+|---|---|:---:|:---:|:---:|:---:|
+| Manage billing, delete Workspace | `workspace:manage` | ✅ | ❌ | ❌ | ❌ |
+| Manage Members and roles | `members:manage` | ✅ | ✅ | ❌ | ❌ |
+| Create/delete Connections, manage Credentials | `connections:manage` | ✅ | ✅ | ❌ | ❌ |
+| Create/revoke workspace API tokens | `api_tokens:manage` | ✅ | ✅ | ❌ | ❌ |
+| Execute Tool Calls, view Tools and own logs | `tools:execute` | ✅ | ✅ | ✅ | ❌ |
+| View full audit log | `audit:read` | ✅ | ✅ | ❌ | ❌ |
+
+**`viewer` currently holds nothing, and that is an open question rather than a decision.**
+The role is storable — DATABASE_DESIGN.md §3 puts it in the `members.role` CHECK domain —
+but it has never appeared in this table, and PRD.md FR-CP-1 lists only owner/admin/member.
+Granting it "read everything" would be inventing policy, and read access to the audit log
+or to Tool Calls is exactly the kind of grant that should be decided deliberately rather
+than inferred from a role's name. Deny-by-default is therefore the only consistent answer
+until this table gains real `viewer` values or the role is removed from the domain. Both
+are changes to canonical documents.
+
+**Deny by default, at runtime.** An unmapped role holds nothing; an unknown permission is
+held by nobody, **including owner**; a malformed value is refused outright. There is no
+wildcard and no permissive fallback.
+
+Note the distinction from the authoring rule that "an unlisted capability requires owner":
+that is guidance for choosing column values when adding a *new row to this table*, not a
+runtime behaviour. Applied at runtime it would mean a typo in a permission name silently
+grants an owner access to something nobody defined — the exact failure deny-by-default
+exists to prevent.
+
+**Policy is separate from enforcement.** `authz.py` answers `(role, permission) → allow |
+deny` as a pure function with no database, cache, network, or request involved, which is
+what lets the whole security model be reviewed as one table in source control. Resolving
+an authenticated request into a Role and refusing it when the answer is deny is the
+enforcement layer's job, and it lives in the service layer (not in adapters — adapters are
+thin, Bible §6.4).
 
 ## 5. Secrets handling rules
 

@@ -150,3 +150,47 @@ on the function is mandatory: without it a caller controlling `search_path` coul
 the target table and have the function read it under another role's privileges. The
 mechanism generalises to any future lookup that must run before a tenant is known
 (SECURITY.md §3, DATABASE_DESIGN.md §6).
+
+---
+
+## ADR-0009 — Workspace RBAC: explicit role→permission mapping, deny by default
+**Status:** Accepted · 2026-08-14
+
+**Context:** SECURITY.md §4.1 has always carried a role matrix, but it was prose. Turning
+it into executable policy forced three questions the document did not answer.
+
+1. *What may a `viewer` do?* The role is storable (DATABASE_DESIGN.md §3) yet appears in no
+   capability table, and PRD.md FR-CP-1 lists only owner/admin/member.
+2. *What happens at runtime for a capability the table does not list?* §4.1 said "an
+   unlisted capability requires owner", which read literally is a permissive fallback.
+3. *Should roles inherit from one another?* The matrix is nearly a hierarchy, and
+   expressing it as one would be shorter.
+
+**Decision:**
+
+1. **Explicit mapping, not inheritance.** Each role's permission set is enumerated in
+   full. `admin` is not expressed as "owner minus `workspace:manage`" — under that shape a
+   capability added to owner silently lands on admin, and the reviewer of that diff sees
+   one line change while two roles gain power.
+2. **Deny by default at runtime, including for owner.** An unmapped role holds nothing; an
+   unknown permission is held by nobody. §4.1's "unlisted capability requires owner" is
+   reinterpreted as *authoring guidance* — the column values to default to when adding a
+   row — not a runtime rule. As a runtime rule it would let a typo in a permission name
+   grant an owner access to an undefined capability.
+3. **`viewer` holds no permissions**, recorded as an open question rather than settled
+   policy. Inventing "read everything" would be exactly the speculative grant this module
+   is supposed to avoid, and the affected reads (full audit log, Tool Calls) are
+   security-relevant enough to deserve a deliberate decision.
+4. **Policy is separate from enforcement.** `app/core/authz.py` is a pure function over
+   static data — no database, cache, network, request object, or framework import — and
+   exposes only decision functions. It deliberately provides no `require_*` helper and
+   raises nothing; refusing a request belongs to the enforcement layer.
+5. **Static and in source control**, not a database table or dynamic configuration. The
+   entire security model is reviewable in one diff without running anything.
+
+**Consequences:** Adding a capability is a two-file change — SECURITY.md §4.1 and
+`ROLE_PERMISSIONS` — and forgetting the second means the permission is denied to everyone
+rather than granted to someone by accident. Adding a role denies everything until it is
+mapped, so an incomplete role is inert rather than dangerous. The `viewer` question stays
+open and blocks nothing: a viewer can currently be stored but can do nothing, which is
+safe but not useful, and needs either real values in §4.1 or removal from the role domain.
