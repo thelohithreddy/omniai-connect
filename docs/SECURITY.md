@@ -152,6 +152,52 @@ an authenticated request into a Role and refusing it when the answer is deny is 
 enforcement layer's job, and it lives in the service layer (not in adapters — adapters are
 thin, Bible §6.4).
 
+### 4.2 Request authorization boundary
+
+Enforcement lives in `apps/api/app/core/authorization.py`. An endpoint declares the
+permission it needs; the caller never does:
+
+```python
+@router.delete("/members/{member_id}")
+async def remove(
+    ctx: Annotated[WorkspaceContext, Depends(require_permission(Permission.MEMBERS_MANAGE))],
+): ...
+```
+
+The requirement is captured in a closure when the route is defined, so it is absent from
+the request signature and cannot be supplied, overridden, or guessed. A caller can
+influence *whether* they satisfy a requirement, never *which* one applies.
+
+Order of evaluation, enforced by dependency composition rather than convention:
+
+| Step | Establishes | Failure |
+|---|---|---|
+| Authentication | the caller (Bearer token → `WorkspaceContext`) | **401** `unauthorized` |
+| Tenant binding | `SET LOCAL app.workspace_id`, RLS armed | — |
+| Membership resolution | the Member row *in this workspace* | deny |
+| Role | read from the persisted row, never the request | deny |
+| Policy (§4.1) | `is_allowed(role, permission)` | **403** `forbidden` |
+
+**401 and 403 stay distinct.** Failing to authenticate is not the same as authenticating
+and lacking a capability, and collapsing them destroys the caller's ability to tell a bad
+credential from an insufficient one.
+
+**Authorization follows the active tenant, not the identity's strongest membership.** A
+user who is an owner in workspace A and a viewer in workspace B holds viewer's permissions
+when authenticated against B. This needs no comparison in the authorization code: the
+membership lookup is workspace-scoped by construction and RLS is armed on the same
+transaction, so A's row is simply unreachable from B's context.
+
+**Every denial is identical.** One message, no permission name, no workspace id, no
+statement of whether a membership exists elsewhere — otherwise a 403 becomes a
+membership-enumeration primitive.
+
+**Machine identity holds no permissions.** ADR-0002's two identity planes are never mixed:
+API tokens are machine credentials and do not map to a Member (DATABASE_DESIGN.md §3), so
+they resolve no role and every check denies. Treating a token as its workspace's owner, or
+as the member who created it, would be a confused deputy. Machine authorization is the
+token's own `scopes` field — a separate mechanism, not yet enforced.
+
 ## 5. Secrets handling rules
 
 1. Secrets live in `.env` files (local) and platform secret stores (Railway/Vercel) —
