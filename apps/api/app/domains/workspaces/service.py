@@ -23,6 +23,7 @@ from app.domains.workspaces.models import MEMBER_ROLES, ApiToken, Member, Worksp
 from app.domains.workspaces.repository import (
     ApiTokenRepository,
     MemberRepository,
+    RevocationOutcome,
     WorkspaceRepository,
 )
 
@@ -272,6 +273,31 @@ class ApiTokenService:
             else None
         )
         return TokenPage(tokens=tokens, next_cursor=next_cursor, has_more=has_more)
+
+    async def revoke(self, token_id: uuid.UUID) -> None:
+        """Revoke one of this Workspace's tokens. Idempotent.
+
+        Raises `NotFoundError` when the token does not exist **or belongs to another
+        Workspace** — deliberately the same outcome for both. SECURITY.md §3 requires
+        cross-tenant access to answer `not_found` rather than `forbidden`, because a
+        distinct response would confirm that a guessed id is real somewhere and turn this
+        endpoint into an existence oracle across tenants.
+
+        Revoking an already-revoked token succeeds silently, per API_GUIDELINES.md §2:
+        *"Idempotent: deleting a deleted resource is 204."* That is not laxity. Revocation
+        is what an operator reaches for during an incident, frequently through a retried
+        request or a script run twice, and an error on the second attempt would suggest the
+        credential is somehow still live at exactly the moment certainty matters most. The
+        original `revoked_at` is preserved by the repository, so the audit trail still
+        records when the credential actually stopped working.
+
+        Returns nothing. There is no post-revocation state worth reporting that the listing
+        does not already show, and returning the row would mean serializing a credential
+        record in response to a destructive call for no reason.
+        """
+        outcome = await self._repository.revoke(token_id)
+        if outcome is RevocationOutcome.NOT_FOUND:
+            raise NotFoundError("API token not found.")
 
     async def issue(
         self,

@@ -13,6 +13,22 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **API token revocation (M1.2-H).** `DELETE /v1/api-tokens/{id}` → 204 stops a credential
+  working immediately. No migration: `revoked_at` already existed and authentication already
+  rejected revoked tokens, so this module supplies only the state transition.
+  - A state transition, not a row deletion — the token stays listed with `revoked_at` set,
+    which is what makes post-incident review possible. ADR-0012 records the reasoning,
+    including why `DELETE` rather than a `/{id}/revoke` action path.
+  - Idempotent per API_GUIDELINES.md §2, **preserving the first `revoked_at`**: the UPDATE
+    carries `WHERE revoked_at IS NULL`, so a retry cannot rewrite the audit record to the
+    time of the retry. Proven with five concurrent revocations producing exactly one
+    transition.
+  - Requires `api_tokens:manage`. A machine token cannot revoke anything, including itself,
+    so a stolen credential cannot cut off the operator's own tokens mid-incident.
+  - Cross-tenant and nonexistent targets return byte-identical 404s, so the endpoint is not
+    an existence oracle. Creating a token grants no authority over it.
+  - 35 tests; 24 adversarial mutations run with zero survivors.
+
 - **API token listing (M1.2-G).** `GET /v1/api-tokens` returns a page of the Workspace's
   token metadata, newest first.
   - Keyset cursor pagination per API_GUIDELINES.md §3 (`limit` default 50, max 100;

@@ -282,3 +282,49 @@ encoded filter set, or anything a caller must not alter — point 3 no longer co
 signing must be decided then: a key, an algorithm, and a rotation policy, none of which any
 canonical document currently establishes. Recorded here as the deferred question rather than
 pre-emptively answered.
+
+## ADR-0012 — Revocation is `DELETE` on the token resource, implemented as a state transition
+
+**Status:** Accepted (2026-08-14) · **Context:** M1.2-H
+
+**Context:** `api_tokens.revoked_at` already existed (M1.1) and authentication already
+rejected revoked tokens, so the enforcement half of revocation was complete before this
+module began; only the state transition was missing. Two questions had to be settled from
+the canon rather than preference: which HTTP verb and path express revocation, and what
+repeated revocation means.
+
+API_GUIDELINES.md §1 lists `/v1/api-tokens` as a canonical resource and §2 defines
+`DELETE → 204`, *"Idempotent: deleting a deleted resource is 204"*. §2 also permits
+POST-as-action. No action-style sub-path (`/{id}/verb`) appears anywhere in the guidelines
+or the codebase; the only instance-path precedents are plain `GET /v1/tool-calls/{id}` and
+`GET /v1/operations/{id}`.
+
+**Decision:**
+
+1. **`DELETE /v1/api-tokens/{id}` → 204.** Choosing `POST /{id}/revoke` would invent a URL
+   convention the guidelines do not establish, and §2's DELETE row already specifies
+   idempotent semantics that match revocation exactly. From the client's side the
+   credential ceases to exist, which is what DELETE means; row retention is an audit
+   implementation detail. The tension is acknowledged: a revoked token *remains visible* in
+   listings with `revoked_at` set, which is unusual for something "deleted" — that
+   visibility is deliberate and is why `ApiTokenRead` carries the field.
+2. **The row is retained, not deleted.** DATABASE_DESIGN.md §3's "no soft delete —
+   revocation deletes the row" governs `credentials`, a different table; `api_tokens` was
+   given a nullable `revoked_at` precisely so the record survives.
+3. **Idempotent, preserving the first timestamp.** The UPDATE carries
+   `WHERE revoked_at IS NULL`, so a second revocation matches nothing and leaves the
+   original timestamp intact, and a follow-up existence check separates "already revoked"
+   (204) from "not yours" (404).
+4. **No un-revoke.** The guidelines define no such operation and one would let a
+   compromised credential be restored. A replacement token is issued instead.
+5. **Cross-tenant and nonexistent targets are indistinguishable** (`not_found`, per
+   SECURITY.md §3).
+
+**Consequences:** A client cannot tell from the API whether a 204 revoked the token or
+found it already revoked. That is the point of idempotency and is the safer ambiguity: the
+credential is dead either way. Operators who need to know *when* a token was cut off read
+`revoked_at` from the listing, which is why preserving the original value matters.
+
+Revocation is not retroactive: an in-flight request that already authenticated completes.
+Making it retroactive would require a mechanism to interrupt running requests, which
+nothing in the architecture provides and no canonical document asks for.

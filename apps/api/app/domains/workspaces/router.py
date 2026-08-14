@@ -6,6 +6,7 @@ here grows an `if` about domain state, it belongs in the service.
 
 from __future__ import annotations
 
+import uuid
 from typing import Annotated, Final
 
 from fastapi import APIRouter, Depends, Query, Request, Response, status
@@ -151,6 +152,43 @@ async def list_api_tokens(
         next_cursor=page.next_cursor,
         has_more=page.has_more,
     )
+
+
+@api_tokens_router.delete(
+    "/{token_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Revoke a workspace API token",
+    responses={
+        204: {"description": "Revoked. Also returned if it was already revoked."},
+        400: {"description": "Malformed token id."},
+        401: {"description": "Missing or invalid credentials."},
+        403: {"description": "Caller does not hold `api_tokens:manage` in this Workspace."},
+        404: {"description": "No such token in this Workspace."},
+    },
+)
+async def revoke_api_token(
+    token_id: uuid.UUID,
+    service: Annotated[ApiTokenService, Depends(get_api_token_service)],
+) -> None:
+    """Stop a credential from working, immediately and permanently.
+
+    **`DELETE` on a state transition.** The row is not removed — `revoked_at` is set, and
+    the token stays visible in listings with that field populated, which is how an operator
+    later sees that a credential existed and when it was cut off. From the client's side the
+    credential ceases to exist, which is what `DELETE` means; retention is an audit
+    implementation detail. There is no un-revoke: the guidelines define no such operation
+    and inventing one would let a compromised credential be restored (ADR-0012).
+
+    **Effective immediately**, with no cache to wait for. `get_workspace_context` re-reads
+    the token row on every request and rejects a revoked one (MCP_RUNTIME.md §5: revoking
+    "severs every client using it immediately"). Nothing here duplicates that check — this
+    endpoint only writes the state that the single existing resolver already enforces.
+
+    Requires `api_tokens:manage`. A machine token cannot revoke anything, including itself,
+    because it resolves to no membership (ADR-0002) — which also means a stolen credential
+    cannot be used to revoke the *other* tokens an operator would need during a response.
+    """
+    await service.revoke(token_id)
 
 
 @api_tokens_router.post(

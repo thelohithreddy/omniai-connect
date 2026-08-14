@@ -8,8 +8,9 @@ this code can express (P-14). RLS is the second net, not the first.
 from __future__ import annotations
 
 import uuid
+from enum import StrEnum
 
-from sqlalchemy import delete, select, tuple_
+from sqlalchemy import delete, func, select, tuple_, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,6 +18,20 @@ from app.core.exceptions import ConflictError
 from app.core.pagination import CursorPosition
 from app.core.security import WorkspaceContext
 from app.domains.workspaces.models import ApiToken, Member, Workspace
+
+
+class RevocationOutcome(StrEnum):
+    """What a revocation attempt actually did.
+
+    Three outcomes rather than a boolean, because the HTTP layer must distinguish
+    idempotent success from a token that is not the caller's. A boolean would force the
+    service to guess, and the natural guess — "False means not found" — would turn a second
+    revocation into a 404 and break the idempotency API_GUIDELINES.md §2 requires.
+    """
+
+    REVOKED = "revoked"
+    ALREADY_REVOKED = "already_revoked"
+    NOT_FOUND = "not_found"
 
 
 class WorkspaceRepository:
@@ -88,6 +103,59 @@ class ApiTokenRepository:
         )
         token: ApiToken | None = await self._session.scalar(stmt)
         return token
+
+    async def revoke(self, token_id: uuid.UUID) -> RevocationOutcome:
+        """Mark one of this Workspace's tokens revoked. Reports what actually happened.
+
+        Revocation is a **state transition, not a row deletion**: the row is retained with
+        `revoked_at` set (DATABASE_DESIGN.md §3). The credential stops working —
+        `auth.resolve_api_token`'s caller rejects a revoked row — while the record of it
+        having existed survives, which is what makes an audit trail possible after an
+        incident. (The line in DATABASE_DESIGN.md §3 that says "revocation deletes the row"
+        governs `credentials`, a different table with different requirements.)
+
+        **`WHERE revoked_at IS NULL` is what makes this concurrency-safe.** Two requests
+        revoking the same token both reach the UPDATE; Postgres serialises them on the row
+        lock, and the second re-evaluates the predicate after the first commits, matches
+        nothing, and leaves the original `revoked_at` intact. Without that predicate the
+        second would overwrite the timestamp, and the audit record would say the token was
+        revoked at the moment of the *retry* rather than of the incident.
+
+        `updated_at` is set explicitly because this is a Core UPDATE: `TimestampMixin`
+        declares `onupdate` client-side (app/shared/models.py), so it only fires through the
+        ORM flush path and a Core statement would silently leave the column stale.
+
+        The follow-up SELECT is what separates "already revoked" from "not yours". Both
+        cases produce zero updated rows, and collapsing them would make repeated revocation
+        indistinguishable from targeting another tenant's token — one is a 204, the other a
+        404, and confusing them either breaks idempotency or turns this endpoint into an
+        existence oracle.
+        """
+        revoked = await self._session.scalar(
+            update(ApiToken)
+            .where(
+                ApiToken.id == token_id,
+                ApiToken.workspace_id == self._ctx.workspace_id,
+                ApiToken.revoked_at.is_(None),
+            )
+            .values(revoked_at=func.now(), updated_at=func.now())
+            .returning(ApiToken.id)
+        )
+        if revoked is not None:
+            return RevocationOutcome.REVOKED
+
+        # Zero rows updated: either the token is already revoked, or it is not this
+        # Workspace's to revoke. The distinction is scoped exactly like every other read
+        # here, so a token belonging to another tenant is simply invisible.
+        exists = await self._session.scalar(
+            select(ApiToken.id).where(
+                ApiToken.id == token_id,
+                ApiToken.workspace_id == self._ctx.workspace_id,
+            )
+        )
+        return (
+            RevocationOutcome.ALREADY_REVOKED if exists is not None else RevocationOutcome.NOT_FOUND
+        )
 
     async def create(
         self,

@@ -242,6 +242,34 @@ a decision. It is treated as an information-disclosure boundary:
   names a Workspace, and the pagination cursor carries a position rather than an authority
   (ADR-0011), so a forged cursor cannot cross a tenant boundary.
 
+### 4.5 API token revocation
+
+`DELETE /v1/api-tokens/{id}` requires `api_tokens:manage` and returns 204.
+
+- **Effective immediately.** `revoked_at` is set and the single existing resolver
+  (`get_workspace_context`) rejects the token on its next use — there is no cache to expire
+  and no second validity mechanism. MCP_RUNTIME.md §5: revoking "severs every client using
+  it immediately". A request that authenticated *before* the revocation committed completes
+  normally; revocation binds every request that begins after the commit.
+- **A state transition, not a row deletion.** The row survives with `revoked_at` set and
+  stays visible in listings, which is what lets an incident review establish that a
+  credential existed and when it stopped working. (`credentials` are different — §3 of
+  DATABASE_DESIGN.md deletes those rows outright.)
+- **Idempotent**, preserving the *first* `revoked_at`. Revocation is what an operator
+  reaches for mid-incident, often through a retry or a script run twice; an error on the
+  second attempt would imply the credential is somehow still live at the moment certainty
+  matters most. Preserving the original timestamp keeps the audit trail honest — an
+  unconditional overwrite would record the retry instead of the incident.
+- **One-way.** There is no un-revoke operation, so a compromised credential cannot be
+  restored (ADR-0012).
+- **A machine token cannot revoke anything, including itself.** Otherwise a stolen
+  credential could cut off every *other* token in the Workspace — including the operator's
+  — turning a compromise into a denial of service during the response to it.
+- **Cross-tenant targets answer `not_found`, identically to an id that never existed**
+  (§3), so the endpoint cannot be used to probe which token ids are real elsewhere.
+  Creating a token grants no authority over it: `created_by_member_id` is provenance, and
+  authority comes from the role matrix alone.
+
 ## 5. Secrets handling rules
 
 1. Secrets live in `.env` files (local) and platform secret stores (Railway/Vercel) —
