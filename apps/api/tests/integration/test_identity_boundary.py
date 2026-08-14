@@ -289,7 +289,11 @@ async def test_members_user_id_round_trips_a_better_auth_user_id(
     round-trip rather than by reading the column width, because equality is the property
     that actually matters.
     """
-    better_auth_user_id = "hX4wNWEYqXe6vWfesytcUIDxvDJPHNGr"
+    # Generated rather than pasted from a real sign-up. Better Auth ids are 32 characters
+    # and `uuid4().hex` is exactly 32, so the length under test is identical — but a
+    # high-entropy 32-character literal in the source is indistinguishable from a leaked
+    # credential to a secret scanner, and gitleaks flagged the pasted one.
+    better_auth_user_id = uuid.uuid4().hex
     assert len(better_auth_user_id) == 32
 
     workspace_id = uuid.uuid4()

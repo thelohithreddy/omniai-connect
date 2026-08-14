@@ -15,14 +15,22 @@
  *   pnpm --filter web test
  */
 import assert from "node:assert/strict";
-import { createPublicKey, verify as verifySignature } from "node:crypto";
+import { createPublicKey, randomUUID, verify as verifySignature } from "node:crypto";
 import { after, before, describe, test } from "node:test";
 
 import { getAuth } from "../src/lib/auth.ts";
 
 const ORIGIN = "http://localhost:3000";
 const BASE = `${ORIGIN}/api/auth`;
-const PASSWORD = "correct-horse-battery-staple-1";
+
+/**
+ * Generated per run rather than written down. A password literal in the repository is
+ * indistinguishable from a leaked credential to a secret scanner — gitleaks flagged the
+ * previous fixed string — and a password that differs every run is a stronger fixture
+ * anyway: the leakage assertions below search output for *this* run's value, so they
+ * cannot accidentally pass by matching nothing.
+ */
+const PASSWORD = `pw-${randomUUID()}`;
 
 const auth = getAuth();
 
