@@ -521,6 +521,41 @@ async def test_service_cannot_reach_another_workspace(
             await service.get_member_by_user_id("b_only")
 
 
+async def test_mismatched_context_is_refused_by_the_database(
+    app_session: AsyncSession,
+    admin_engine: AsyncEngine,
+    workspace_a: SeededWorkspace,
+    workspace_b: SeededWorkspace,
+) -> None:
+    """Defense in depth, asserted at the service layer.
+
+    Binds the transaction to workspace A but hands the service a repository whose context
+    claims workspace B — what a compromised or buggy auth layer would produce. Layer 1 is
+    now actively working against us: the repository's predicate *asks for* B's rows. RLS
+    alone decides, and it refuses both directions.
+
+    The write raises a raw `DBAPIError` rather than a domain exception, and that is
+    deliberate rather than an oversight. This state is unreachable through any caller
+    input — it means the bound tenant and the resolved context disagree, which is an
+    internal inconsistency, not a user error. The application's catch-all handler turns it
+    into a generic `internal` 500 with no detail leaked (main.py), which is the honest
+    answer. Translating it into a 4xx domain error would dress a serious bug up as an
+    ordinary rejection.
+    """
+    from sqlalchemy.exc import DBAPIError
+
+    await seed_member(admin_engine, workspace_b.id, user_id="b_only")
+
+    async with app_session.begin():
+        await UnitOfWork(session=app_session).bind_workspace(workspace_a.id)
+        mismatched = MemberService(MemberRepository(app_session, make_context(workspace_b.id)))
+        assert await mismatched.list_members() == []
+        with pytest.raises(NotFoundError):
+            await mismatched.get_member_by_user_id("b_only")
+        with pytest.raises(DBAPIError):
+            await mismatched.add_member(user_id="smuggled", role="member")
+
+
 async def test_service_writes_land_in_its_own_workspace(
     app_session: AsyncSession,
     admin_engine: AsyncEngine,
