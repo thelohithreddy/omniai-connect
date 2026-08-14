@@ -37,6 +37,13 @@ test: ## Run all tests
 
 migrate: ## Apply DB migrations (runs inside the api container against the compose db)
 	docker compose exec api alembic upgrade head
+	$(MAKE) migrate-identity
+
+# Better Auth owns the `identity` schema and migrates it itself (ADR-0014). Separate from
+# Alembic on purpose: Alembic never learns the schema's name, which is what keeps
+# `alembic downgrade base` from destroying human identity data.
+migrate-identity: ## Apply Better Auth's schema to the `identity` schema
+	docker compose exec -w /repo/apps/web web pnpm migrate:identity
 
 migrate-down: ## Roll back one migration
 	docker compose exec api alembic downgrade -1
@@ -54,6 +61,9 @@ db-reset: ## Destroy and recreate the local database volume, then migrate
 	docker compose up -d api
 	@echo "waiting for api…" && sleep 8
 	docker compose exec api alembic upgrade head
+	docker compose up -d web
+	@echo "waiting for web…" && sleep 8
+	$(MAKE) migrate-identity
 
 test-api: ## Run backend tests inside the container (needs the stack up)
 	docker compose exec api pytest -q
@@ -62,4 +72,4 @@ clean: ## Remove build artifacts
 	rm -rf apps/web/.next .turbo node_modules apps/api/.venv
 
 .PHONY: help setup dev dev-web dev-api lint format typecheck test migrate migrate-down \
-	migration seed db-reset test-api clean
+	migration migrate-identity seed db-reset test-api clean

@@ -382,3 +382,57 @@ the document to change — not this implementation.
 
 The docker-compose API healthcheck deliberately still targets `/health`, not
 `/health/ready`: compose health gates container restarts, which §6 assigns to liveness.
+
+## ADR-0014 — Better Auth owns a dedicated `identity` schema through its own role
+
+**Status:** Accepted (2026-08-14) · **Context:** M1.3-D
+
+**Context:** ADR-0002 makes Better Auth the human identity provider in the Next.js layer.
+It does not say where Better Auth's tables live, which database role reaches them, or who
+runs their migrations — and Better Auth creates and migrates its own schema, so those
+questions have to be answered before it can be configured at all.
+
+Three placements were available and two are unsafe:
+
+- **`public`** is where every application table lives, and DATABASE_DESIGN.md §1 states the
+  only tables there without `workspace_id` are `workspaces` itself and global reference
+  data. Better Auth's five tables are global identity infrastructure and have no tenant
+  column, so putting them in `public` contradicts the schema's stated invariant and puts
+  them under Alembic's autogenerate.
+- **`auth`** was the initially authorized choice and had to be revoked on discovery: it is
+  already created by migration `0001_tenancy_foundation` for `auth.resolve_api_token`
+  (ADR-0008), and that migration's downgrade executes `DROP SCHEMA auth CASCADE`. CI runs
+  `alembic downgrade base` on every push, so Better Auth's users, sessions and signing keys
+  would have been destroyed by a routine rollback — silently, since nothing asserted they
+  were there.
+
+**Decision:**
+
+1. **Better Auth's tables live in a third schema, `identity`,** owned by a dedicated role
+   `omniai_identity`. Neither is mentioned by any Alembic migration, and `env.py` sets
+   `include_schemas=False`, so autogenerate cannot see the schema and `downgrade base`
+   cannot reach it. Rollback safety is structural rather than a property of today's
+   migrations happening to leave it alone.
+2. **The two roles are granted nothing on each other's data.** `omniai_app` has no `USAGE`
+   on `identity` — so a compromised application credential cannot read password hashes,
+   sessions, or the JWT signing key — and `omniai_identity` cannot read `workspaces`,
+   `members`, or `api_tokens`. The boundary is symmetric because protecting only the
+   direction someone thought of is how half a boundary ships.
+3. **Better Auth owns its own migrations,** applied by `pnpm --filter web migrate:identity`
+   through the library's own `getMigrations`, not `@better-auth/cli`. The CLI's latest
+   release (1.4.21) trails the installed library (1.6.28), and a migrator behind the runtime
+   can generate a schema the runtime does not expect. The script imports the runtime's own
+   config object, so the schema and the code reading it cannot disagree.
+4. **The API never reads these tables.** It will authenticate a human by verifying a JWT
+   against the JWKS Better Auth publishes (M1.3-B), which is what lets the privilege
+   separation in (2) be total rather than aspirational.
+5. **`BETTER_AUTH_URL` must be `https://` in production.** Better Auth derives the session
+   cookie's `Secure` attribute and `__Secure-` prefix from the URL's scheme, so an `http://`
+   value silently issues downgraded cookies. `advanced.useSecureCookies` is deliberately not
+   set: overriding the derivation would pin one value across every environment.
+
+**Consequences:** Two migration lifecycles now exist, and a fresh database needs both
+(`alembic upgrade head` and `migrate:identity`) — CI runs both. Rotating
+`BETTER_AUTH_SECRET` invalidates every stored signing key, because the private key in
+`identity.jwks` is encrypted with it; rotation therefore requires clearing `identity.jwks`
+and accepting that outstanding JWTs stop verifying.

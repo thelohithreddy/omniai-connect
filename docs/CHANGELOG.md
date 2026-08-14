@@ -13,6 +13,27 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Better Auth human authentication (M1.3-D).** The control plane now has real human
+  identity: sign-up, sign-in, sign-out, sessions, and a JWKS document at
+  `/api/auth/jwks` that the API will verify against in M1.3-B. Better Auth is mounted at
+  the catch-all route `apps/web/src/app/api/auth/[...all]/route.ts`.
+  - Its tables live in a dedicated `identity` schema owned by a dedicated `omniai_identity`
+    role (ADR-0014). `omniai_app` is granted nothing there and `omniai_identity` cannot read
+    tenant tables, so neither credential can reach the other's data. `identity` is invisible
+    to Alembic, so `alembic downgrade base` cannot destroy human identity data — the hazard
+    that ruled out the `auth` schema, which migration 0001 drops with `CASCADE`.
+  - Better Auth owns its own migrations: `pnpm --filter web migrate:identity`, run through
+    the library's own `getMigrations` rather than the version-skewed `@better-auth/cli`.
+  - Sessions are DB-backed and opaque; JWTs are EdDSA (Ed25519), 15-minute, with `iss`/`aud`
+    derived from `BETTER_AUTH_URL` and the signing private key encrypted at rest.
+  - `BETTER_AUTH_URL` must be `https://` in production, asserted at construction: Better Auth
+    derives the cookie's `Secure` attribute from the scheme, so an http URL would silently
+    downgrade every session cookie.
+  - Adds an auth contract suite (`pnpm --filter web test`, 20 tests, real Postgres) and a
+    database boundary suite (`tests/integration/test_identity_boundary.py`, 11 tests). CI
+    gained a Postgres service on the web job and identity provisioning on both.
+  - No FastAPI JWT verification yet — that is M1.3-B.
+
 - **Member management endpoints (M1.3-A).** `GET /v1/members`, `PATCH /v1/members/{id}`,
   `DELETE /v1/members/{id}` behind `members:manage` — the router layer M1.2-C deliberately
   left unbuilt. No migration; no change to `MemberService`'s business rules.
