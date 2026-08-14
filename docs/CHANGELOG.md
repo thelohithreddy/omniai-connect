@@ -13,6 +13,23 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Token lifecycle verification (M1.2-J).** 18 integration tests exercising create →
+  authenticate → list → revoke → denied as one system, through the real endpoints, the real
+  resolver and real PostgreSQL. Test-only: no production code changed.
+  - Covers what module suites structurally cannot: that the plaintext `POST /v1/api-tokens`
+    *returns* authenticates against the real resolver; that a rolled-back creation leaves no
+    usable credential and a rolled-back revocation leaves the credential live; that a
+    revoked token is inert on every bearer-authenticated route; that pooled connections
+    carry no tenant into the next transaction, asserted by reading the GUC directly.
+  - Two genuine gaps in the lifecycle suite were found by mutation and closed: it could not
+    distinguish application-level tenant scoping from RLS (added an RLS-bypassed check), and
+    its pooled-connection test could not detect a session-scoped tenant binding because
+    every request rebinds (added a direct GUC observation).
+  - One vacuous assertion in the first draft was found and fixed: under `ASGITransport` a
+    failing request *raises* rather than returning 500, so an assertion placed after such a
+    call never executed.
+  - 25 adversarial mutations run against the lifecycle suite alone, with zero survivors.
+
 - **API token revocation (M1.2-H).** `DELETE /v1/api-tokens/{id}` → 204 stops a credential
   working immediately. No migration: `revoked_at` already existed and authentication already
   rejected revoked tokens, so this module supplies only the state transition.
