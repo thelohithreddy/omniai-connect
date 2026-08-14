@@ -30,7 +30,7 @@ from app.core.authz import Permission, Role
 from app.core.db import UnitOfWork, get_uow
 from app.core.exceptions import PermissionDeniedError
 from app.core.ids import new_id
-from app.core.security import CallerIdentity, WorkspaceContext
+from app.core.security import CallerIdentity, WorkspaceContext, get_workspace_context
 from app.domains.workspaces.repository import MemberRepository
 from app.main import app as real_app
 from tests.conftest import SeededWorkspace
@@ -561,6 +561,96 @@ async def test_caller_cannot_escalate_by_supplying_role_or_permission(
         **attack,  # type: ignore[arg-type]
     )
     assert response.status_code == 403, "caller-supplied field changed the decision"
+
+
+def build_authorized_app(
+    app_engine: AsyncEngine, workspace_id: uuid.UUID, member_id: uuid.UUID
+) -> FastAPI:
+    """A test app whose authentication yields a *human* context, as M1.2+ eventually will.
+
+    `get_workspace_context` is overridden rather than reimplemented: the override receives
+    the request's `UnitOfWork` through the normal dependency and binds the tenant on it,
+    exactly as the real authenticator does. Everything downstream — membership lookup,
+    policy, the 403 — is untouched production code.
+    """
+    factory = async_sessionmaker(app_engine, expire_on_commit=False, autoflush=False)
+    test_app = FastAPI()
+    for exc, handler in real_app.exception_handlers.items():
+        test_app.add_exception_handler(exc, handler)  # type: ignore[arg-type]
+
+    @test_app.get("/needs-members-manage")
+    async def needs_members_manage(  # pyright: ignore[reportUnusedFunction]
+        ctx: Annotated[WorkspaceContext, Depends(require_permission(Permission.MEMBERS_MANAGE))],
+    ) -> dict[str, str]:
+        return {"workspace": str(ctx.workspace_id)}
+
+    async def override_uow() -> object:
+        async with factory() as session, session.begin():
+            yield UnitOfWork(session=session)
+
+    async def override_context(uow: Annotated[UnitOfWork, Depends(get_uow)]) -> WorkspaceContext:
+        await uow.bind_workspace(workspace_id)
+        return member_context(workspace_id, member_id)
+
+    test_app.dependency_overrides[get_uow] = override_uow
+    test_app.dependency_overrides[get_workspace_context] = override_context
+    return test_app
+
+
+@pytest.mark.parametrize(
+    ("role", "expected"), [("owner", 200), ("admin", 200), ("member", 403), ("viewer", 403)]
+)
+async def test_end_to_end_through_real_dependency_injection(
+    app_engine: AsyncEngine,
+    admin_engine: AsyncEngine,
+    workspace_a: SeededWorkspace,
+    role: str,
+    expected: int,
+) -> None:
+    """The only allow path exercised through the real FastAPI dependency graph.
+
+    Everything else in this file is a denial, and denials are the weaker evidence: if
+    FastAPI's per-request dependency caching ever stopped sharing one `UnitOfWork` between
+    authentication and authorization, the membership lookup would run on an *unbound*
+    transaction, RLS would hide every row, and every check would deny. Fail-closed, so not
+    a security hole — but the authorization system would be silently inert and a suite of
+    denial tests would still be green.
+
+    A 200 here proves the whole chain: the tenant was bound on the same transaction the
+    membership lookup used, the role came out of the row, and the policy allowed it.
+    """
+    member_id = await seed_member(admin_engine, workspace_a.id, role=role)
+    test_app = build_authorized_app(app_engine, workspace_a.id, member_id)
+    async with AsyncClient(transport=ASGITransport(app=test_app), base_url="http://t") as client:
+        response = await client.get("/needs-members-manage")
+
+    assert response.status_code == expected, (
+        f"{role} on members:manage expected {expected}, got {response.status_code}: "
+        f"{response.text[:200]}"
+    )
+    if expected == 200:
+        assert response.json() == {"workspace": str(workspace_a.id)}
+    else:
+        assert response.json()["error"]["code"] == "forbidden"
+
+
+async def test_end_to_end_denies_a_membership_from_another_workspace(
+    app_engine: AsyncEngine,
+    admin_engine: AsyncEngine,
+    workspace_a: SeededWorkspace,
+    workspace_b: SeededWorkspace,
+) -> None:
+    """Cross-workspace escalation, through the real request path rather than in-process.
+
+    An owner membership belonging to workspace A, presented while the request is
+    authenticated against workspace B. 403, not 200.
+    """
+    a_owner = await seed_member(admin_engine, workspace_a.id, role="owner")
+    test_app = build_authorized_app(app_engine, workspace_b.id, a_owner)
+    async with AsyncClient(transport=ASGITransport(app=test_app), base_url="http://t") as client:
+        response = await client.get("/needs-members-manage")
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "forbidden"
 
 
 # --------------------------------------------------------------------------------------
