@@ -198,9 +198,15 @@ jobs:
           export BETTER_AUTH_SECRET="$(openssl rand -base64 32)"
           pnpm install --frozen-lockfile
           pnpm --filter web migrate:identity
-          pnpm --filter web build
-          nohup pnpm --filter web start > /tmp/better-auth-web.log 2>&1 &
-          for i in $(seq 1 60); do
+          # `next dev`, not `next start` — deliberately. `next start` runs with
+          # NODE_ENV=production, and the M1.3-D boot guard in apps/web/src/lib/auth.ts
+          # correctly REFUSES to start a production server on an http:// BETTER_AUTH_URL
+          # (it would issue session cookies without the Secure attribute). CI's provider is
+          # a localhost http test fixture, so it must run in development mode — exactly as
+          # the docker-compose `web` service does. Weakening the guard to make prod boot on
+          # http would defeat the very control M1.3-D added.
+          nohup pnpm --filter web dev > /tmp/better-auth-web.log 2>&1 &
+          for i in $(seq 1 90); do
             curl -sf http://localhost:3000/api/auth/jwks > /dev/null && break
             sleep 1
           done
