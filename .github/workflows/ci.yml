@@ -183,16 +183,30 @@ jobs:
       # then asserts `identity` is still intact. Choosing a schema Alembic already owned
       # would fail right here, which is exactly how this module found that hazard.
       #
-      # The secret is generated per-run and thrown away with the job's database — it signs
-      # nothing that outlives the run, and there is no literal in the repository to leak.
-      - name: Apply Better Auth's schema to `identity`
+      # Since M1.3-B the provider is also STARTED: the human-auth E2E tests sign in against
+      # the real Better Auth and the API's verifier fetches its real JWKS — those tests
+      # fail rather than skip when the provider is absent, deliberately. One secret is
+      # exported for the whole step so the migration, the running server, and the jwks row
+      # it mints all agree; a mismatch is exactly the failed-decrypt outage ADR-0014
+      # documents. The secret is generated per-run and dies with the job's database.
+      - name: Apply Better Auth's schema and start the provider
         working-directory: ${{ github.workspace }}
         env:
           BETTER_AUTH_URL: http://localhost:3000
           BETTER_AUTH_DATABASE_URL: postgresql://omniai_identity:omniai_identity@localhost:5432/omniai
         run: |
+          export BETTER_AUTH_SECRET="$(openssl rand -base64 32)"
           pnpm install --frozen-lockfile
-          BETTER_AUTH_SECRET="$(openssl rand -base64 32)" pnpm --filter web migrate:identity
+          pnpm --filter web migrate:identity
+          pnpm --filter web build
+          nohup pnpm --filter web start > /tmp/better-auth-web.log 2>&1 &
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:3000/api/auth/jwks > /dev/null && break
+            sleep 1
+          done
+          curl -sf http://localhost:3000/api/auth/jwks > /dev/null || {
+            echo "Better Auth provider failed to start"; tail -50 /tmp/better-auth-web.log; exit 1;
+          }
 
       # --frozen: fail if uv.lock is stale rather than re-resolving (P-59).
       - run: uv sync --frozen

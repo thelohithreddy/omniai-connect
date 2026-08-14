@@ -105,8 +105,49 @@ Two identity planes, per ADR-0002 — never mixed:
 
 | Plane | Who | Mechanism |
 |---|---|---|
-| Human | Dashboard users | Better Auth in apps/web owns signup/login/sessions/social OAuth; FastAPI verifies the signed session/JWT via shared JWKS/secret and resolves a Member + Workspace context per request. |
+| Human | Dashboard users | Better Auth in apps/web owns signup/login/sessions/social OAuth; FastAPI verifies the issued **EdDSA JWT** against Better Auth's published JWKS (`/api/auth/jwks`) and resolves a Member + Workspace context per request (ADR-0015). |
 | Machine | AI clients, automation | Workspace-scoped API tokens issued by the API itself. Shown once at creation, stored hashed (never recoverable), revocable individually, and bound to exactly one Workspace. |
+
+**Human JWT verification (ADR-0015).** The single composite resolver `get_workspace_context`
+dispatches by credential shape: the `omc_` prefix takes the machine path, everything else
+the human path, and neither falls through to the other. The human verifier:
+
+- pins the algorithm allowlist to `("EdDSA",)` — `alg=none`, HMAC confusion, and every
+  RSA/EC variant are refused before key material is touched (the token cannot choose its
+  own algorithm), and the `PyJWK` key binding refuses a mismatched `alg` as a second gate;
+- validates `iss` and `aud` against `BETTER_AUTH_URL`, so a token minted by any *other*
+  Better Auth deployment does not authenticate here;
+- requires `exp`, `iat`, `sub`, `iss`, `aud`; honors `nbf` when present; 30 s leeway;
+- reads keys only from the configured JWKS URL — never from the token (`jku`/`x5u`/embedded
+  keys are ignored) — through a bounded cache: 300 s TTL, single-flight refresh, one forced
+  refresh per unknown `kid` behind a 30 s cooldown (amplification-bounded), stale-on-error,
+  fail-closed when no keys have ever been fetched;
+- uses the verified `sub` for one thing only — the membership lookup. **No JWT claim confers
+  authorization**: role comes from the persisted Member row read under RLS, permissions from
+  the matrix in §4.1. A claim-stuffed token (`role: owner`, `permissions: [...]`) moves
+  nothing.
+
+**Workspace is established, never asserted.** A human's workspace is resolved from persisted
+membership via `auth.resolve_member_workspaces` (a SECURITY DEFINER bootstrap twin of
+`auth.resolve_api_token`, ADR-0008/0015), not from any request signal. A subject with
+exactly one membership binds to it; zero or many fail closed with the uniform 401. Supplying
+`X-Workspace-Id`, a `workspace_id` query parameter, or a `workspace_id` JWT claim changes
+nothing — selecting a workspace among several that a user belongs to is an undefined
+public-API decision (recorded as an Open Question in PROJECT_STATUS.md), and the interim is
+deny-by-default.
+
+**Revocation.** A verified JWT is bearer-valid until `exp` (≤ 900 s); logout ends the Better
+Auth session but cannot invalidate an outstanding JWT, and FastAPI never sees the session
+(it cannot read the `identity` schema, ADR-0014). Immediate lockout is achieved by removing
+the Member — authorization is the membership row, not the token, so removal takes effect on
+the next request. Rotating `BETTER_AUTH_SECRET` invalidates all outstanding tokens within
+one cache TTL.
+
+**Uniform failure.** Every human-credential failure — malformed, bad signature, wrong
+issuer/audience, expiry, unknown `kid`, JWKS outage, no membership, ambiguous membership —
+returns the one 401 message; the reason goes to structured logs (event names only, never
+token material). Authentication (401) and authorization (403) stay distinct (§4.2); a failed
+cross-tenant read is the canonical 404, never a 403 existence oracle.
 
 ### 4.1 Role matrix
 

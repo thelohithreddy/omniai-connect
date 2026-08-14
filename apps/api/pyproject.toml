@@ -20,6 +20,11 @@ dependencies = [
     # and returns a real uuid.UUID, so it binds directly to SQLAlchemy's Uuid type —
     # uuid-utils returns a foreign type needing conversion at every boundary. (P-60)
     "uuid6>=2024.7.10",
+    # Human JWT verification against Better Auth's JWKS (ADR-0015). The [crypto]
+    # extra pulls `cryptography` for EdDSA/Ed25519 — the observed signing algorithm.
+    # PyJWT's API requires an explicit algorithms allowlist, which is the property
+    # that makes algorithm-confusion unrepresentable rather than merely tested-for.
+    "pyjwt[crypto]>=2.10",
 ]
 
 [dependency-groups]

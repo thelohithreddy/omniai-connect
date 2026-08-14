@@ -436,3 +436,111 @@ Three placements were available and two are unsafe:
 `BETTER_AUTH_SECRET` invalidates every stored signing key, because the private key in
 `identity.jwks` is encrypted with it; rotation therefore requires clearing `identity.jwks`
 and accepting that outstanding JWTs stop verifying.
+
+## ADR-0015 — Human JWT verification: PyJWT, pinned EdDSA, bounded JWKS cache, membership-bootstrap resolution
+
+**Status:** Accepted (2026-08-15) · **Context:** M1.3-B
+
+**Context:** ADR-0002 decides *that* FastAPI verifies the human credential ("FastAPI
+validates the signed session/JWT on every request via shared JWKS/secret and maps it to a
+Member + Workspace context"), and ADR-0014 point 4 resolves the mechanism to a JWT verified
+against the JWKS Better Auth publishes. Neither decides the verification library, the
+accepted algorithm, the issuer/audience values, the JWKS cache behavior, or how a verified
+subject becomes a workspace-bound context. M1.3-D built the real provider, so several of
+those are now **observable facts** rather than open choices; the rest are engineering
+decisions recorded here.
+
+**Observed provider contract (recorded, not chosen).** Better Auth 1.6.28 with the default
+`jwt()` plugin emits: `alg: EdDSA` (Ed25519), a `kid` header resolving into the JWKS at
+`/api/auth/jwks` (`kty: OKP`, `crv: Ed25519`, public parameters only), `iss` and `aud` both
+equal to `BETTER_AUTH_URL`, `sub` = the Better Auth user id (the same opaque string
+`members.user_id` stores), `iat`/`exp` with a 900-second lifetime, and **no `nbf`**. The
+web contract suite pins all of this on the provider side; the verifier pins it on the
+consumer side, so drift breaks both ends visibly.
+
+**Decision:**
+
+1. **Library: PyJWT (`pyjwt[crypto]`), not python-jose, joserfc, or authlib.**
+   python-jose is effectively unmaintained with open algorithm-confusion CVE history
+   (CVE-2024-33663/33664) and is excluded outright. authlib imports an entire OAuth
+   framework to verify one token shape. joserfc is sound but young. PyJWT is the narrow,
+   ubiquitous choice: EdDSA via the `cryptography` extra, an **explicit `algorithms=[...]`
+   allowlist required by its API** (algorithm confusion is structurally unrepresentable —
+   the post-CVE-2022-29217 design), typed (`py.typed`), actively maintained. Its sync
+   JWKS client is not used; the JWKS cache below is ours, over the already-present httpx.
+2. **Algorithm allowlist: `("EdDSA",)`** — exactly what the provider emits. `alg=none`,
+   HMAC confusion, and every RSA/EC variant fail the allowlist before any key material is
+   touched.
+3. **Issuer and audience: `settings.better_auth_url`.** These are the observed claim
+   values, already configured (M1.3-D), and asserted by the provider's own contract tests.
+   No new authority is invented; both are validated on every token.
+4. **Required claims: `exp`, `iat`, `sub`, `iss`, `aud`.** `nbf` is validated when present
+   but not required — the provider does not emit it. Leeway 30 s on time-based claims:
+   containers and managed platforms are NTP-synced; 30 s absorbs real skew without
+   materially extending the 900 s token lifetime.
+5. **JWKS resolution: fetch only from configuration, never from the token.** The URL
+   derives from `better_auth_url` (`{base}/api/auth/jwks`), overridable via
+   `BETTER_AUTH_JWKS_URL` solely because container networking can make the fetch address
+   differ from the public issuer string (`http://web:3000` vs `http://localhost:3000`).
+   `jku`/`x5u`/embedded keys are never honored — PyJWT does not read them and the resolver
+   selects keys exclusively by `kid` from the configured document.
+6. **Cache policy: TTL 300 s, single-flight refresh, unknown-`kid` forced refresh behind a
+   30 s cooldown, stale-on-error.** 300 s bounds how long a *removed* key keeps verifying
+   (key removal is the revocation lever — ADR-0014's secret-rotation consequence). The
+   cooldown bounds attacker-driven amplification: unknown `kid`s can force at most one
+   fetch per 30 s process-wide. On refresh failure the last-good keys keep serving, with a
+   warning — public keys are not secrets and do not expire; the alternative turns any
+   control-plane blip into a human-auth outage. A process that has **never** fetched keys
+   fails closed. Fetch timeout 2.0 s, the readiness-probe precedent (ADR-0013).
+   This fetch is a first-party call to our own control plane — platform infrastructure per
+   SECURITY.md §1.1, not tenant egress, so the Execution-Runtime-only rule (Bible §6.3)
+   does not apply to it.
+7. **Membership bootstrap follows ADR-0008 exactly.** Resolving *which* workspaces a
+   verified subject belongs to is the same bootstrap problem as resolving an API token:
+   the lookup discovers the workspace, so it cannot run under a policy that already needs
+   one. Migration 0004 adds `auth.resolve_member_workspaces(p_user_id text)` — SECURITY
+   DEFINER, owned by `omniai_auth`, `search_path` pinned, `EXECUTE` revoked from PUBLIC and
+   granted to `omniai_app` alone, backed by a `FOR SELECT TO omniai_auth USING (true)`
+   policy on `members` and an `ix_members_user_id` index (a bootstrap lookup cannot lead
+   with `workspace_id`, the same exception `api_tokens.token_hash` already embodies).
+8. **Workspace resolution: exactly-one-membership resolves; everything else fails closed.**
+   The repository is explicit that "which Workspaces does this user belong to" as a *user
+   feature* needs its own architectural decision, and no canonical workspace-*selection*
+   mechanism (path, header, claim) exists anywhere. So: a verified subject with exactly one
+   membership binds to that workspace — the degenerate case where no selection exists to
+   perform, derived purely from persisted state, influenceable by nothing in the request.
+   Zero memberships or more than one produce the uniform 401. The selection mechanism for
+   multi-workspace humans is recorded as an Open Question in PROJECT_STATUS.md; it is a
+   public-API-shape decision that belongs to the founder, and nothing here forecloses any
+   answer.
+9. **One composite resolver, no fallback between planes.** BACKEND_SPEC §3 already defines
+   `get_workspace_context` as resolving both credential types. Discrimination is by shape:
+   credentials bearing the `omc_` prefix take the machine path, everything else the human
+   path, and neither path ever falls through to the other — a failed JWT is never retried
+   as an API token, nor the reverse. Machine authentication is byte-for-byte unchanged.
+10. **Uniform failure: every human-path validation failure returns the canonical 401 with
+    one message, "Invalid or expired credentials."** Malformed token, bad signature, wrong
+    issuer/audience, expiry, unknown `kid`, JWKS outage with no cache, no membership, and
+    ambiguous membership are indistinguishable to the caller, matching the machine plane's
+    single-message precedent. The specific reason goes to structured logs — event names
+    only, never token material or claims.
+11. **JWT claims confer no authorization.** The verified `sub` is used for exactly one
+    thing: the membership lookup. Role comes from the persisted member row read under RLS
+    by the existing `resolve_member_role`; permissions come from the existing static
+    matrix (ADR-0009). Any other claim in the token — including Better Auth's `email`,
+    `name`, `role`-shaped extras a future plugin might add — is ignored by construction.
+
+**Revocation semantics (stated honestly).** A verified JWT is bearer-valid until `exp` —
+at most 900 s. Logout deletes the Better Auth session but does not and cannot invalidate
+outstanding JWTs, and FastAPI cannot observe logout (ADR-0014: the API never reads
+`identity` tables). Rotating `BETTER_AUTH_SECRET` (clearing `identity.jwks`) invalidates
+all outstanding tokens within one cache TTL of the next successful refresh. Removing a
+Member takes effect at that user's next request — the membership row, not the token, is
+what authorizes. Immediate JWT revocation is impossible under this stateless design; if it
+is ever required, that is a new ADR (denylist or session-introspection), not a patch.
+
+**Consequences:** Two new runtime dependencies (`pyjwt`, `cryptography`). One new
+migration (0004) extending the `auth` schema — reversible, and `identity` remains
+untouched by Alembic. Multi-workspace humans cannot authenticate until the selection
+decision lands; that is deliberate deny-by-default, not an oversight, and it is the
+recorded Open Question.

@@ -1,9 +1,13 @@
-"""Machine identity: workspace-scoped API token generation, hashing, and resolution.
+"""Caller identity resolution: machine API tokens, and human JWTs via `core.human_auth`.
 
 Per ADR-0002 there are two identity planes and they never mix. This module owns the
 *machine* plane — the tokens AI clients and Interfaces present (MCP_RUNTIME.md §2,
-AI_RUNTIME.md §2.1). Human identity is Better Auth's, lands in M1.2, and gets its own
-resolver.
+AI_RUNTIME.md §2.1) — and hosts the single composite resolver BACKEND_SPEC §3 defines:
+`get_workspace_context` accepts either credential type and dispatches by shape. Machine
+tokens carry the `omc_` prefix; anything else is treated as a human JWT and verified by
+`core.human_auth` (ADR-0015). Neither path ever falls through to the other — a failed JWT
+is never retried as an API token, nor the reverse, so a defect in one plane cannot become
+an authentication path through the other.
 
 **Why SHA-256 and not bcrypt/argon2.** Password hashes are deliberately slow because
 passwords are low-entropy and guessable; the work factor is what makes a dictionary attack
@@ -33,6 +37,12 @@ from sqlalchemy import text
 
 from app.core.db import UnitOfWork, get_uow
 from app.core.exceptions import UnauthorizedError
+from app.core.human_auth import (
+    HUMAN_AUTH_FAILED,
+    JWKSCache,
+    get_jwks_cache,
+    resolve_human_subject,
+)
 
 # noqa S105: this is a public, non-secret marker deliberately printed in dashboards and
 # logs so a leaked credential is greppable (the pattern GitHub uses with `ghp_`). It is a
@@ -123,12 +133,34 @@ _RESOLVE_TOKEN_SQL = text(
 )
 
 
+# The human bootstrap twin of `auth.resolve_api_token` (migration 0004, ADR-0015 §7): a
+# verified JWT names a user, not a workspace, so discovering the workspace cannot itself
+# run under the policy that needs one. Same SECURITY DEFINER mechanism, same owner role.
+_RESOLVE_MEMBER_SQL = text(
+    "SELECT member_id, workspace_id FROM auth.resolve_member_workspaces(:user_id)"
+)
+
+
 async def get_workspace_context(
     request: Request,
     uow: Annotated[UnitOfWork, Depends(get_uow)],
+    jwks_cache: Annotated[JWKSCache, Depends(get_jwks_cache)],
 ) -> WorkspaceContext:
-    """FastAPI dependency: Bearer token → bound, tenant-scoped request context."""
+    """FastAPI dependency: Bearer credential → bound, tenant-scoped request context.
+
+    The composite resolver of BACKEND_SPEC §3. Dispatch is by credential shape and is
+    exclusive: the `omc_` prefix is reserved by `generate_token`, so a machine token can
+    never parse as a JWT and a JWT can never carry the prefix. There is no retry of one
+    plane's credential against the other.
+    """
     presented = extract_bearer_token(request)
+    if presented.startswith(TOKEN_PREFIX):
+        return await _machine_context(request, uow, presented)
+    return await _human_context(request, uow, presented, jwks_cache)
+
+
+async def _machine_context(request: Request, uow: UnitOfWork, presented: str) -> WorkspaceContext:
+    """API token → context. The M1.2 path, byte-for-byte."""
     row = (
         await uow.session.execute(_RESOLVE_TOKEN_SQL, {"token_hash": hash_token(presented)})
     ).first()
@@ -151,6 +183,52 @@ async def get_workspace_context(
         caller=CallerIdentity(kind="api_token", api_token_id=row.token_id),
         request_id=request_id,
         scopes=tuple(row.scopes or ()),
+    )
+
+
+async def _human_context(
+    request: Request, uow: UnitOfWork, presented: str, jwks_cache: JWKSCache
+) -> WorkspaceContext:
+    """Verified human JWT → membership → context (ADR-0015 §§8–11).
+
+    `resolve_human_subject` owns every cryptographic and claim check; by the time it
+    returns, `sub` is proven to come from our issuer. What remains is pure membership:
+
+    - zero memberships   → uniform 401. The subject is real but has no tenant context;
+      distinguishing this from a forged token would let a stolen-JWT holder probe which
+      accounts have workspaces.
+    - one membership     → that workspace, the degenerate case where no selection exists.
+    - many memberships   → uniform 401, fail closed. Selecting among workspaces is an
+      undecided public-API-shape question (the Open Question in PROJECT_STATUS.md), and
+      guessing here would invent the answer. Deny-by-default is the only safe interim.
+
+    The role is deliberately NOT read here. `resolve_member_role` reads it from the
+    member row under RLS after binding — one source of truth, already tested, and a
+    bootstrap function that returned roles would be a second authorization surface.
+    """
+    sub = await resolve_human_subject(presented, jwks_cache)
+
+    rows = (await uow.session.execute(_RESOLVE_MEMBER_SQL, {"user_id": sub})).all()
+    if len(rows) != 1:
+        log.debug(
+            "human_auth.membership_unresolved",
+            membership_count=len(rows),
+        )
+        raise UnauthorizedError(HUMAN_AUTH_FAILED)
+
+    member_id, workspace_id = rows[0].member_id, rows[0].workspace_id
+    await uow.bind_workspace(workspace_id)
+    structlog.contextvars.bind_contextvars(workspace_id=str(workspace_id), member_id=str(member_id))
+
+    request_id: str = getattr(request.state, "request_id", "")
+    return WorkspaceContext(
+        workspace_id=workspace_id,
+        caller=CallerIdentity(kind="member", member_id=member_id),
+        request_id=request_id,
+        # Humans carry no token scopes; their authorization is the RBAC matrix, resolved
+        # from the persisted role by require_permission. An empty tuple here is a fact,
+        # not a placeholder.
+        scopes=(),
     )
 
 

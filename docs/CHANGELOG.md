@@ -13,6 +13,30 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Human JWT authentication in the API (M1.3-B).** FastAPI now verifies Better Auth's
+  EdDSA JWTs against the published JWKS and resolves them to a tenant-scoped
+  `WorkspaceContext`, completing the human half of ADR-0002. This is the first time an
+  authenticated *human* can call the API — every prior request was a machine API token.
+  - New `app/core/human_auth.py`: a pinned-EdDSA verifier (algorithm allowlist,
+    issuer/audience/lifetime validation, `sub`-only output) over a bounded JWKS cache
+    (300 s TTL, single-flight, unknown-`kid` refresh with a cooldown, stale-on-error,
+    fail-closed cold). `get_workspace_context` is now the composite resolver BACKEND_SPEC §3
+    describes — dispatch by the `omc_` prefix, no fallthrough between planes. Machine
+    authentication is byte-for-byte unchanged. Library: `pyjwt[crypto]` (ADR-0015).
+  - Migration 0004 adds `auth.resolve_member_workspaces` (SECURITY DEFINER bootstrap twin of
+    `auth.resolve_api_token`) and `ix_members_user_id`. A verified subject with exactly one
+    membership binds to it; **JWT claims never confer role, permission, or workspace** —
+    authorization stays the persisted Member row + the RBAC matrix (ADR-0009).
+  - Multi-workspace humans fail closed (uniform 401) pending a workspace-selection decision,
+    now a recorded Open Question. Revocation is honest: a JWT is valid until `exp` (≤ 900 s);
+    removing the Member is the immediate lockout.
+  - Tests: 50-case negative verifier matrix (unit), 22 integration tests (RBAC, tenancy,
+    machine/human separation, concurrency/single-flight, log audit), and 4 real-provider
+    E2E tests (live Better Auth login → real JWKS → real RLS). CI's API job now builds and
+    starts the provider so the E2E tests run for real rather than skip.
+  - No FastAPI change to M1.2 machine auth, M1.3-A endpoints, or M1.3-D — verified by the
+    full 590-test suite at both log levels.
+
 - **Better Auth human authentication (M1.3-D).** The control plane now has real human
   identity: sign-up, sign-in, sign-out, sessions, and a JWKS document at
   `/api/auth/jwks` that the API will verify against in M1.3-B. Better Auth is mounted at
