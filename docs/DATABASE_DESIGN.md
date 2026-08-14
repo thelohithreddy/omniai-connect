@@ -35,6 +35,25 @@ their owning domains are built (see ROADMAP.md milestones).
 - **Enums.** Stored as `text` with a `CHECK` constraint, not native Postgres enums
   (native enums make additive migrations awkward). Allowed values live in one Python
   module per domain.
+- **Intra-tenant foreign keys are composite.** A foreign key from one tenant table to
+  another carries `workspace_id` in the key, targeting a `UNIQUE (workspace_id, id)` on
+  the referenced table — not a bare reference to its `id`:
+
+  ```sql
+  UNIQUE (workspace_id, id),                       -- on the referenced table
+  FOREIGN KEY (workspace_id, invited_by)
+      REFERENCES members (workspace_id, id)
+      ON DELETE SET NULL (invited_by)              -- column-scoped; Postgres 15+
+  ```
+
+  This is a tenant-isolation control, not a stylistic preference. **Postgres validates
+  referential integrity internally with RLS bypassed**, so a single-column FK lets
+  workspace A store a reference to workspace B's row and no policy ever sees it. Carrying
+  `workspace_id` into the key makes a cross-tenant reference structurally impossible
+  rather than merely unlikely (ADR-0008).
+
+  The `ON DELETE SET NULL` must name its column: a bare `SET NULL` also targets
+  `workspace_id`, which is `NOT NULL`, so every parent deletion would fail.
 
 ## 2. Core ERD
 
