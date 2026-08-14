@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import ConflictError
+from app.core.pagination import CursorPosition
 from app.core.security import WorkspaceContext
 from app.domains.workspaces.models import ApiToken, Member, Workspace
 
@@ -48,6 +49,36 @@ class ApiTokenRepository:
             .where(ApiToken.workspace_id == self._ctx.workspace_id)
             .order_by(ApiToken.created_at.desc())
         )
+        return list((await self._session.scalars(stmt)).all())
+
+    async def list_page(self, *, limit: int, after: CursorPosition | None = None) -> list[ApiToken]:
+        """One page of this Workspace's tokens, newest first.
+
+        `workspace_id` is taken from the context and is not a parameter — there is no
+        argument here through which a caller could name another tenant, which is the same
+        guarantee `create` provides for writes.
+
+        **Ordering is `(created_at DESC, id DESC)`, and the second key is not decorative.**
+        `created_at` alone is not unique: two tokens minted in the same microsecond tie,
+        and a keyset predicate over a non-unique key either skips rows or serves one
+        forever. `id` is UUIDv7, so ordering by it agrees with creation order rather than
+        scrambling tied rows, and the pair is unique because `id` is the primary key.
+
+        The keyset predicate is written as a row comparison — `(created_at, id) < (…, …)`
+        — rather than the expanded `created_at < x OR (created_at = x AND id < y)`. Both
+        are correct; the row form is what Postgres can satisfy as a single index range
+        scan on `ix_api_tokens_workspace_id_created_at` instead of evaluating a disjunction.
+
+        Returns at most `limit` rows and knows nothing about pages: deciding whether more
+        exist is the service's job, because it requires fetching one extra row and that is
+        a pagination decision, not a persistence one.
+        """
+        stmt = select(ApiToken).where(ApiToken.workspace_id == self._ctx.workspace_id)
+        if after is not None:
+            stmt = stmt.where(
+                tuple_(ApiToken.created_at, ApiToken.id) < (after.created_at, after.id)
+            )
+        stmt = stmt.order_by(ApiToken.created_at.desc(), ApiToken.id.desc()).limit(limit)
         return list((await self._session.scalars(stmt)).all())
 
     async def get(self, token_id: uuid.UUID) -> ApiToken | None:

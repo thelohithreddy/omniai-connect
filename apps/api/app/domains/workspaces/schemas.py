@@ -92,3 +92,25 @@ class ApiTokenCreated(BaseModel):
     created_by_member_id: uuid.UUID | None
     expires_at: datetime | None
     created_at: datetime
+
+
+class ApiTokenList(BaseModel):
+    """The list envelope from API_GUIDELINES.md §3 — `data` / `next_cursor` / `has_more`.
+
+    Named fields rather than a bare array, and that is the contract's choice, not a
+    preference: a top-level JSON array cannot grow a pagination field later without
+    breaking every client, and it is the shape that makes "there are more" expressible at
+    all.
+
+    Items are `ApiTokenRead`, the same model every other token read uses. It has no
+    `token`, `plaintext`, or `token_hash` field, so this endpoint is structurally incapable
+    of emitting a credential — the guarantee comes from the model's shape, not from
+    remembering to exclude something here.
+    """
+
+    data: list[ApiTokenRead]
+    next_cursor: str | None = Field(
+        default=None,
+        description="Opaque; pass back as `?cursor=`. Null when `has_more` is false.",
+    )
+    has_more: bool

@@ -220,6 +220,28 @@ Tokens are currently issued **unscoped** (`scopes = []`). A scope vocabulary is 
 defined (ADR-0010) — and `[]` is the deny-by-default
 value, not a placeholder meaning "everything".
 
+### 4.4 API token listing
+
+`GET /v1/api-tokens` requires `api_tokens:manage` — the same capability as issuance, because
+no separate read capability exists in §4.1 and inventing one would widen the policy without
+a decision. It is treated as an information-disclosure boundary:
+
+- **Metadata only.** The response carries `token_prefix` — the public fragment that lets a
+  human recognise a credential, as GitHub shows `ghp_…` — and never the secret or its
+  SHA-256 digest. The read model has no field able to hold either, so this is a property of
+  the schema rather than of a filter someone must remember to apply.
+- **A machine token cannot enumerate the Workspace's credentials.** Reconnaissance is how a
+  stolen credential is used well: knowing how many tokens exist, what they are named, and
+  which are already revoked tells an attacker which to impersonate and when they would be
+  noticed. Machine identity resolves to no membership (ADR-0002), so the boundary that stops
+  a token minting another also stops it reading the list.
+- **A denial discloses nothing** — no count, ids, prefixes, names, workspace id, or the name
+  of the permission required. Echoing the required permission would let a prober map the
+  API's authorization surface endpoint by endpoint.
+- **The tenant comes from the authenticated context.** No query, path, body, or header field
+  names a Workspace, and the pagination cursor carries a position rather than an authority
+  (ADR-0011), so a forged cursor cannot cross a tenant boundary.
+
 ## 5. Secrets handling rules
 
 1. Secrets live in `.env` files (local) and platform secret stores (Railway/Vercel) —

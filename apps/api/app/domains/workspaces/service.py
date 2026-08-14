@@ -11,6 +11,13 @@ import uuid
 from dataclasses import dataclass, field
 
 from app.core.exceptions import NotFoundError, ValidationFailedError
+from app.core.pagination import (
+    DEFAULT_LIMIT,
+    CursorPosition,
+    decode_cursor,
+    encode_cursor,
+    resolve_limit,
+)
 from app.core.security import generate_token
 from app.domains.workspaces.models import MEMBER_ROLES, ApiToken, Member, Workspace
 from app.domains.workspaces.repository import (
@@ -187,6 +194,19 @@ def _require_valid_role(role: str) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class TokenPage:
+    """One page of token metadata plus the cursor that continues it.
+
+    `next_cursor` is `None` exactly when `has_more` is `False` (API_GUIDELINES.md §3), so
+    a client loops until the cursor is null without needing to interpret the rows.
+    """
+
+    tokens: list[ApiToken]
+    next_cursor: str | None
+    has_more: bool
+
+
+@dataclass(frozen=True, slots=True)
 class IssuedApiToken:
     """A newly created token *plus* its plaintext — a return value, never a stored one.
 
@@ -217,6 +237,41 @@ class ApiTokenService:
 
     def __init__(self, repository: ApiTokenRepository) -> None:
         self._repository = repository
+
+    async def list_tokens(
+        self, *, limit: int = DEFAULT_LIMIT, cursor: str | None = None
+    ) -> TokenPage:
+        """One page of this Workspace's token *metadata*, newest first.
+
+        Returns metadata only. There is no secret to withhold here and no code path that
+        could produce one: the plaintext was never stored (M1.2-F), and `ApiToken` has no
+        attribute holding it. Listing cannot recover a credential because the credential
+        does not exist anywhere to be recovered — not because this method remembers to
+        filter it out.
+
+        **`has_more` is computed by over-fetching one row, not by counting.** A
+        `SELECT count(*)` would be a second query over the whole tenant's tokens on every
+        page, and it would still be wrong — the count is taken at a different instant from
+        the page, so a concurrent issuance makes them disagree. Asking for `limit + 1` and
+        discarding the extra answers exactly the question "is there anything after this
+        page?" using the same snapshot as the page itself.
+
+        The cursor is decoded before the query runs, so a malformed one is a
+        `ValidationFailedError` rather than a silently empty page (API_GUIDELINES.md §3).
+        """
+        position = decode_cursor(cursor) if cursor is not None else None
+        page_size = resolve_limit(limit)
+
+        rows = await self._repository.list_page(limit=page_size + 1, after=position)
+
+        has_more = len(rows) > page_size
+        tokens = rows[:page_size]
+        next_cursor = (
+            encode_cursor(CursorPosition(created_at=tokens[-1].created_at, id=tokens[-1].id))
+            if has_more and tokens
+            else None
+        )
+        return TokenPage(tokens=tokens, next_cursor=next_cursor, has_more=has_more)
 
     async def issue(
         self,

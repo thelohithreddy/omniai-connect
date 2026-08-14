@@ -13,6 +13,21 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **API token listing (M1.2-G).** `GET /v1/api-tokens` returns a page of the Workspace's
+  token metadata, newest first.
+  - Keyset cursor pagination per API_GUIDELINES.md §3 (`limit` default 50, max 100;
+    `data`/`next_cursor`/`has_more`), ordered `(created_at DESC, id DESC)` so the sort key is
+    unique and pages cannot skip or repeat a row. `has_more` comes from over-fetching one
+    row rather than a `count(*)`. ADR-0011 records the design.
+  - Requires `api_tokens:manage`, so a machine token cannot enumerate the Workspace's
+    credentials — the same boundary that stops it minting one.
+  - Metadata only: `ApiTokenRead` has no field able to carry a secret or its digest, asserted
+    against the raw response bytes rather than the expected key set.
+  - Unknown query parameters are a `validation_error` rather than being silently dropped
+    (§4), so a caller cannot believe a misspelled or unsupported filter was applied.
+  - No schema change: the existing `(workspace_id, created_at DESC)` index serves the query.
+  - 44 tests; 21 adversarial mutations run with zero survivors.
+
 - **API token creation (M1.2-F).** `POST /v1/api-tokens` mints a workspace-scoped machine
   credential and returns its plaintext exactly once.
   - Schema (`alembic/versions/0003_api_token_creator.py`): `api_tokens.created_by_member_id`

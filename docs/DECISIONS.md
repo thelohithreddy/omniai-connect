@@ -237,3 +237,48 @@ resolution is a document change, not an implementation: §5 needs to state that
 credential-issuing endpoints are exempt, or specify storing an idempotency *marker* (key →
 token id) rather than the response body. Until then the guideline and the code disagree,
 and the code is deliberately the stricter of the two.
+
+## ADR-0011 — Keyset cursor pagination; cursors carry a position, not an authority
+
+**Status:** Accepted (2026-08-14) · **Context:** M1.2-G, the first list endpoint
+
+**Context:** API_GUIDELINES.md §3 mandates cursor pagination on every list endpoint and
+forbids offset pagination, and requires cursors to be opaque — *"encoded internally, signed
+if they ever carry state"*. It does not specify the cursor's contents, its ordering key, or
+what "carry state" means in practice. The first list endpoint has to settle those.
+
+**Decision:**
+
+1. **Keyset pagination on `(created_at DESC, id DESC)`.** The sort key must be unique or the
+   predicate is unsound: rows sharing a `created_at` would be skipped or served forever.
+   `id` breaks the tie and, being UUIDv7, orders in agreement with creation time rather than
+   scrambling tied rows. The predicate is expressed as a row comparison, which Postgres can
+   satisfy as a single index range scan.
+2. **`has_more` is computed by over-fetching one row**, never by `count(*)`. A count is a
+   second scan of the tenant's rows on every page *and* is taken at a different instant from
+   the page, so a concurrent insert makes the two disagree.
+3. **Cursors encode only the sort key of a row the client was already served**, and are
+   base64url-encoded so they read as opaque. They are **not signed**. §3's "signed if they
+   ever carry state" is read as applying to cursors that carry *server-side* state — a
+   snapshot id, a filter set, a privilege. A position the client has already seen is not
+   such state: forging it lets a caller resume from an arbitrary point **inside their own
+   tenant**, which is not a privilege since they may already page through all of it, and it
+   cannot reach another tenant because the workspace predicate comes from the authenticated
+   context and is applied independently.
+4. **Every unusable cursor is a `validation_error`** — expired, truncated, hand-written, or
+   from another endpoint. Silently serving page one would make a client loop forever or
+   believe it had reached the end of a list it had barely started.
+5. **Unknown query parameters are rejected**, per §4. FastAPI's default is to drop them, so a
+   client that misspells a filter or asks for one the endpoint does not support would
+   otherwise receive a 200 containing everything and believe it was filtered.
+
+**Consequences:** Cursors cannot express "jump to page 7"; only sequential traversal is
+possible. That is inherent to keyset pagination and acceptable — no canonical requirement
+asks for random page access, and offset is forbidden precisely because it buys that ability
+with correctness.
+
+If a future list endpoint needs a cursor that *does* carry state — a frozen snapshot, an
+encoded filter set, or anything a caller must not alter — point 3 no longer covers it and
+signing must be decided then: a key, an algorithm, and a rotation policy, none of which any
+canonical document currently establishes. Recorded here as the deferred question rather than
+pre-emptively answered.

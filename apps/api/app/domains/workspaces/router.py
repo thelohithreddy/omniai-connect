@@ -6,16 +6,24 @@ here grows an `if` about domain state, it belongs in the service.
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Final
 
-from fastapi import APIRouter, Depends, Response, status
+from fastapi import APIRouter, Depends, Query, Request, Response, status
 
 from app.core.authorization import require_permission
 from app.core.authz import Permission
 from app.core.db import UnitOfWork, get_uow
+from app.core.exceptions import ValidationFailedError
+from app.core.pagination import DEFAULT_LIMIT, MAX_LIMIT
 from app.core.security import CurrentWorkspace, WorkspaceContext
 from app.domains.workspaces.repository import ApiTokenRepository, WorkspaceRepository
-from app.domains.workspaces.schemas import ApiTokenCreate, ApiTokenCreated, WorkspaceRead
+from app.domains.workspaces.schemas import (
+    ApiTokenCreate,
+    ApiTokenCreated,
+    ApiTokenList,
+    ApiTokenRead,
+    WorkspaceRead,
+)
 from app.domains.workspaces.service import ApiTokenService, WorkspaceService
 
 router = APIRouter(prefix="/v1/workspaces", tags=["workspaces"])
@@ -30,6 +38,10 @@ api_tokens_router = APIRouter(prefix="/v1/api-tokens", tags=["api-tokens"])
 # It also means the required Permission is fixed at import time: it is captured in a
 # closure with no request in scope, so no header, body field, or query parameter can reach
 # it. A caller can fail the requirement; never choose a different one.
+#: The only query parameters this endpoint accepts. Anything else is a validation error
+#: rather than a silent no-op (API_GUIDELINES.md §4).
+_ALLOWED_LIST_PARAMS: Final = frozenset({"limit", "cursor"})
+
 AuthorizedTokenAdmin = Annotated[
     WorkspaceContext, Depends(require_permission(Permission.API_TOKENS_MANAGE))
 ]
@@ -73,6 +85,72 @@ def get_api_token_service(
     reorder below the write.
     """
     return ApiTokenService(ApiTokenRepository(uow.session, ctx))
+
+
+def reject_unknown_query_params(request: Request) -> None:
+    """API_GUIDELINES.md §4: *"Unknown filter/sort fields are a `validation_error`, not
+    silently ignored."*
+
+    FastAPI's default is the opposite — unrecognised query parameters are dropped without
+    comment. That default is quietly dangerous for a listing endpoint: a client that asks
+    for `?revoked=false`, or misspells `limit` as `limlt`, receives a perfectly valid 200
+    containing *everything*, and believes it received a filtered page. For a credential
+    inventory that is a correctness bug the caller cannot detect.
+
+    This endpoint documents its sortable fields as *none* — the order is fixed at
+    `-created_at` (§4's default) — so `sort` is unknown here too and is refused rather than
+    accepted and ignored, which would be the more misleading of the two failures.
+    """
+    unknown = sorted(set(request.query_params) - _ALLOWED_LIST_PARAMS)
+    if unknown:
+        raise ValidationFailedError(
+            "Unknown query parameters.",
+            details={"unknown": unknown, "allowed": sorted(_ALLOWED_LIST_PARAMS)},
+        )
+
+
+@api_tokens_router.get(
+    "",
+    response_model=ApiTokenList,
+    summary="List the Workspace's API tokens",
+    responses={
+        200: {"description": "A page of token metadata. Never contains a secret."},
+        400: {"description": "Unknown query parameter, bad limit, or an invalid cursor."},
+        401: {"description": "Missing or invalid credentials."},
+        403: {"description": "Caller does not hold `api_tokens:manage` in this Workspace."},
+    },
+)
+async def list_api_tokens(
+    service: Annotated[ApiTokenService, Depends(get_api_token_service)],
+    _: Annotated[None, Depends(reject_unknown_query_params)],
+    limit: Annotated[
+        int,
+        Query(ge=1, le=MAX_LIMIT, description="Page size. Defaults to 50, maximum 100."),
+    ] = DEFAULT_LIMIT,
+    cursor: Annotated[str | None, Query(description="Opaque cursor from a prior page.")] = None,
+) -> ApiTokenList:
+    """Page through this Workspace's tokens, newest first.
+
+    **Metadata only, always.** The response carries `token_prefix` — the public fragment
+    that lets a human recognise a credential in a revocation UI, exactly as GitHub shows
+    `ghp_…` — and never the secret or its hash. That is not enforced by a filter here: the
+    plaintext was never stored, and `ApiTokenRead` has no field able to carry either value.
+
+    The Workspace comes from the authenticated context and appears in no parameter of this
+    function. There is no request field — query, path, body, or header — through which a
+    caller could name a different tenant, so cross-workspace listing is not a request this
+    API can express.
+
+    Requires `api_tokens:manage`, the same capability as issuance (SECURITY.md §4.1). A
+    machine token therefore cannot enumerate the Workspace's credentials, for the same
+    reason it cannot mint one: it resolves to no membership (ADR-0002).
+    """
+    page = await service.list_tokens(limit=limit, cursor=cursor)
+    return ApiTokenList(
+        data=[ApiTokenRead.model_validate(token) for token in page.tokens],
+        next_cursor=page.next_cursor,
+        has_more=page.has_more,
+    )
 
 
 @api_tokens_router.post(
