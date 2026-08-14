@@ -16,7 +16,7 @@ while the system leaks.
 from __future__ import annotations
 
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 
 import pytest
@@ -32,6 +32,7 @@ from sqlalchemy.ext.asyncio import (
 from app.core.config import settings
 from app.core.db import UnitOfWork, get_uow
 from app.core.ids import new_id
+from app.core.logging import configure_logging
 from app.core.security import GeneratedToken, generate_token
 from app.main import app
 
@@ -41,6 +42,42 @@ class SeededWorkspace:
     id: uuid.UUID
     slug: str
     token: GeneratedToken
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _pin_log_level() -> Iterator[None]:
+    """Pin a permissive log level for the whole session, **before any logger is used**.
+
+    Session-scoped and autouse for a reason that is not obvious and cost one red CI run to
+    find. `configure_logging` sets `cache_logger_on_first_use=True`, which is the correct
+    production setting — logging is configured once at startup and the cache removes a
+    per-call config lookup from every request. Its documented consequence is that a logger
+    **freezes its wrapper class, and therefore its level filter, on first use** and never
+    consults the configuration again.
+
+    The application holds module-level loggers (`app/core/middleware.py`,
+    `app/core/security.py`). Once any test has made a request, the middleware's logger is
+    frozen at whatever level was active at that moment. A later test that sets
+    `settings.log_level = "debug"` and calls `configure_logging()` changes the config but
+    *not* that frozen logger, so `.info()` stays a no-op for the rest of the session.
+
+    That is exactly how M1.2-F failed in CI and passed locally: CI runs at `LOG_LEVEL=warning`,
+    so by the time the log-leak test ran, the middleware logger had long since frozen at
+    warning and emitted nothing — while locally, at `LOG_LEVEL=debug`, it had frozen at debug
+    and emitted normally. The test ran green in one environment and red in the other while
+    the application behaved identically in both.
+
+    Pinning here, before the first test runs, is what makes log-observing tests deterministic
+    rather than dependent on the ambient environment and on test ordering. It applies to every
+    module-level logger, not just the middleware's — so a secret leaked from any module during
+    a request is observable, instead of being silently filtered out.
+    """
+    original = settings.log_level
+    settings.log_level = "debug"
+    configure_logging()
+    yield
+    settings.log_level = original
+    configure_logging()
 
 
 @pytest.fixture

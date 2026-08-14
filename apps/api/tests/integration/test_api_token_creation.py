@@ -33,10 +33,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 import app.domains.workspaces.service as service_module
-from app.core.config import settings
 from app.core.db import UnitOfWork, get_uow
 from app.core.exceptions import ValidationFailedError
-from app.core.logging import configure_logging
 from app.core.middleware import RequestContextMiddleware
 from app.core.security import (
     PREFIX_DISPLAY_LEN,
@@ -698,32 +696,31 @@ async def test_no_log_output_contains_the_plaintext(
 ) -> None:
     """Capture the real log stream for a successful issuance and search it.
 
-    `caplog` is useless here and using it would make this test *look* like a security
-    check while asserting against an empty buffer: `configure_logging` installs
-    `structlog.PrintLoggerFactory`, which writes to stdout and never reaches stdlib
-    logging. Redirecting stdout is what actually observes what the process emits.
+    `caplog` is useless here and using it would make this test *look* like a security check
+    while asserting against an empty buffer: `configure_logging` installs
+    `structlog.PrintLoggerFactory`, which writes to stdout and never reaches stdlib logging.
+    Redirecting stdout is what actually observes what the process emits.
 
-    The level is forced to debug for the same reason — CI runs at `warning`, where
-    `.info()` is dropped entirely and "the secret is not in the output" would be true of
-    an empty string. The `assert emitted` below is the guard that keeps this test honest:
-    if nothing was logged at all, the absence of the secret proves nothing.
+    The log level is pinned session-wide by `_pin_log_level` in `conftest.py`, **not** here.
+    Setting it inside this test does not work and looks like it does: structlog freezes a
+    logger's level filter on first use (`cache_logger_on_first_use=True`), so by the time
+    this test runs, the middleware's module-level logger has already been frozen by whatever
+    earlier test first made a request. Reconfiguring afterwards changes the configuration and
+    not that logger. See the fixture's docstring for the full mechanism.
+
+    `assert emitted` is what keeps this test honest, and it is doing real work: it is the
+    assertion that failed in CI when the level filter silently suppressed everything, turning
+    "the secret is absent" into a statement about an empty string.
     """
     owner_id = await seed_member(admin_engine, workspace_a.id, user_id="owner", role="owner")
     test_app = build_token_app(app_engine, lambda: member_context(workspace_a.id, owner_id))
 
-    original_level = settings.log_level
-    settings.log_level = "debug"
-    configure_logging()
     buffer = io.StringIO()
-    try:
-        with contextlib.redirect_stdout(buffer):
-            async with AsyncClient(
-                transport=ASGITransport(app=test_app), base_url="http://t"
-            ) as client:
-                response = await client.post("/v1/api-tokens", json={"name": "ci"})
-    finally:
-        settings.log_level = original_level
-        configure_logging()
+    with contextlib.redirect_stdout(buffer):
+        async with AsyncClient(
+            transport=ASGITransport(app=test_app), base_url="http://t"
+        ) as client:
+            response = await client.post("/v1/api-tokens", json={"name": "ci"})
 
     assert response.status_code == 201
     emitted = buffer.getvalue()
