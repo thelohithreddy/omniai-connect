@@ -133,17 +133,43 @@ def _guard_depth(node: Any, depth: int = 0) -> None:
 
 
 def detect_version(document: dict[str, Any]) -> str:
-    """Confirm this is a supported OpenAPI 3.0 document, from parsed structure (never the
-    filename). Swagger 2.0 and OpenAPI 3.1 are recognised but declared unsupported in this slice
-    (converted / handled by later slices), never silently mis-parsed."""
+    """The OpenAPI-3.0 gate: confirm this is a supported OpenAPI 3.0.x document, from parsed
+    structure (never the filename). A Swagger 2.0 document is converted upstream by `to_openapi3`
+    (M1.4-B1.3) *before* this runs, so a `swagger` key reaching here is refused as defence in
+    depth; OpenAPI 3.1 is recognised but declared unsupported in this slice. Nothing is silently
+    mis-parsed."""
     if "swagger" in document:
-        raise IngestionError("unsupported_format", "Swagger 2.0 is not supported in this slice")
+        raise IngestionError("unsupported_format", "Swagger 2.0 must be converted first")
     version = document.get("openapi")
     if not isinstance(version, str):
         raise IngestionError("unsupported_format", "not an OpenAPI document")
     if not version.startswith("3.0"):
         raise IngestionError("unsupported_format", "only OpenAPI 3.0 is supported in this slice")
     return version
+
+
+def to_openapi3(document: dict[str, Any]) -> dict[str, Any]:
+    """Return an OpenAPI 3.0.x document ready for the reference importer (M1.4-B1.3).
+
+    Deterministically classifies the parsed root and performs the single upfront upgrade step
+    (CONNECTOR_ENGINE §3): an OpenAPI 3.0.x document passes through; a Swagger 2.0 document
+    (`swagger: "2.0"`, exact) is converted by the pure, network-free converter; a document that
+    declares BOTH `swagger` and `openapi` is refused as ambiguous (an attacker must not be able to
+    steer parser selection). The converted document is then re-validated by the SAME OpenAPI-3 gate
+    (`detect_version`), so a bad conversion can never slip past the importer, and 3.1 / unknown /
+    malformed inputs fail closed with the existing safe taxonomy."""
+    if "swagger" in document:
+        if "openapi" in document:
+            raise IngestionError(
+                "unsupported_format", "ambiguous specification: both swagger and openapi present"
+            )
+        # Local import keeps openapi.py free of a module-level swagger dependency (swagger.py
+        # imports IngestionError from here); the converter has no network capability of its own.
+        from app.domains.connectors import swagger
+
+        document = swagger.convert(document)
+    detect_version(document)
+    return document
 
 
 # --------------------------------------------------------------------------- $ref resolution
@@ -472,4 +498,5 @@ __all__ = [
     "load_spec",
     "normalize",
     "spec_hash",
+    "to_openapi3",
 ]

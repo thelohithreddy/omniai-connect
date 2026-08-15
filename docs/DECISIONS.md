@@ -1287,3 +1287,73 @@ persist/dedup/missing-staged, remote-ref through the pipeline) — a 12-mutation
 1 inert redundant-guard survivor), a live real-worker upload run, and full regression **1028 passed**
 at warning and debug. Deferred to B1.3+: Swagger 2 → OpenAPI 3, OpenAPI 3.1, `diff_summary`/
 promotion, the `tools` table, the §17 remote-ref cache, scheduled re-sync — none started.
+
+## ADR-0027 — Connector ingestion: Swagger 2 → OpenAPI 3 conversion (M1.4-B1.3)
+
+**Status:** Accepted (2026-08-16) · **Context:** M1.4-B1.3, the last ingestion-format slice of the
+Connector Engine v1. Canon is explicit (CONNECTOR_ENGINE §3.2, CONNECTOR_SPECIFICATION §6): a
+Swagger 2.0 document is *converted to OpenAPI 3 as a single upfront step, then the OpenAPI 3
+importer runs — no separate normalization logic to maintain*. `source_type` already admits
+`swagger2` (ADR-0019). Two points were canon-silent; the founder ratified both (below). No migration.
+
+**Decision:**
+
+1. **A pure, network-free converter (`swagger.py`).** Conversion is a deterministic structural
+   transform: a parsed Swagger 2.0 dict in, an equivalent OpenAPI 3.0.3 dict out. It performs **no
+   I/O of any kind** — no network, DB, ObjectStore, or request/auth/tenant state — so it is
+   independently testable and adds **no** new SSRF boundary, parser, `$ref` resolver, storage, queue,
+   event system, tenant mechanism, or authorization chain. It is invoked by one new entry,
+   `openapi.to_openapi3(document)`, which the pipeline calls *once* between `load_spec` and
+   `normalize`: an OpenAPI 3.0.x document passes through; a Swagger 2.0 document is converted; the
+   result is re-validated by the **same** OpenAPI-3 gate (`detect_version`) so a bad conversion can
+   never reach the importer. **No new dependency** — a library would introduce a second parser and
+   heavy transitive deps; the hand-written converter matches the framework-free `openapi.py`.
+
+2. **Mapping (CONNECTOR_SPECIFICATION §6).** `definitions → components.schemas`; `parameters →
+   components.parameters` (non-body) / `components.requestBodies` (reusable body); `responses →
+   components.responses`; `securityDefinitions → components.securitySchemes` (basic → http/basic,
+   apiKey unchanged, oauth2 flow → the OpenAPI-3 `flows` object); a **body parameter → requestBody**
+   (content per `consumes`, default `application/json`); **formData → a form requestBody**
+   (`multipart/form-data` when a `file` field is present, else `application/x-www-form-urlencoded`;
+   `type: file → {type: string, format: binary}`); a non-body parameter's inline schema is lifted
+   under `schema` and `collectionFormat → style/explode`; `discriminator` string → object. Only
+   **local** `#/definitions|parameters|responses/*` refs are rewritten to `#/components/*`; **remote
+   refs are left untouched** — a Swagger remote `$ref` keeps its `#/definitions/…` fragment and
+   resolves, as-is, through B1.2's one resolver (which navigates a JSON-pointer fragment literally in
+   whatever document it fetched). Only the root document is converted; there is nothing
+   Swagger-specific to fetch.
+
+3. **`host`/`schemes`/`basePath` → `servers` metadata only, never a fetch target (ratified strict
+   detection).** These become the connector's `base_url` candidate exactly as OpenAPI `servers` do
+   (https ordered first); because the converter performs no I/O and ingestion fetches only its own
+   `source_url`, a Swagger `host` can **never** become an ingestion SSRF vector. Detection is strict:
+   conversion happens **iff** top-level `swagger == "2.0"` (exact string; numeric `2.0`, `"1.0"`,
+   etc. → `unsupported_format`); a document declaring **both** `swagger` and `openapi` is refused as
+   **ambiguous** (an attacker must not steer parser selection); Swagger is never inferred from
+   incidental fields (`host`, `definitions`). The **original Swagger bytes remain the canonical
+   `raw_spec_ref`** — the converted document is a transient intermediate. `spec_hash` is unchanged
+   (over the normalized Tool set): a Swagger document and its native OpenAPI-3 equivalent normalize
+   to the **same** Tool set → the **same** hash → cross-format dedup; idempotency and versioning are
+   B1.1/B1.2's, untouched. The error taxonomy is **reused** — no new reason code. Conversion is
+   bounded (recursion depth-guarded on top of `load_spec`'s size/depth caps; O(size), no new
+   unbounded path).
+
+4. **Deferred (ratified).** Canon says conversion warnings should "surface as lint findings", but
+   the lint-findings surface is part of the §4 stage-4 lint stage that B1.1/B1.2 never built (no
+   column, no event field). Adding one would cross the DB/event-contract firewall, so the **warnings
+   surface is deferred** with the rest of the lint stage; conversion itself is faithful and
+   deterministic. `x-nullable → nullable` and richer collectionFormat/header fidelity are likewise
+   deferred niceties (inert for the current normalizer).
+
+**Consequences:** No migration; `connector_versions` immutability and RLS unchanged; no new SECURITY
+DEFINER / role / RBAC / auth; the API surface (router/service/events/subscribers) is **untouched** —
+conversion is entirely worker-side, so a Swagger file/URL flows through the existing multipart
+endpoint and the worker converts. `detect_version` remains the OpenAPI-3 gate (converted docs never
+carry `swagger`; a raw `swagger` reaching it is refused as defence in depth). Proven by 40 converter
+unit tests (detection, every top-level/parameter/body/formData/schema/response mapping, ref
+rewriting, deep-nesting rejection, no-network, determinism, and a Swagger-vs-native equal-hash
+proof) + 3 real-Postgres+MinIO pipeline tests (convert-and-ingest with the original bytes retained,
+cross-format dedup to one version, a Swagger remote `$ref` through the guarded fetcher), a
+30-mutation B1.3 audit (0 meaningful survivors), a live real-worker Swagger ingestion, and full
+regression at warning and debug. Deferred to B1.4: `diff_summary`, promotion gating, the `tools`
+denormalization table; also OpenAPI 3.1, the §17 remote-ref cache, scheduled re-sync — none started.

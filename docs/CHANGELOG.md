@@ -13,6 +13,31 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Connector ingestion: Swagger 2 → OpenAPI 3 conversion (M1.4-B1.3, ADR-0027).** The last
+  ingestion-format slice: supported Swagger 2.0 documents now ingest through the existing surfaces.
+  Canon (CONNECTOR_ENGINE §3.2) is a *single upfront conversion step, then the OpenAPI 3 importer
+  runs — no separate normalization logic*. A new **pure, network-free converter** (`swagger.py`)
+  transforms a parsed Swagger 2.0 dict into an equivalent OpenAPI 3.0.3 dict — no I/O, no DB, no
+  ObjectStore, no request/auth/tenant state — invoked by one entry (`openapi.to_openapi3`) that the
+  worker calls between parse and normalize; the converted doc is re-validated by the **same**
+  OpenAPI-3 gate. **No new dependency, no migration, no API-surface change** (conversion is entirely
+  worker-side). Mapping: `definitions → components.schemas`, `parameters →
+  components.parameters/requestBodies`, `responses → components.responses`, `securityDefinitions →
+  components.securitySchemes`, body param → `requestBody`, formData → form requestBody (multipart on
+  a file field), `schemes/host/basePath → servers`, `consumes/produces →` media types,
+  `collectionFormat → style/explode`, `discriminator` string → object; **local**
+  `#/definitions|parameters|responses` refs are rewritten to `#/components/*` while **remote refs are
+  left untouched** (they resolve as-is through B1.2's one resolver). **Security:** `host`/`schemes`
+  become `servers` **metadata only** — never an ingestion fetch target (the converter does zero I/O;
+  ingestion fetches only `source_url`), so a Swagger host can never become an SSRF vector. Detection
+  is **strict** (`swagger == "2.0"` exact; a doc declaring both `swagger` and `openapi` is refused as
+  ambiguous; never inferred from incidental fields). The **original Swagger bytes stay the canonical
+  `raw_spec_ref`**; `spec_hash` is unchanged, so a Swagger doc and its native OpenAPI-3 equivalent
+  produce the **same** Tool set and hash (cross-format dedup). Reuses the existing error taxonomy.
+  Proven by 40 converter unit tests + 3 real-Postgres+MinIO pipeline tests, a 30-mutation B1.3 audit
+  (0 meaningful survivors), a live real-worker Swagger ingestion, and full regression at warning and
+  debug. Deferred to B1.4: `diff_summary`, promotion, the `tools` table (also OpenAPI 3.1, the §17
+  remote-ref cache, scheduled re-sync, and the §4 lint-warnings surface).
 - **Connector ingestion: file upload + remote `$ref` (M1.4-B1.2, ADR-0026).** Extends B1.1 with the
   two remaining source/resolution capabilities. `POST /v1/connectors/{id}/versions` is now
   `multipart/form-data` accepting **exactly one** of a `source_url` field or a `file` upload

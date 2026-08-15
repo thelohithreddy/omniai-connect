@@ -464,3 +464,135 @@ async def test_a_remote_ref_is_resolved_through_the_pipeline_fetcher(
             {"c": cid},
         )
     assert schema[0]["input_schema"]["properties"]["q"] == {"type": "string", "maxLength": 7}
+
+
+# ----------------------------------------------------------- Swagger 2 → OpenAPI 3 (M1.4-B1.3)
+
+# The SAME two operations as SPEC_V1, described as Swagger 2.0 — so they normalize to an identical
+# Tool set (and thus an identical spec_hash), proving conversion adds no separate normalization.
+SWAGGER_SPEC = json.dumps(
+    {
+        "swagger": "2.0",
+        "info": {"title": "T", "version": "1"},
+        "host": "api.demo.com",
+        "basePath": "/v1",
+        "schemes": ["https"],
+        "paths": {
+            "/customers": {
+                "get": {"operationId": "listCustomers"},
+                "post": {"operationId": "createCustomer"},
+            }
+        },
+    }
+).encode()
+
+
+async def test_a_swagger2_spec_is_converted_and_ingested_with_the_original_bytes_retained(
+    admin_engine: AsyncEngine, workspace_a: SeededWorkspace, captured_events: list[Event]
+) -> None:
+    cid = await _seed_connector(admin_engine, workspace_a.id)
+    async with worker_tenant_uow(str(workspace_a.id)) as uow:
+        result = await ingest_from_url(
+            uow, workspace_a.id, cid, URL, fetcher=_fetcher(SWAGGER_SPEC)
+        )
+    assert result.status == "ingested" and result.version == 1
+
+    async with admin_engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT raw_spec_ref, normalized_schema FROM connector_versions"
+                    " WHERE connector_id=:c"
+                ),
+                {"c": cid},
+            )
+        ).one()
+        connector = (
+            await conn.execute(
+                text("SELECT status, base_url FROM connectors WHERE id=:c"), {"c": cid}
+            )
+        ).one()
+    # Converted + normalized: canonical tools, base_url from the synthesized servers.
+    assert [t["name"] for t in row.normalized_schema] == [
+        "demo_listcustomers",
+        "demo_createcustomer",
+    ]
+    assert connector.status == "active"
+    assert connector.base_url == "https://api.demo.com/v1"  # from Swagger host + basePath
+    # The ORIGINAL Swagger bytes are the canonical raw_spec_ref — not the converted intermediate.
+    stored = await get_object_store().get(
+        TenantObjectKey.for_workspace(workspace_a.id, f"connectors/{cid}/specs/v1.json")
+    )
+    assert stored == SWAGGER_SPEC
+    assert json.loads(stored)["swagger"] == "2.0"
+    assert [e.event_type for e in captured_events] == ["connector.ingested"]
+
+
+async def test_swagger_and_native_openapi3_dedupe_to_one_version(
+    admin_engine: AsyncEngine, workspace_a: SeededWorkspace
+) -> None:
+    # Ingesting the Swagger spec then its native OpenAPI-3 equivalent (SPEC_V1) is a no-op re-sync:
+    # equal normalized content → equal spec_hash → no second version. Cross-format determinism.
+    cid = await _seed_connector(admin_engine, workspace_a.id)
+    async with worker_tenant_uow(str(workspace_a.id)) as uow:
+        await ingest_from_url(uow, workspace_a.id, cid, URL, fetcher=_fetcher(SWAGGER_SPEC))
+    async with worker_tenant_uow(str(workspace_a.id)) as uow:
+        second = await ingest_from_url(uow, workspace_a.id, cid, URL, fetcher=_fetcher(SPEC_V1))
+    assert second.status == "unchanged" and second.version == 1
+    async with admin_engine.connect() as conn:
+        count = await conn.scalar(
+            text("SELECT count(*) FROM connector_versions WHERE connector_id=:c"), {"c": cid}
+        )
+    assert count == 1
+
+
+async def test_a_swagger_remote_ref_resolves_through_the_guarded_fetcher(
+    admin_engine: AsyncEngine, workspace_a: SeededWorkspace
+) -> None:
+    # A Swagger body-schema remote $ref keeps its `#/definitions/...` fragment after conversion; the
+    # ONE resolver (B1.2) fetches the remote doc through the SAME guarded fetcher and navigates it.
+    root = json.dumps(
+        {
+            "swagger": "2.0",
+            "host": "api.demo.com",
+            "basePath": "/v1",
+            "schemes": ["https"],
+            "paths": {
+                "/x": {
+                    "post": {
+                        "operationId": "x",
+                        "parameters": [
+                            {
+                                "name": "body",
+                                "in": "body",
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"q": {"$ref": "https://s.demo.com/d.json#/S"}},
+                                },
+                            }
+                        ],
+                    }
+                }
+            },
+        }
+    ).encode()
+    remote = json.dumps({"S": {"type": "string", "maxLength": 4}}).encode()
+    docs = {"https://api.demo.com/openapi.json": root, "https://s.demo.com/d.json": remote}
+
+    async def multi_fetch(url: str) -> bytes:
+        if url not in docs:
+            raise RuntimeError("blocked")
+        return docs[url]
+
+    cid = await _seed_connector(admin_engine, workspace_a.id)
+    async with worker_tenant_uow(str(workspace_a.id)) as uow:
+        result = await ingest_from_url(
+            uow, workspace_a.id, cid, "https://api.demo.com/openapi.json", fetcher=multi_fetch
+        )
+    assert result.status == "ingested"
+    async with admin_engine.connect() as conn:
+        schema = await conn.scalar(
+            text("SELECT normalized_schema FROM connector_versions WHERE connector_id=:c"),
+            {"c": cid},
+        )
+    assert schema[0]["input_schema"]["properties"]["q"] == {"type": "string", "maxLength": 4}

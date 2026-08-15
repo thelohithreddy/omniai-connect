@@ -173,10 +173,14 @@ async def _persist(
     object_store: ObjectStore,
     fetcher: Fetcher,
 ) -> IngestionResult:
-    """Shared tail of both source paths: parse → normalize (remote refs via `fetcher`) → dedup →
-    store raw → persist an immutable version → advance the connector → buffer the event."""
+    """Shared tail of both source paths: parse → to_openapi3 (Swagger 2 upgraded, then OpenAPI-3
+    validated) → normalize (remote refs via `fetcher`) → dedup → store raw → persist an immutable
+    version → advance the connector → buffer the event."""
     document = openapi.load_spec(raw)
-    openapi.detect_version(document)
+    # Single upfront format step (M1.4-B1.3): a Swagger 2.0 document is converted to OpenAPI 3
+    # here, then the ONE OpenAPI-3 importer runs unchanged. The ORIGINAL bytes (`raw`) remain the
+    # canonical raw_spec_ref — the converted document is a transient intermediate.
+    document = openapi.to_openapi3(document)
     # Remote $refs are resolved through the SAME guarded fetcher as the root spec (B0.1, §15/§18).
     tools = await openapi.normalize(document, connector.slug, fetch=fetcher)
     new_hash = openapi.spec_hash(tools)
