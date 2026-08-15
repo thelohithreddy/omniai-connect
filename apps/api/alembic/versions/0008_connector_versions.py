@@ -79,7 +79,10 @@ def upgrade() -> None:
         sa.Column("diff_summary", postgresql.JSONB(), nullable=True),
         # Immutable snapshot: created_at only, never updated (no updated_at).
         sa.Column(
-            "created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
         ),
         sa.PrimaryKeyConstraint("id", name="pk_connector_versions"),
         sa.ForeignKeyConstraint(
@@ -96,9 +99,13 @@ def upgrade() -> None:
             ondelete="CASCADE",
         ),
         # Monotonic, gap-tolerant, unique per connector.
-        sa.UniqueConstraint("connector_id", "version", name="uq_connector_versions_connector_id_version"),
+        sa.UniqueConstraint(
+            "connector_id", "version", name="uq_connector_versions_connector_id_version"
+        ),
         # The composite-FK target for connectors.current_version_id.
-        sa.UniqueConstraint("workspace_id", "id", name="uq_connector_versions_workspace_id_id"),
+        sa.UniqueConstraint(
+            "workspace_id", "id", name="uq_connector_versions_workspace_id_id"
+        ),
     )
 
     # Tenant-scoped access path leads with workspace_id (P-44).
