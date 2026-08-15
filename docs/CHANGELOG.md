@@ -13,6 +13,24 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Internal event bus (M1.4-B0.4, ADR-0023).** The shared-kernel domain-event transport
+  (`app/core/events.py`): a frozen Pydantic `Event` envelope (`event_id` UUIDv7, `event_type`
+  dotted namespace, `version`, `workspace_id`, `occurred_at` UTC-aware, JSON-safe `payload`) and
+  an in-process bus. Per canon (BACKEND_SPEC §4, ADR-0001) it is **in-process now, broker later**:
+  `bus.publish(event)` takes no transaction handle (so the future Redis-Streams swap is invisible),
+  buffers the event on the ambient `UnitOfWork` via a task-scoped contextvar, and the UoW
+  dispatches the buffer **after COMMIT** — a rolled-back transaction emits nothing. Security is
+  structural: `extra="forbid"` rejects smuggled authority fields (role/member/token), `JsonValue`
+  rejects arbitrary Python objects, `occurred_at` refuses naive timestamps, and
+  `UnitOfWork.buffer_event` fails closed unless the event's `workspace_id` equals the transaction's
+  bound tenant (ADR-0022 — an event selects WHERE, never WHO/ROLE). Explicit startup registration;
+  type-scoped dispatch; handler failures are isolated and logged with envelope identifiers only
+  (never the payload); nested dispatch is depth-bounded. Honest limits: best-effort **at-most-once**
+  in-process (at-least-once is the future broker's property), **no exactly-once claim**, not a
+  Celery replacement, and **no table / no migration / no SECURITY DEFINER**. Proven by 54 tests (48
+  unit + 6 real-Postgres integration incl. rollback-emits-nothing, fail-closed tenant-match, and
+  A×8/B×8/C×8 concurrency), a 23-mutation B0.4 audit with **0 survivors**, and a live
+  publish→commit→dispatch run. No domain event is published yet (that is M1.4-B1).
 - **Worker tenant execution boundary (M1.4-B0.3, ADR-0022).** `app/workers/context.py`
   (`worker_tenant_uow`) binds a background task to its tenant **fail-closed**, reusing the
   existing `UnitOfWork` + `SET LOCAL app.workspace_id` GUC — **no second GUC/transaction system,

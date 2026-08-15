@@ -29,6 +29,7 @@ from sqlalchemy.pool import NullPool
 
 from app.core.config import settings
 from app.core.db import UnitOfWork
+from app.core.events import current_sink, event_bus
 
 
 class WorkerContextError(Exception):
@@ -79,7 +80,16 @@ async def worker_tenant_uow(
         await uow.bind_workspace(bound)
         if await uow.current_workspace() != bound:
             raise WorkerContextError("workspace_binding_failed")
-        yield uow
+        # This UoW is the ambient event sink for the task; buffered events dispatch only after
+        # the transaction commits (below), and a task that raises rolls back and emits nothing.
+        # save-and-restore (not reset(token)): robust across a generator teardown context.
+        previous = current_sink.get()
+        current_sink.set(uow)
+        try:
+            yield uow
+        finally:
+            current_sink.set(previous)
+    await event_bus.dispatch(uow.drain_events())
 
 
 __all__ = ["WorkerContextError", "validate_workspace_id", "worker_sessions", "worker_tenant_uow"]

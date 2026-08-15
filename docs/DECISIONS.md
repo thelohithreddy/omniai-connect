@@ -1010,3 +1010,73 @@ a **real Redis → worker → RLS** tenant task (`start_worker`, not eager), a d
 end-to-end run, and a B0.3 mutation audit (6 constructible mutations killed; the lone survivor is
 inert redundant defense-in-depth — the fail-closed read-back verify, kept as cheap insurance).
 The event bus (B0.4) and R2 (B0.5) remain separate slices; the ingestion pipeline itself is M1.4-B1.
+
+## ADR-0023 — Internal event bus: in-process, post-commit, buffered on the UoW (M1.4-B0.4)
+
+**Status:** Accepted (2026-08-15) · **Context:** M1.4-B0.4, the fourth ingestion-infrastructure
+slice. BACKEND_SPEC §4 (governed by ADR-0001) specifies an internal event bus that is
+"in-process now, broker later (Redis Streams is the planned swap)"; this ADR builds the contract
+and the in-process transport only. It publishes no domain event (`connector.ingested` and friends
+are M1.4-B1), adds no table, and is deliberately **not** an authorization mechanism, a tenant
+selector, a second transaction system, a job queue, or a durable-delivery guarantee.
+
+**Decision:**
+
+1. **A frozen Pydantic `Event` envelope** (`app/core/events.py`) carrying `event_id` (a
+   server-generated UUIDv7 from `core/ids.py`), `event_type`, `version`, `workspace_id`,
+   `occurred_at`, and a JSON-safe `payload` — the canon fields (BACKEND_SPEC §4) plus an explicit
+   `version`. Immutability and validation are structural, not conventional:
+   - `frozen=True` makes the envelope an immutable fact; `extra="forbid"` is a **security
+     control** — a caller cannot smuggle a `role`, `member_id`, `token`, or any authority field
+     into the envelope. The envelope carries WHERE (`workspace_id`) and WHAT (`event_type` +
+     `payload`); WHO, when a domain needs it, rides in the typed payload as a non-authoritative
+     reference, never as authority (canon lists no actor field; ADR-0022).
+   - `event_type` must be a dotted namespace (`connector.ingested`); `version >= 1` (explicit,
+     starting at 1; same type + higher version = contract evolution — the smallest mechanism, an
+     integer, no schema registry, compatibility owned by the subscriber); `occurred_at` must be
+     timezone-aware and is normalised to UTC (a naive wall-clock is refused); `payload` is typed
+     `JsonValue`, so an ORM entity, a connection, or any arbitrary Python object is rejected. No
+     payload **byte** bound is imposed: in B0.4 an event is authored only by trusted server code
+     (there is no untrusted → payload path), so a size cap is not a security-critical bound to
+     derive; a future module that accepts untrusted event input owns that limit.
+
+2. **`bus.publish(event)` takes no transaction handle** — deliberately, so the future broker swap
+   is invisible ("callers never notice the swap", BACKEND_SPEC §4). In-process, the ambient
+   transaction is found through a **task-scoped `ContextVar`** (the same mechanism `core/logging.py`
+   uses for `request_id`/`workspace_id`; it follows `await` and never bleeds between concurrent
+   requests). `publish` buffers the event on that transaction's `UnitOfWork`; when the bus becomes
+   a broker, the same call enqueues to Redis Streams instead.
+
+3. **Handlers run after COMMIT, buffered on the UoW** (BACKEND_SPEC §4). The `UnitOfWork`
+   (`core/db.py`) gains the buffer and dispatches it *after* its `session.begin()` block commits;
+   an exception (handler error or a failed commit) propagates out of the block and skips dispatch,
+   so **a rolled-back transaction emits nothing**. The bus never opens, commits, or rolls back a
+   transaction — the UoW owns the lifecycle. Wired into both origins: the request path (`get_uow`)
+   and the worker path (`worker_tenant_uow`).
+
+4. **Tenant-match is fail-closed.** `UnitOfWork.buffer_event` refuses an event whose `workspace_id`
+   is not the transaction's bound tenant (and refuses to publish before a workspace is bound) —
+   event metadata can never become a tenant selector (ADR-0022), defence in depth over RLS.
+
+5. **Explicit registration; type-scoped, isolated, bounded dispatch.** `subscribe(event_type,
+   handler)` registers at startup (no filesystem scan, no import side effects); dispatch delivers
+   only to a type's handlers, runs sync or async handlers, **isolates** a handler failure (logged
+   with the non-secret envelope identifiers — never the payload — and never failing the
+   already-committed publisher), and bounds nested re-dispatch with a depth guard.
+
+6. **Explicit, honest semantics.** In-process delivery is **best-effort at-most-once** (a crash
+   between COMMIT and dispatch loses the event); **at-least-once is a property of the *future*
+   broker**, so handlers must be idempotent and this module claims **no exactly-once** guarantee
+   and adds no dedup table. The bus is **not Celery** — heavy work is a Celery task a handler
+   enqueues (ADR-0007), never the bus; customer-facing events use `webhooks_outbox`, not this bus.
+
+**Consequences:** No migration; no new table; no new dependency (Pydantic already present); no new
+SECURITY DEFINER function; no new DB privilege; RLS ENABLE+FORCE and `omniai_app`'s
+non-superuser/non-BYPASSRLS status unchanged (catalog-verified). Proven by 54 tests — 48 unit
+(envelope validation, immutability, JSON-safe payload, forbidden authority fields, type-scoped
+dispatch, handler isolation, bounded reentrancy, fail-closed publish, secret-safe logging, and the
+UoW buffer/tenant-match/drain) and 6 real-Postgres integration (buffered-until-commit,
+rollback-emits-nothing, fail-closed tenant-match, A/B isolation, A×8/B×8/C×8 concurrency, and the
+request-path emission) — plus a B0.4 mutation audit of 23 constructible mutations, **all killed, 0
+survivors**, and a live in-process publish→commit→dispatch run. R2 (B0.5) remains a separate slice;
+the ingestion pipeline that first publishes `connector.ingested` is M1.4-B1.
