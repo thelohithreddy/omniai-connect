@@ -31,6 +31,7 @@ from app.core.authz import (
 #   Capability                                     | owner | admin | member | viewer
 #   Manage billing, delete Workspace               |  yes  |  no   |  no    |  no
 #   Manage Members and roles                       |  yes  |  yes  |  no    |  no
+#   Create/configure/delete Connectors             |  yes  |  yes  |  no    |  no
 #   Create/delete Connections, manage Credentials  |  yes  |  yes  |  no    |  no
 #   Create/revoke workspace API tokens             |  yes  |  yes  |  no    |  no
 #   Execute Tool Calls, view Tools and own logs    |  yes  |  yes  |  yes   |  no
@@ -43,24 +44,28 @@ from app.core.authz import (
 EXPECTED: dict[tuple[Role, Permission], bool] = {
     (Role.OWNER, Permission.WORKSPACE_MANAGE): True,
     (Role.OWNER, Permission.MEMBERS_MANAGE): True,
+    (Role.OWNER, Permission.CONNECTORS_MANAGE): True,
     (Role.OWNER, Permission.CONNECTIONS_MANAGE): True,
     (Role.OWNER, Permission.API_TOKENS_MANAGE): True,
     (Role.OWNER, Permission.TOOLS_EXECUTE): True,
     (Role.OWNER, Permission.AUDIT_READ): True,
     (Role.ADMIN, Permission.WORKSPACE_MANAGE): False,
     (Role.ADMIN, Permission.MEMBERS_MANAGE): True,
+    (Role.ADMIN, Permission.CONNECTORS_MANAGE): True,
     (Role.ADMIN, Permission.CONNECTIONS_MANAGE): True,
     (Role.ADMIN, Permission.API_TOKENS_MANAGE): True,
     (Role.ADMIN, Permission.TOOLS_EXECUTE): True,
     (Role.ADMIN, Permission.AUDIT_READ): True,
     (Role.MEMBER, Permission.WORKSPACE_MANAGE): False,
     (Role.MEMBER, Permission.MEMBERS_MANAGE): False,
+    (Role.MEMBER, Permission.CONNECTORS_MANAGE): False,
     (Role.MEMBER, Permission.CONNECTIONS_MANAGE): False,
     (Role.MEMBER, Permission.API_TOKENS_MANAGE): False,
     (Role.MEMBER, Permission.TOOLS_EXECUTE): True,
     (Role.MEMBER, Permission.AUDIT_READ): False,
     (Role.VIEWER, Permission.WORKSPACE_MANAGE): False,
     (Role.VIEWER, Permission.MEMBERS_MANAGE): False,
+    (Role.VIEWER, Permission.CONNECTORS_MANAGE): False,
     (Role.VIEWER, Permission.CONNECTIONS_MANAGE): False,
     (Role.VIEWER, Permission.API_TOKENS_MANAGE): False,
     (Role.VIEWER, Permission.TOOLS_EXECUTE): False,
@@ -73,7 +78,7 @@ EXPECTED: dict[tuple[Role, Permission], bool] = {
 
 def test_the_expectation_table_is_complete() -> None:
     """Guards the guard: every combination must be stated, or coverage silently shrinks."""
-    assert len(EXPECTED) == len(Role) * len(Permission) == 24
+    assert len(EXPECTED) == len(Role) * len(Permission) == 28
     assert set(EXPECTED) == {(r, p) for r in Role for p in Permission}
 
 
@@ -118,6 +123,7 @@ def test_admin_member_boundary_is_administration() -> None:
     """A member participates; it does not administer."""
     assert permissions_for(Role.ADMIN) - permissions_for(Role.MEMBER) == {
         Permission.MEMBERS_MANAGE,
+        Permission.CONNECTORS_MANAGE,
         Permission.CONNECTIONS_MANAGE,
         Permission.API_TOKENS_MANAGE,
         Permission.AUDIT_READ,
@@ -392,5 +398,6 @@ def test_every_role_in_the_domain_has_an_explicit_mapping() -> None:
 
 
 def test_permission_count_matches_the_canonical_table() -> None:
-    """SECURITY.md §4.1 has six rows. A seventh here means policy was invented."""
-    assert len(Permission) == 6
+    """SECURITY.md §4.1 has seven rows (connectors:manage added in M1.4-A, ADR-0019). An
+    eighth here means policy was invented."""
+    assert len(Permission) == 7

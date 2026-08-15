@@ -138,6 +138,12 @@ A definition of an external API: its Tools, auth requirements, and base config
 (`draft|ingesting|active|failed`), `current_version_id NULL` (FK to
 `connector_versions`), `deleted_at NULL`, timestamps.
 
+Migrated in 0007 (M1.4-A, ADR-0019). Slug uniqueness is a **partial** unique index on
+`(workspace_id, lower→as-stored slug) WHERE deleted_at IS NULL`, so a soft-deleted slug can
+be reused. `current_version_id` ships as a bare nullable UUID — the composite intra-tenant FK
+to `connector_versions` is added additively (P-43) when that table lands with ingestion.
+`base_url` is SSRF-linted by the service before insert (CONNECTOR_SPECIFICATION §11).
+
 ### connector_versions
 Immutable snapshots of a Connector's ingested definition (CONNECTOR_ENGINE.md §6).
 Columns: `id`, `workspace_id`, `connector_id`, `version` (monotonic integer per

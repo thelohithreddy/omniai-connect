@@ -13,6 +13,29 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Connectors — Connector Engine v1, first slice (M1.4-A, ADR-0019).** The tenant-owned
+  `connectors` domain: a Connector is a Workspace's definition of an external API (name, base
+  URL, auth *requirements*, Tool-Schema status). Manual definition only — OpenAPI/Swagger
+  ingestion is deferred (it needs a Celery worker + R2, neither provisioned yet).
+  - **Endpoints (`/v1/connectors`):** `POST` (create), `GET` (list, cursor-paginated),
+    `GET /{id}`, `DELETE /{id}` — all gated by the new `connectors:manage` permission
+    (owner/admin; member/viewer denied), transcribed into SECURITY.md §4.1 and `authz.py`.
+  - **Client is never authoritative:** `source_type` is server-fixed to `manual` (no
+    client-claimed OpenAPI ingestion), `status` starts `draft`, `workspace_id` comes from the
+    bound context, and the request schema is `extra="forbid"`. `auth_config` is requirements
+    only — never secrets.
+  - **`base_url` SSRF lint** (CONNECTOR_SPECIFICATION §11, SECURITY §6): https only; no
+    embedded credentials; no localhost/`.local`/private/loopback/link-local/reserved/metadata
+    hosts. Enforced in the service, so MCP/Celery callers are guarded too.
+  - **Soft delete** (`deleted_at`) with a partial unique index on `(workspace_id, slug) WHERE
+    deleted_at IS NULL` — one live connector per slug; a deleted slug frees up; a foreign or
+    soft-deleted id is a uniform 404.
+  - **Migration 0007** (additive, reversible; `identity` untouched): `connectors` table with
+    RLS `ENABLE`+`FORCE` and the tenant policy. **No SECURITY DEFINER function** — connectors
+    are always accessed within a bound workspace. 27 integration tests (authz matrix, contract,
+    SSRF, slug-uniqueness, soft-delete, cross-tenant isolation with an RLS-bypassed repository
+    proof, pagination, machine/human); connectors mutation audit (A01–A08) left zero survivors.
+
 - **Human session security hardening (M1.3-G, ADR-0018).** Lifecycle hardening *around* the
   released human-auth architecture (Better Auth → EdDSA JWT/JWKS → `X-Workspace-Id` → membership
   → role → RBAC → RLS) — not a redesign. Discovery (7-agent map + a live-stack probe) confirmed

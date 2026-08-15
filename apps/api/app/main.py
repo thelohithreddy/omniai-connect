@@ -23,6 +23,7 @@ from app.core.exceptions import DomainError
 from app.core.logging import configure_logging, get_logger
 from app.core.middleware import REQUEST_ID_HEADER, RequestContextMiddleware
 from app.core.readiness import check_readiness
+from app.domains.connectors.router import connectors_router
 from app.domains.workspaces.router import api_tokens_router, invitations_router, members_router
 from app.domains.workspaces.router import router as workspaces_router
 
@@ -44,6 +45,7 @@ app.include_router(workspaces_router)
 app.include_router(api_tokens_router)
 app.include_router(members_router)
 app.include_router(invitations_router)
+app.include_router(connectors_router)
 
 
 def _envelope(

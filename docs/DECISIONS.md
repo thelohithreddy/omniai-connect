@@ -797,3 +797,61 @@ change (`extract_bearer_token`, decision 3). New tests lock the boundary, the du
 rule, the cookie-is-not-a-credential rule, session rotation, and the non-string-`kid` no-crash
 property. This ADR is the single reference for "what the human session security model actually
 guarantees" and for the deferred decisions; SECURITY.md §4.8 mirrors it operationally.
+
+---
+
+## ADR-0019 — Connectors domain and the `connectors:manage` permission
+
+**Status:** Accepted (2026-08-15) · **Context:** M1.4-A (Connector Engine v1, first slice)
+
+**Context:** ROADMAP §M1 requires a Connector Engine (OpenAPI/Swagger ingestion → canonical
+Tool Schema per ADR-0003; manual REST definition; per-Tool enable/disable). By strict
+dependency ordering everything downstream — Connections, Credentials, Tool Calls, the
+Execution Runtime, the audit log — needs Connectors and their Tools to exist first. The
+founder ratified M1.4-A as the **smallest safe first slice**: the tenant-owned `connectors`
+data model plus manual CRUD, with OpenAPI/Swagger **ingestion deferred** (it needs a Celery
+worker service and R2 object storage, neither yet provisioned). This ADR records the domain,
+its permission, and its boundary; it does not reopen ADR-0003/0004/0009.
+
+**Decision:**
+
+1. **A `connectors` domain (BACKEND_SPEC §1), tenant-owned.** Migration 0007 creates the
+   canonical `connectors` table (DATABASE_DESIGN §3) with `workspace_id NOT NULL`, RLS
+   `ENABLE`+`FORCE`, and the `tenant_isolation` policy — identical to every other tenant
+   table. **No SECURITY DEFINER function**: unlike `api_tokens`/`invitations` (discovered
+   pre-RLS from a token), a Connector is always accessed within an already-bound workspace,
+   so no bootstrap resolver exists to widen.
+
+2. **`connectors:manage` → owner/admin (founder-ratified).** A new `Permission` transcribed
+   into SECURITY.md §4.1 and `authz.py` in the same change (ADR-0009), granted to owner and
+   admin only (member/viewer denied), mirroring `connections:manage`. All four endpoints
+   (`POST`/`GET`/`GET {id}`/`DELETE /v1/connectors`) are gated by it through the existing
+   centralized `require_permission`; no router-local authorization.
+
+3. **Server-established fields; the client is never authoritative.** `source_type` is fixed
+   to `manual` by the service (a client cannot mint a Connector that falsely claims OpenAPI
+   ingestion), `status` starts at `draft`, `workspace_id` comes from the bound context, and
+   the request schema is `extra="forbid"`. `auth_config` holds auth *requirements* only —
+   never secret values (CONNECTOR_ENGINE.md §8); secrets live in a Connection's Credential.
+
+4. **`base_url` is SSRF-linted before storage (CONNECTOR_SPECIFICATION §11, SECURITY §6).**
+   https only; no embedded credentials; no localhost/`.local`/private/loopback/link-local/
+   reserved/metadata hosts. The lint lives in the service so non-HTTP callers (MCP, Celery)
+   are guarded identically. Hostname→IP resolution is deliberately NOT done here (DNS
+   rebinding is an egress-time concern the Execution Runtime owns); literal private addresses
+   and obvious local hostnames are refused, which is exactly what §11 requires of a declared
+   URL.
+
+5. **Soft delete; slug unique per live workspace.** Deletion sets `deleted_at` (retained for
+   audit, DATABASE_DESIGN §3). A partial unique index on `(workspace_id, slug) WHERE
+   deleted_at IS NULL` makes at most one *live* connector per slug and frees the slug on
+   delete. A foreign or soft-deleted id is a uniform 404 (no cross-tenant existence oracle).
+
+6. **Deferred to later slices (not invented here):** OpenAPI/Swagger ingestion (`source_url`,
+   the async importer, `connector_versions`, `tools`, the `current_version_id` FK — a bare
+   nullable column for now, P-43), per-Tool enable/disable, and connection/credential wiring.
+   Ingestion is blocked on provisioning a Celery worker service and R2 object storage.
+
+**Consequences:** One additive, reversible migration (0007); `identity` untouched. One new
+permission (7 total). No new identity, tenant-authority, or authorization mechanism. The
+connectors-enforcement mutation audit (A01–A08) left zero survivors.

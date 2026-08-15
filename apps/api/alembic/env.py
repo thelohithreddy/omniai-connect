@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 # Importing the domain models registers them on Base.metadata for autogenerate.
 # Without this import autogenerate sees an empty schema and cheerfully drops everything.
+import app.domains.connectors.models  # noqa: F401
 import app.domains.workspaces.models  # noqa: F401
 from alembic import context
 from app.core.config import settings

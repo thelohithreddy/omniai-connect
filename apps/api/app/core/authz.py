@@ -60,6 +60,9 @@ class Permission(StrEnum):
     WORKSPACE_MANAGE = "workspace:manage"
     #: "Manage Members and roles" — add, remove, and re-role members.
     MEMBERS_MANAGE = "members:manage"
+    #: "Create, configure, and delete Connectors" — the Workspace's API-integration
+    #: definitions (base URL, auth *requirements*, ingested Tool Schema). Never secrets.
+    CONNECTORS_MANAGE = "connectors:manage"
     #: "Create/delete Connections, manage Credentials" — custody of customer secrets.
     CONNECTIONS_MANAGE = "connections:manage"
     #: "Create/revoke workspace API tokens" — machine identity administration.
@@ -76,6 +79,7 @@ class Permission(StrEnum):
 #   Capability                                     | owner | admin | member |
 #   Manage billing, delete Workspace               |   ✅  |   ❌  |   ❌   |
 #   Manage Members and roles                       |   ✅  |   ✅  |   ❌   |
+#   Create/configure/delete Connectors             |   ✅  |   ✅  |   ❌   |
 #   Create/delete Connections, manage Credentials  |   ✅  |   ✅  |   ❌   |
 #   Create/revoke workspace API tokens             |   ✅  |   ✅  |   ❌   |
 #   Execute Tool Calls, view Tools and own logs    |   ✅  |   ✅  |   ✅   |
@@ -94,6 +98,7 @@ ROLE_PERMISSIONS: Final[Mapping[Role, frozenset[Permission]]] = MappingProxyType
             {
                 Permission.WORKSPACE_MANAGE,
                 Permission.MEMBERS_MANAGE,
+                Permission.CONNECTORS_MANAGE,
                 Permission.CONNECTIONS_MANAGE,
                 Permission.API_TOKENS_MANAGE,
                 Permission.TOOLS_EXECUTE,
@@ -103,6 +108,7 @@ ROLE_PERMISSIONS: Final[Mapping[Role, frozenset[Permission]]] = MappingProxyType
         Role.ADMIN: frozenset(
             {
                 Permission.MEMBERS_MANAGE,
+                Permission.CONNECTORS_MANAGE,
                 Permission.CONNECTIONS_MANAGE,
                 Permission.API_TOKENS_MANAGE,
                 Permission.TOOLS_EXECUTE,

@@ -165,6 +165,7 @@ Adding a capability means editing this table and that mapping in the same change
 |---|---|:---:|:---:|:---:|:---:|
 | Manage billing, delete Workspace | `workspace:manage` | ✅ | ❌ | ❌ | ❌ |
 | Manage Members and roles | `members:manage` | ✅ | ✅ | ❌ | ❌ |
+| Create/configure/delete Connectors | `connectors:manage` | ✅ | ✅ | ❌ | ❌ |
 | Create/delete Connections, manage Credentials | `connections:manage` | ✅ | ✅ | ❌ | ❌ |
 | Create/revoke workspace API tokens | `api_tokens:manage` | ✅ | ✅ | ❌ | ❌ |
 | Execute Tool Calls, view Tools and own logs | `tools:execute` | ✅ | ✅ | ✅ | ❌ |
