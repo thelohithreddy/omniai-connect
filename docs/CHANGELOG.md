@@ -13,6 +13,29 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Connector diff, promotion gate & tools projection (M1.4-B1.4, ADR-0028).** The final ingestion
+  slice, closing the Connector Engine v1 milestone. Adds the three deferred capabilities. **Diff:** a
+  pure, deterministic `compute_diff` produces `{added, removed, changed, breaking}` Tool-by-Tool on
+  source identity, flagging an `input_schema` change breaking per CONNECTOR_SPECIFICATION §185 (a
+  required arg added, an arg removed, or a type narrowed); it is persisted as
+  `connector_versions.diff_summary` (content-only, no timestamps/ids/URLs/secrets). **Promotion
+  gate:** a first version or an additive diff **auto-promotes** during ingestion; a **breaking** diff
+  is persisted un-promoted (the connector keeps serving its current version, no `connector.ingested`
+  fires) and an owner/admin activates it via `POST /v1/connectors/{id}/versions/{version}/promote`
+  (`connectors:manage`, idempotent, concurrency-safe under a `FOR UPDATE` lock). Canon's "used by
+  active Connections" narrowing is deferred (Connections are a future module) — B1.4 conservatively
+  gates all breaking diffs. **tools table (migration `0009`):** a projection of the active version's
+  Tool set (`connector_versions.normalized_schema` stays authoritative). Promotion swaps the active
+  set — current live rows soft-deleted, the new version's rows inserted, each Tool's `enabled`
+  override re-applied on identity; a removed Tool is soft-deleted (deprecated, retained for audit,
+  fails `tool_not_found`). RLS ENABLE+FORCE + `tenant_isolation`, two composite intra-tenant FKs,
+  SELECT/INSERT/UPDATE grants (no DELETE — soft-delete only), partial unique
+  `(connector_version_id, name) WHERE deleted_at IS NULL`. Activation **reuses `connector.ingested`**
+  (canon §343) — no new event. Proven by 19 diff unit tests + 11 real-Postgres+MinIO integration
+  tests + 6 promote-endpoint API tests, a 26-mutation audit (0 meaningful survivors), migration
+  up/down/up, and full regression at warning and debug. **Deferred:** the usage-based gate
+  refinement, auto-promote-per-Connector setting, `deprecated`/`archived` states, scheduled re-sync,
+  the §4 lint surface.
 - **Connector ingestion: Swagger 2 → OpenAPI 3 conversion (M1.4-B1.3, ADR-0027).** The last
   ingestion-format slice: supported Swagger 2.0 documents now ingest through the existing surfaces.
   Canon (CONNECTOR_ENGINE §3.2) is a *single upfront conversion step, then the OpenAPI 3 importer

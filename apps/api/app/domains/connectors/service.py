@@ -26,6 +26,7 @@ from app.core.pagination import (
     encode_cursor,
     resolve_limit,
 )
+from app.domains.connectors import promotion
 from app.domains.connectors.events import connector_ingestion_requested
 from app.domains.connectors.models import Connector
 from app.domains.connectors.repository import ConnectorRepository
@@ -201,6 +202,34 @@ class ConnectorService:
             )
         )
         connector.status = "ingesting"
+        return connector
+
+    async def promote(self, uow: UnitOfWork, *, connector_id: uuid.UUID, version: int) -> Connector:
+        """Promote a persisted version to the connector's active definition (M1.4-B1.4).
+
+        The explicit half of the promotion gate: a first/purely-additive version auto-promotes
+        during ingestion, but a **breaking** version is persisted un-promoted and activated here by
+        an owner/admin (authorization is enforced at the request boundary, `connectors:manage`).
+
+        The connector is row-locked (`SELECT … FOR UPDATE`) so concurrent promotions — and a
+        promotion racing the worker's auto-promote — serialize on the row: the winner projects the
+        tools and advances the pointer, the loser sees the version already current and no-ops.
+        Idempotent (promoting the current version changes nothing). A connector mid-ingestion is a
+        409 (its run owns the transition); a foreign/deleted connector or an unknown version is a
+        uniform 404. `promotion.promote` swaps the active tool set and buffers `connector.ingested`.
+        """
+        connector = await self._repository.get_for_update(connector_id)
+        if connector is None:
+            raise NotFoundError("Connector not found.")
+        if connector.status == "ingesting":
+            raise ConflictError(
+                "Connector is ingesting; promote after it settles.",
+                details={"status": connector.status},
+            )
+        version_row = await self._repository.get_version(connector_id, version)
+        if version_row is None:
+            raise NotFoundError("Connector version not found.")
+        await promotion.promote(uow, connector.workspace_id, connector, version_row)
         return connector
 
 

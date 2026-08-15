@@ -15,6 +15,7 @@ from collections.abc import AsyncIterator
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 import app.workers.tasks as tasks
@@ -333,3 +334,159 @@ async def test_a_malicious_upload_filename_never_reaches_the_storage_key(
     assert resp.status_code == 202, resp.text
     upload_ref = captured_enqueue[0]["args"][3]  # type: ignore[misc]
     assert ".." not in upload_ref and upload_ref.startswith(f"connectors/{cid}/uploads/")
+
+
+# ----------------------------------------------------- promote endpoint (M1.4-B1.4)
+
+
+def _tool(name: str, version: int) -> dict[str, object]:
+    return {
+        "name": name,
+        "description": name,
+        "input_schema": {"type": "object", "properties": {}},
+        "annotations": {"readonly": True},
+        "tags": [],
+        "connector_version": version,
+    }
+
+
+async def _seed_two_versions(
+    engine: AsyncEngine, workspace_id: uuid.UUID, *, status: str = "active"
+) -> uuid.UUID:
+    """A connector with v1 current (demo_x tool projected) and v2 persisted but un-promoted."""
+    cid, v1, v2 = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    slug = f"p-{cid.hex[:8]}"
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO connectors (id,workspace_id,name,slug,source_type,base_url,status)"
+                " VALUES (:i,:w,'Promo',:s,'openapi3','https://api.example.com',:st)"
+            ),
+            {"i": cid, "w": workspace_id, "s": slug, "st": status},
+        )
+        for vid, num, tool in ((v1, 1, "demo_x"), (v2, 2, "demo_y")):
+            await conn.execute(
+                text(
+                    "INSERT INTO connector_versions"
+                    " (id,workspace_id,connector_id,version,spec_hash,normalized_schema)"
+                    " VALUES (:i,:w,:c,:n,:h,CAST(:ns AS jsonb))"
+                ),
+                {
+                    "i": vid,
+                    "w": workspace_id,
+                    "c": cid,
+                    "n": num,
+                    "h": f"{num:064d}",
+                    "ns": json.dumps([_tool(tool, num)]),
+                },
+            )
+        await conn.execute(
+            text("UPDATE connectors SET current_version_id=:v WHERE id=:c"), {"v": v1, "c": cid}
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO tools"
+                " (id,workspace_id,connector_id,connector_version_id,name,description,"
+                "input_schema,annotations,enabled)"
+                " VALUES (:i,:w,:c,:v,'demo_x','x',CAST('{}' AS jsonb),CAST('{}' AS jsonb),true)"
+            ),
+            {"i": uuid.uuid4(), "w": workspace_id, "c": cid, "v": v1},
+        )
+    return cid
+
+
+async def _current_version(engine: AsyncEngine, cid: uuid.UUID) -> int | None:
+    async with engine.connect() as conn:
+        return await conn.scalar(
+            text(
+                "SELECT v.version FROM connectors c JOIN connector_versions v"
+                " ON v.id=c.current_version_id WHERE c.id=:c"
+            ),
+            {"c": cid},
+        )
+
+
+async def test_promote_swaps_to_the_target_version_and_is_idempotent(
+    owner: dict[str, object], admin_engine: AsyncEngine, workspace_a: SeededWorkspace
+) -> None:
+    client: AsyncClient = owner["client"]  # type: ignore[assignment]
+    cid = await _seed_two_versions(admin_engine, workspace_a.id)
+
+    resp = await client.post(
+        f"/v1/connectors/{cid}/versions/2/promote",
+        headers=hx(owner["token"], owner["ws"]),  # type: ignore[arg-type]
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "active"
+    assert await _current_version(admin_engine, cid) == 2
+    async with admin_engine.connect() as conn:
+        live = list(
+            await conn.scalars(
+                text("SELECT name FROM tools WHERE connector_id=:c AND deleted_at IS NULL"),
+                {"c": cid},
+            )
+        )
+    assert live == ["demo_y"]  # v1's demo_x soft-deleted in the swap
+
+    # Idempotent: promoting the current version again is a 200 no-op.
+    again = await client.post(
+        f"/v1/connectors/{cid}/versions/2/promote",
+        headers=hx(owner["token"], owner["ws"]),  # type: ignore[arg-type]
+    )
+    assert again.status_code == 200
+    assert await _current_version(admin_engine, cid) == 2
+
+
+@pytest.mark.parametrize(("role", "expected"), [("member", 403), ("viewer", 403)])
+async def test_promote_requires_connectors_manage(
+    human_client: tuple[AsyncClient, FakeJWKSEndpoint],
+    authority: SigningAuthority,
+    admin_engine: AsyncEngine,
+    workspace_a: SeededWorkspace,
+    role: str,
+    expected: int,
+) -> None:
+    client, _ = human_client
+    cid = await _seed_two_versions(admin_engine, workspace_a.id)
+    await seed_member(admin_engine, workspace_a.id, user_id=f"pro-{role}", role=role)
+    resp = await client.post(
+        f"/v1/connectors/{cid}/versions/2/promote",
+        headers=hx(authority.sign(f"pro-{role}"), workspace_a.id),
+    )
+    assert resp.status_code == expected
+    assert await _current_version(admin_engine, cid) == 1  # unauthorized → not promoted
+
+
+async def test_promote_unknown_connector_is_404(owner: dict[str, object]) -> None:
+    client: AsyncClient = owner["client"]  # type: ignore[assignment]
+    resp = await client.post(
+        f"/v1/connectors/{uuid.uuid4()}/versions/1/promote",
+        headers=hx(owner["token"], owner["ws"]),  # type: ignore[arg-type]
+    )
+    assert resp.status_code == 404
+
+
+async def test_promote_unknown_version_is_404(
+    owner: dict[str, object], admin_engine: AsyncEngine, workspace_a: SeededWorkspace
+) -> None:
+    client: AsyncClient = owner["client"]  # type: ignore[assignment]
+    cid = await _seed_two_versions(admin_engine, workspace_a.id)
+    resp = await client.post(
+        f"/v1/connectors/{cid}/versions/99/promote",
+        headers=hx(owner["token"], owner["ws"]),  # type: ignore[arg-type]
+    )
+    assert resp.status_code == 404
+    assert await _current_version(admin_engine, cid) == 1
+
+
+async def test_promote_while_ingesting_is_409(
+    owner: dict[str, object], admin_engine: AsyncEngine, workspace_a: SeededWorkspace
+) -> None:
+    client: AsyncClient = owner["client"]  # type: ignore[assignment]
+    cid = await _seed_two_versions(admin_engine, workspace_a.id, status="ingesting")
+    resp = await client.post(
+        f"/v1/connectors/{cid}/versions/2/promote",
+        headers=hx(owner["token"], owner["ws"]),  # type: ignore[arg-type]
+    )
+    assert resp.status_code == 409
+    assert await _current_version(admin_engine, cid) == 1  # unchanged

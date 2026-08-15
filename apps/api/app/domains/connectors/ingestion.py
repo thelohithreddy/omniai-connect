@@ -36,8 +36,9 @@ from app.core.object_store import (
     TenantObjectKey,
     get_object_store,
 )
-from app.domains.connectors import openapi
-from app.domains.connectors.events import connector_ingested, connector_ingestion_failed
+from app.domains.connectors import openapi, promotion
+from app.domains.connectors.diff import compute_diff
+from app.domains.connectors.events import connector_ingestion_failed
 from app.domains.connectors.models import Connector, ConnectorVersion
 from app.domains.connectors.openapi import IngestionError
 
@@ -48,7 +49,9 @@ Fetcher = Callable[[str], Awaitable[bytes]]
 @dataclass(frozen=True, slots=True)
 class IngestionResult:
     connector_id: uuid.UUID
-    status: str  # "ingested" (new version) | "unchanged" (no-op re-sync)
+    # "ingested" (new version, auto-promoted) | "unchanged" (no-op re-sync) |
+    # "pending" (breaking version persisted, awaiting explicit promotion — M1.4-B1.4)
+    status: str
     version: int | None
     spec_hash: str
 
@@ -191,6 +194,15 @@ async def _persist(
         connector.status = "active"
         return IngestionResult(connector_id, "unchanged", current.version, new_hash)
 
+    # Diff the new Tool set against the current version on source identity; the breaking flag drives
+    # the promotion gate (§185). A first version has no predecessor — every Tool is additive.
+    old_tools = [
+        {key: value for key, value in tool.items() if key != "connector_version"}
+        for tool in (current.normalized_schema if current is not None else [])
+        if isinstance(tool, dict)
+    ]
+    diff = compute_diff(old_tools, tools)
+
     version = await _next_version_number(uow, workspace_id, connector_id)
     # Persist the version number into the stored Tool set (hash stays version-independent).
     normalized_schema = [{**tool, "connector_version": version} for tool in tools]
@@ -206,23 +218,28 @@ async def _persist(
         spec_hash=new_hash,
         raw_spec_ref=raw_key.full_key,
         normalized_schema=normalized_schema,
+        diff_summary=diff,
     )
     uow.session.add(row)
     await uow.session.flush()  # assign row.id for the pointer
 
-    connector.current_version_id = row.id
-    connector.status = "active"
-    base_url = openapi.base_url_from_servers(document)
-    if base_url:
-        connector.base_url = base_url[:2048]
     if source_url is not None:
         connector.source_url = source_url[:2048]
 
-    # Buffered directly on this UoW; dispatches only after COMMIT (B0.4). Buffering on the held
-    # UoW (not the ambient-sink `event_bus.publish`) keeps this correct regardless of caller
-    # context, and still enforces the event-tenant == bound-tenant match.
-    uow.buffer_event(connector_ingested(workspace_id, connector_id, version, new_hash))
-    return IngestionResult(connector_id, "ingested", version, new_hash)
+    if current is None or not diff["breaking"]:
+        # First version, or a non-breaking (purely additive) diff → auto-promote (§7, §381):
+        # advance the pointer, project the tools, and buffer `connector.ingested` (in `promote`).
+        await promotion.promote(uow, workspace_id, connector, row)
+        base_url = openapi.base_url_from_servers(document)
+        if base_url:
+            connector.base_url = base_url[:2048]
+        return IngestionResult(connector_id, "ingested", version, new_hash)
+
+    # Breaking diff → the version is persisted with its diff_summary but NOT promoted: the connector
+    # keeps serving its current version (status returns to active) and an owner/admin promotes it
+    # explicitly (§4/§7). No tools projection, no `connector.ingested` — the live set is unchanged.
+    connector.status = "active"
+    return IngestionResult(connector_id, "pending", version, new_hash)
 
 
 async def mark_failed(

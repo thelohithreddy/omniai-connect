@@ -1357,3 +1357,73 @@ cross-format dedup to one version, a Swagger remote `$ref` through the guarded f
 30-mutation B1.3 audit (0 meaningful survivors), a live real-worker Swagger ingestion, and full
 regression at warning and debug. Deferred to B1.4: `diff_summary`, promotion gating, the `tools`
 denormalization table; also OpenAPI 3.1, the §17 remote-ref cache, scheduled re-sync — none started.
+
+## ADR-0028 — Connector diff, promotion gate, and tools projection (M1.4-B1.4)
+
+**Status:** Accepted (2026-08-16) · **Context:** M1.4-B1.4, the final ingestion slice, closing the
+Connector Engine v1 milestone. It lands the three capabilities B1.1–B1.3 deferred: version diffing,
+promotion gating, and the `tools` denormalization table (CONNECTOR_SPECIFICATION §3/§4/§185,
+CONNECTOR_ENGINE §3/§7, DATABASE_DESIGN §3). Two points were canon-silent because they depend on the
+future **Connections** module; the founder ratified both (below). One new migration (`0009_tools`).
+
+**Decision:**
+
+1. **Deterministic diff (`diff.py`, pure).** `compute_diff(old_tools, new_tools) →
+   {added, removed, changed, breaking}`, computed Tool-by-Tool on **source identity** — the
+   canonical tool name, which encodes operationId/method+path with stable disambiguation (§5), so a
+   re-described operation is a `changed` entry and a renamed operationId is a remove + add. A
+   `changed` entry lists the content fields that moved (excluding version-specific / identity
+   fields) and flags the `input_schema` change **breaking** per §185: *a required argument added, an
+   argument removed, or an existing argument's type narrowed*. `breaking` (the gate input) is any
+   removed tool OR any breaking change; additive edits (new tool, new optional argument, description/
+   annotation/enum changes) are not breaking. Output is deterministic and content-only — no
+   timestamps, ids, URLs, workspace ids, or secrets — persisted as `connector_versions.diff_summary`.
+
+2. **Promotion gate (ratified).** Ingestion computes the diff against the current version. A **first
+   version or a non-breaking (additive) diff auto-promotes** inside the ingestion transaction
+   (§381). A **breaking diff is persisted with its `diff_summary` but NOT auto-promoted**: the
+   connector keeps serving its current version (status returns to `active`), no tools are projected,
+   and **no `connector.ingested` fires** (the live set is unchanged). An owner/admin then promotes
+   explicitly via `POST /v1/connectors/{connector_id}/versions/{version}/promote`
+   (`connectors:manage`, synchronous, idempotent, 200). Canon gates on breaking changes *"used by
+   active Connections"*, but **Connections are a future module** — so the founder ratified the
+   conservative reading: gate **all** breaking diffs (false caution is cheaper, §6/§13); the
+   usage-based *narrowing* of the gate is deferred to the Connections module. Authorization is the
+   existing chain only (JWT → X-Workspace-Id → membership → `connectors:manage` → connector
+   ownership → RLS); no Connection / spec / version field ever influences authority.
+
+3. **`tools` projection (`promotion.py`, migration `0009`).** `tools` is a **projection** of the
+   *active* version's Tool set — `connector_versions.normalized_schema` stays authoritative (§3).
+   Promotion **swaps the active set** and never mutates schema in place: the current live rows are
+   soft-deleted (`deleted_at`), the new version's rows inserted (`connector_version_id` = the
+   promoted version), and each Tool's `enabled` override re-applied on identity (name). The live set
+   is `deleted_at IS NULL`; a removed Tool has no new row and stays soft-deleted — deprecated,
+   retained for audit, failing `tool_not_found` (§13). The projection + pointer advance + event are
+   one transaction shared by both callers (worker auto-promote and the explicit endpoint), so there
+   is exactly one implementation. `tools` columns per DATABASE_DESIGN §3 (`name, description,
+   input_schema, output_hints NULL, annotations` (carrying tags), `enabled` default true,
+   `deleted_at`); RLS ENABLE+FORCE + `tenant_isolation`; two composite intra-tenant FKs (connector
+   AND version in the same workspace); **SELECT/INSERT/UPDATE grants — no DELETE** (deprecation is a
+   soft delete); partial unique `(connector_version_id, name) WHERE deleted_at IS NULL` so
+   re-promotion never collides with history.
+
+4. **Event (ratified) + idempotency + concurrency.** On activation/promotion, **reuse
+   `connector.ingested`** (canon §343 — "promotion publishes connector.ingested"); no new event type
+   is invented, and its payload is unchanged (connector id, version, spec_hash — no secrets). The
+   auto-promote path dedupes on `spec_hash` (a no-op re-sync creates no version, no tools, no event);
+   Celery redelivery re-runs to the same hash. Explicit promotion is idempotent (promoting the
+   current version is a no-op) and concurrency-safe: the connector row is locked `FOR UPDATE`, so
+   concurrent promotions (and a promotion racing the worker) serialize — the winner projects, the
+   loser no-ops — with the partial-unique index as the correctness backstop against duplicate rows.
+
+**Consequences:** One migration (`0009_tools`; up/down/up verified, `alembic check` clean); no
+change to `connectors` / `connector_versions`, no historical migration rewritten. The event contract
+is unchanged. The B1.1–B1.3 auto-promote-always behaviour changes only for **breaking** re-syncs
+(now held pending) — one existing test that used a removal was split into an additive-auto-promote
+test and a breaking-pending test. Proven by 19 diff unit tests + 11 real-Postgres+MinIO integration
+tests (auto-promote, breaking-pending, tools projection, override persistence, explicit promotion,
+concurrency) + 6 promote-endpoint API tests (RBAC, 404, 409, idempotency, swap), a 26-mutation B1.4
+audit (0 meaningful survivors), migration up/down/up, and full regression at warning and debug.
+**Deferred:** the usage-based gate refinement, an auto-promote-per-Connector setting, the
+`deprecated`/`archived` states, scheduled re-sync, and the §4 lint surface — all belonging to later
+modules.

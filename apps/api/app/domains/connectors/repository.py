@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.exceptions import ConflictError
 from app.core.pagination import CursorPosition
 from app.core.security import WorkspaceContext
-from app.domains.connectors.models import Connector
+from app.domains.connectors.models import Connector, ConnectorVersion
 
 
 class ConnectorRepository:
@@ -104,6 +104,40 @@ class ConnectorRepository:
         )
         connector: Connector | None = await self._session.scalar(stmt)
         return connector
+
+    async def get_for_update(self, connector_id: uuid.UUID) -> Connector | None:
+        """One live Connector by id, row-locked for the current transaction (`SELECT … FOR UPDATE`).
+
+        Used by promotion so concurrent promotions (and a promotion racing the worker's
+        auto-promote) serialize on the connector row rather than interleaving the tools projection.
+        Workspace-scoped exactly like `get`.
+        """
+        stmt = (
+            select(Connector)
+            .where(
+                Connector.id == connector_id,
+                Connector.workspace_id == self._ctx.workspace_id,
+                Connector.deleted_at.is_(None),
+            )
+            .with_for_update()
+        )
+        connector: Connector | None = await self._session.scalar(stmt)
+        return connector
+
+    async def get_version(self, connector_id: uuid.UUID, version: int) -> ConnectorVersion | None:
+        """One immutable version of a Connector by its monotonic number, within this Workspace.
+
+        The `workspace_id` predicate is not redundant with the unique `(connector_id, version)`:
+        dropping it would turn a guessed connector id into a cross-tenant read if RLS were ever
+        misconfigured. A version of a foreign connector is simply not found.
+        """
+        stmt = select(ConnectorVersion).where(
+            ConnectorVersion.connector_id == connector_id,
+            ConnectorVersion.version == version,
+            ConnectorVersion.workspace_id == self._ctx.workspace_id,
+        )
+        row: ConnectorVersion | None = await self._session.scalar(stmt)
+        return row
 
     async def mark_ingesting(self, connector_id: uuid.UUID) -> bool:
         """Transition a live Connector into `ingesting`. Returns whether a row moved.

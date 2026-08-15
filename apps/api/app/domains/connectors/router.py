@@ -11,7 +11,7 @@ import contextlib
 import uuid
 from typing import Annotated, Final
 
-from fastapi import APIRouter, Depends, Query, Request, Response, status
+from fastapi import APIRouter, Depends, Path, Query, Request, Response, status
 from starlette.datastructures import UploadFile
 
 from app.core.authorization import require_permission
@@ -223,6 +223,41 @@ async def ingest_connector_version(
             uow, workspace_id=ctx.workspace_id, connector_id=connector_id, source_url=source_url
         )
 
+    return ConnectorRead.model_validate(connector)
+
+
+@connectors_router.post(
+    "/{connector_id}/versions/{version}/promote",
+    response_model=ConnectorRead,
+    summary="Promote a version to the Connector's active definition",
+    responses={
+        200: {
+            "description": "The version is now active: the tools projection was swapped to it and "
+            "`connector.ingested` published. Idempotent — promoting the current version is a no-op."
+        },
+        401: {"description": "Missing or invalid credentials."},
+        403: {"description": "Caller does not hold `connectors:manage` in this Workspace."},
+        404: {"description": "No such live connector, or no such version, in this Workspace."},
+        409: {"description": "The Connector is ingesting; promote after it settles."},
+    },
+)
+async def promote_connector_version(
+    connector_id: uuid.UUID,
+    service: Annotated[ConnectorService, Depends(get_connector_service)],
+    uow: Annotated[UnitOfWork, Depends(get_uow)],
+    version: Annotated[int, Path(ge=1, description="The monotonic version number to promote.")],
+) -> ConnectorRead:
+    """Promote a persisted version to the Connector's active definition (M1.4-B1.4).
+
+    A first or purely-additive version auto-promotes during ingestion; a **breaking** version
+    (a required argument added, an argument removed, or a type narrowed — CONNECTOR_SPECIFICATION
+    §185) is persisted un-promoted and activated here so the change is a deliberate act. The
+    Connector keeps serving its current version until this succeeds. The workspace is the
+    authenticated context and appears in no field, so a cross-workspace promotion is not a request
+    this API can express; a foreign/deleted connector or an unknown version is a uniform 404.
+    Idempotent and concurrency-safe (the connector row is locked for the transaction).
+    """
+    connector = await service.promote(uow, connector_id=connector_id, version=version)
     return ConnectorRead.model_validate(connector)
 
 

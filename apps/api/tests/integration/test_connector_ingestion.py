@@ -50,7 +50,44 @@ SPEC_V2 = json.dumps(
     }
 ).encode()
 
+# Additive change vs SPEC_V1: keeps both operations, adds a third — nothing removed or narrowed.
+SPEC_V1_PLUS = json.dumps(
+    {
+        "openapi": "3.0.3",
+        "info": {"title": "T", "version": "1"},
+        "servers": [{"url": "https://api.demo.com/v1"}],
+        "paths": {
+            "/customers": {
+                "get": {"operationId": "listCustomers"},
+                "post": {"operationId": "createCustomer"},
+            },
+            "/orders": {"get": {"operationId": "listOrders"}},
+        },
+    }
+).encode()
+
 URL = "https://api.demo.com/openapi.json"
+
+
+async def _current_and_live_tools(conn: object, cid: uuid.UUID) -> tuple[int | None, list[str]]:
+    """(current version number, sorted names of the connector's LIVE tool rows) via the admin
+    connection — the projection an authorized reader would see."""
+    current = await conn.scalar(  # type: ignore[attr-defined]
+        text(
+            "SELECT v.version FROM connectors c JOIN connector_versions v"
+            " ON v.id = c.current_version_id WHERE c.id=:c"
+        ),
+        {"c": cid},
+    )
+    names = list(
+        await conn.scalars(  # type: ignore[attr-defined]
+            text(
+                "SELECT name FROM tools WHERE connector_id=:c AND deleted_at IS NULL ORDER BY name"
+            ),
+            {"c": cid},
+        )
+    )
+    return current, names
 
 
 def _fetcher(body: bytes) -> Callable[[str], object]:
@@ -191,14 +228,18 @@ async def test_reingest_identical_spec_is_a_noop(
     assert len([e for e in captured_events if e.event_type == "connector.ingested"]) == 1
 
 
-async def test_reingest_changed_spec_appends_version_2(
+async def test_additive_resync_auto_promotes_version_2(
     admin_engine: AsyncEngine, workspace_a: SeededWorkspace, captured_events: list[Event]
 ) -> None:
+    # An additive re-sync (a new operation, nothing removed/narrowed) auto-promotes (§7): version 2
+    # becomes current, its tools are projected, and a second connector.ingested fires.
     cid = await _seed_connector(admin_engine, workspace_a.id)
     async with worker_tenant_uow(str(workspace_a.id)) as uow:
         await ingest_from_url(uow, workspace_a.id, cid, URL, fetcher=_fetcher(SPEC_V1))
     async with worker_tenant_uow(str(workspace_a.id)) as uow:
-        second = await ingest_from_url(uow, workspace_a.id, cid, URL, fetcher=_fetcher(SPEC_V2))
+        second = await ingest_from_url(
+            uow, workspace_a.id, cid, URL, fetcher=_fetcher(SPEC_V1_PLUS)
+        )
     assert second.status == "ingested" and second.version == 2
     async with admin_engine.connect() as conn:
         versions = list(
@@ -209,8 +250,40 @@ async def test_reingest_changed_spec_appends_version_2(
                 {"c": cid},
             )
         )
+        current, live_tools = await _current_and_live_tools(conn, cid)
     assert versions == [1, 2]
+    assert current == 2  # auto-promoted to v2
+    assert live_tools == ["demo_createcustomer", "demo_listcustomers", "demo_listorders"]
     assert len([e for e in captured_events if e.event_type == "connector.ingested"]) == 2
+
+
+async def test_breaking_resync_persists_a_pending_version_without_promoting(
+    admin_engine: AsyncEngine, workspace_a: SeededWorkspace, captured_events: list[Event]
+) -> None:
+    # A breaking re-sync (SPEC_V2 removes createCustomer) is persisted with its diff_summary but is
+    # NOT auto-promoted: the connector keeps serving v1, its live tools are unchanged, and no second
+    # connector.ingested fires. The gate awaits an explicit promotion (§4/§7).
+    cid = await _seed_connector(admin_engine, workspace_a.id)
+    async with worker_tenant_uow(str(workspace_a.id)) as uow:
+        await ingest_from_url(uow, workspace_a.id, cid, URL, fetcher=_fetcher(SPEC_V1))
+    async with worker_tenant_uow(str(workspace_a.id)) as uow:
+        second = await ingest_from_url(uow, workspace_a.id, cid, URL, fetcher=_fetcher(SPEC_V2))
+    assert second.status == "pending" and second.version == 2
+
+    async with admin_engine.connect() as conn:
+        current, live_tools = await _current_and_live_tools(conn, cid)
+        status = await conn.scalar(text("SELECT status FROM connectors WHERE id=:c"), {"c": cid})
+        diff = await conn.scalar(
+            text("SELECT diff_summary FROM connector_versions WHERE connector_id=:c AND version=2"),
+            {"c": cid},
+        )
+    assert current == 1  # still serving v1
+    assert status == "active"  # not stuck ingesting
+    assert live_tools == ["demo_createcustomer", "demo_listcustomers"]  # v1's tools, unchanged
+    assert diff["breaking"] is True and diff["removed"] == ["demo_createcustomer"]
+    # v1's ingest published exactly one connector.ingested; the breaking, un-promoted v2 published
+    # none (the live set is unchanged).
+    assert len([e for e in captured_events if e.event_type == "connector.ingested"]) == 1
 
 
 # ------------------------------------------------------------------ failure handling
@@ -596,3 +669,161 @@ async def test_a_swagger_remote_ref_resolves_through_the_guarded_fetcher(
             {"c": cid},
         )
     assert schema[0]["input_schema"]["properties"]["q"] == {"type": "string", "maxLength": 4}
+
+
+# ----------------------------------------------------- tools projection + promotion (M1.4-B1.4)
+
+
+async def test_first_version_projects_tools_and_a_diff_summary(
+    admin_engine: AsyncEngine, workspace_a: SeededWorkspace
+) -> None:
+    cid = await _seed_connector(admin_engine, workspace_a.id)
+    async with worker_tenant_uow(str(workspace_a.id)) as uow:
+        await ingest_from_url(uow, workspace_a.id, cid, URL, fetcher=_fetcher(SPEC_V1))
+
+    async with admin_engine.connect() as conn:
+        current, live = await _current_and_live_tools(conn, cid)
+        vid = await conn.scalar(
+            text("SELECT current_version_id FROM connectors WHERE id=:c"), {"c": cid}
+        )
+        diff = await conn.scalar(
+            text("SELECT diff_summary FROM connector_versions WHERE connector_id=:c AND version=1"),
+            {"c": cid},
+        )
+        rows = (
+            await conn.execute(
+                text(
+                    "SELECT input_schema, annotations, enabled, connector_version_id"
+                    " FROM tools WHERE connector_id=:c AND deleted_at IS NULL ORDER BY name"
+                ),
+                {"c": cid},
+            )
+        ).all()
+    assert current == 1
+    assert live == ["demo_createcustomer", "demo_listcustomers"]
+    assert diff["added"] == ["demo_createcustomer", "demo_listcustomers"]
+    assert diff["breaking"] is False
+    # Each row points at the active version, defaults enabled, and carries annotations (+ tags).
+    for input_schema, annots, enabled, cvid in rows:
+        assert cvid == vid
+        assert enabled is True
+        assert input_schema["type"] == "object"
+        assert "tags" in annots
+
+
+async def test_promoting_a_pending_breaking_version_swaps_the_active_tools(
+    admin_engine: AsyncEngine, workspace_a: SeededWorkspace, captured_events: list[Event]
+) -> None:
+    from sqlalchemy import select
+
+    from app.domains.connectors import promotion
+    from app.domains.connectors.models import Connector, ConnectorVersion
+
+    cid = await _seed_connector(admin_engine, workspace_a.id)
+    async with worker_tenant_uow(str(workspace_a.id)) as uow:
+        await ingest_from_url(uow, workspace_a.id, cid, URL, fetcher=_fetcher(SPEC_V1))
+    async with worker_tenant_uow(str(workspace_a.id)) as uow:
+        await ingest_from_url(uow, workspace_a.id, cid, URL, fetcher=_fetcher(SPEC_V2))  # pending
+
+    async with worker_tenant_uow(str(workspace_a.id)) as uow:
+        connector = await uow.session.scalar(select(Connector).where(Connector.id == cid))
+        v2 = await uow.session.scalar(
+            select(ConnectorVersion).where(
+                ConnectorVersion.connector_id == cid, ConnectorVersion.version == 2
+            )
+        )
+        assert connector is not None and v2 is not None
+        changed = await promotion.promote(uow, workspace_a.id, connector, v2)
+    assert changed is True
+
+    async with admin_engine.connect() as conn:
+        current, live = await _current_and_live_tools(conn, cid)
+    assert current == 2
+    assert live == ["demo_listcustomers"]  # createcustomer removed → soft-deleted (deprecated)
+    # v1 auto-promote + v2 explicit promote = exactly two activations.
+    assert len([e for e in captured_events if e.event_type == "connector.ingested"]) == 2
+
+    # Idempotent: promoting the already-current version changes nothing.
+    async with worker_tenant_uow(str(workspace_a.id)) as uow:
+        connector = await uow.session.scalar(select(Connector).where(Connector.id == cid))
+        v2 = await uow.session.scalar(
+            select(ConnectorVersion).where(
+                ConnectorVersion.connector_id == cid, ConnectorVersion.version == 2
+            )
+        )
+        assert connector is not None and v2 is not None
+        assert await promotion.promote(uow, workspace_a.id, connector, v2) is False
+
+
+async def test_enabled_overrides_survive_promotion(
+    admin_engine: AsyncEngine, workspace_a: SeededWorkspace
+) -> None:
+    cid = await _seed_connector(admin_engine, workspace_a.id)
+    async with worker_tenant_uow(str(workspace_a.id)) as uow:
+        await ingest_from_url(uow, workspace_a.id, cid, URL, fetcher=_fetcher(SPEC_V1))
+    # The user disables a tool on v1.
+    async with admin_engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE tools SET enabled=false WHERE connector_id=:c AND name='demo_listcustomers'"
+            ),
+            {"c": cid},
+        )
+    # An additive re-sync auto-promotes v2; the override must re-apply to v2's row (§3), while a
+    # brand-new tool defaults to enabled.
+    async with worker_tenant_uow(str(workspace_a.id)) as uow:
+        await ingest_from_url(uow, workspace_a.id, cid, URL, fetcher=_fetcher(SPEC_V1_PLUS))
+
+    async with admin_engine.connect() as conn:
+        carried = await conn.scalar(
+            text(
+                "SELECT enabled FROM tools"
+                " WHERE connector_id=:c AND name='demo_listcustomers' AND deleted_at IS NULL"
+            ),
+            {"c": cid},
+        )
+        fresh = await conn.scalar(
+            text(
+                "SELECT enabled FROM tools"
+                " WHERE connector_id=:c AND name='demo_listorders' AND deleted_at IS NULL"
+            ),
+            {"c": cid},
+        )
+    assert carried is False  # the disable survived promotion
+    assert fresh is True  # the new tool defaults enabled
+
+
+async def test_concurrent_promotions_project_no_duplicate_tools(
+    admin_engine: AsyncEngine, workspace_a: SeededWorkspace
+) -> None:
+    from app.core.security import CallerIdentity, WorkspaceContext
+    from app.domains.connectors.repository import ConnectorRepository
+    from app.domains.connectors.service import ConnectorService
+
+    cid = await _seed_connector(admin_engine, workspace_a.id)
+    async with worker_tenant_uow(str(workspace_a.id)) as uow:
+        await ingest_from_url(uow, workspace_a.id, cid, URL, fetcher=_fetcher(SPEC_V1))
+    async with worker_tenant_uow(str(workspace_a.id)) as uow:
+        await ingest_from_url(uow, workspace_a.id, cid, URL, fetcher=_fetcher(SPEC_V2))  # pending
+
+    ctx = WorkspaceContext(
+        workspace_id=workspace_a.id,
+        caller=CallerIdentity(kind="api_token", api_token_id=uuid.uuid4()),
+        request_id="req_test",
+    )
+
+    async def promote_v2() -> None:
+        # The production path: service.promote → repository.get_for_update (SELECT … FOR UPDATE) →
+        # promotion. The row lock serializes the two racers — the winner projects, the loser reads
+        # v2 already current and no-ops. Without the lock, both would insert v2's tools and the
+        # partial-unique index would fail the second → a raised error here, not a silent duplicate.
+        async with worker_tenant_uow(str(workspace_a.id)) as uow:
+            service = ConnectorService(ConnectorRepository(uow.session, ctx))
+            await service.promote(uow, connector_id=cid, version=2)
+
+    await asyncio.gather(promote_v2(), promote_v2())
+
+    async with admin_engine.connect() as conn:
+        current, live = await _current_and_live_tools(conn, cid)
+    assert current == 2
+    assert live == ["demo_listcustomers"]  # exactly v2's live set — no duplicate rows
