@@ -103,9 +103,7 @@ def upgrade() -> None:
             "connector_id", "version", name="uq_connector_versions_connector_id_version"
         ),
         # The composite-FK target for connectors.current_version_id.
-        sa.UniqueConstraint(
-            "workspace_id", "id", name="uq_connector_versions_workspace_id_id"
-        ),
+        sa.UniqueConstraint("workspace_id", "id", name="uq_connector_versions_workspace_id_id"),
     )
 
     # Tenant-scoped access path leads with workspace_id (P-44).
