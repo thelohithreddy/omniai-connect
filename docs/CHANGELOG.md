@@ -13,6 +13,25 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Object storage + tenant-key isolation (M1.4-B0.5, ADR-0024).** One `ObjectStore` abstraction
+  (`app/core/object_store.py`) over the S3 API — Cloudflare R2 in production, MinIO in local/CI,
+  differing only by `R2_ENDPOINT`. `aioboto3` is the only S3 SDK and is confined to this module (no
+  application code touches boto3/botocore). Tenant isolation is the **object key**: every key is
+  `ws/<workspace_id>/<path>`, built only by `TenantObjectKey.for_workspace` from a *trusted*
+  workspace UUID and an explicit allowlist grammar that rejects traversal, backslashes, encoded
+  traversal, null/control chars, whitespace, unicode, absolute/UNC paths, and empty segments —
+  before any provider call. `put`/`get`/`head`/`delete` take a `TenantObjectKey`, never a raw
+  string, so a caller can never present a cross-tenant or unvalidated key; the single bucket is
+  infrastructure, never the tenant boundary, and the provider is never the authorization system.
+  Config fails closed (missing settings, and non-TLS in production, are refused — never a silent
+  MinIO fallback), errors surface only the S3 code (never the raw SDK string or a credential), and
+  the secret stays a `SecretStr`. A MinIO service + deterministic bucket init were added to compose
+  and CI; storage credentials are scoped to the api + ingestion worker (dev-only MinIO creds
+  locally). No migration, no table, no SECURITY DEFINER, no public bucket, no anonymous access, no
+  presigned URLs. Proven by 72 tests (adversarial key grammar + fail-closed config + **real-MinIO**
+  PUT/GET/HEAD/DELETE, cross-tenant isolation, A×8/B×8/C×8 concurrency, and failure modes), a
+  17-mutation B0.5 audit (16 killed, 1 inert survivor), and a live cross-tenant isolation run. The
+  importer that first writes `raw_spec_ref` is M1.4-B1.
 - **Internal event bus (M1.4-B0.4, ADR-0023).** The shared-kernel domain-event transport
   (`app/core/events.py`): a frozen Pydantic `Event` envelope (`event_id` UUIDv7, `event_type`
   dotted namespace, `version`, `workspace_id`, `occurred_at` UTC-aware, JSON-safe `payload`) and

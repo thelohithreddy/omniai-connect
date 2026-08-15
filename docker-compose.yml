@@ -33,6 +33,32 @@ services:
       timeout: 5s
       retries: 5
 
+  # S3-compatible object storage for local/CI (M1.4-B0.5, ADR-0024). Production uses Cloudflare
+  # R2; the application speaks only the S3 API, selected by R2_ENDPOINT. Credentials here are
+  # development-only (never production R2 secrets). The console (9001) is a local convenience;
+  # it is not part of any deployed surface.
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniodata:/data
+
+  # Deterministic bucket initialisation: wait for MinIO, then create the dev bucket idempotently
+  # and exit. api/worker gate on this completing, so the bucket always exists before they run.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint:
+      ["/bin/sh", "-c",
+       "until mc alias set local http://minio:9000 minioadmin minioadmin; do sleep 1; done; mc mb --ignore-existing local/omniai-dev; exit 0"]
+
   api:
     build:
       context: .
@@ -48,6 +74,13 @@ services:
       # JWKS fetch address inside the compose network (ADR-0015 §5). The public
       # issuer stays BETTER_AUTH_URL; only the fetch location differs in here.
       BETTER_AUTH_JWKS_URL: http://web:3000/api/auth/jwks
+      # Object storage → MinIO on the compose network (M1.4-B0.5). Dev-only credentials; these
+      # override whatever .env carries so local storage always targets the compose MinIO.
+      R2_ENDPOINT: http://minio:9000
+      R2_ACCESS_KEY_ID: minioadmin
+      R2_SECRET_ACCESS_KEY: minioadmin
+      R2_BUCKET: omniai-dev
+      R2_REGION: auto
     ports:
       - "8000:8000"
     depends_on:
@@ -55,6 +88,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
     volumes:
       - ./apps/api:/app
     healthcheck:
@@ -83,9 +118,11 @@ services:
   # Celery ingestion worker (M1.4-B0.2, ADR-0021). Reuses the API image (one image, a
   # different command — it runs `celery worker`, never uvicorn) and consumes ONLY the
   # `ingestion` queue. It publishes no port, exposes no HTTP surface, and is NOT `env_file:
-  # .env` — its environment is scoped by hand so it never inherits BETTER_AUTH_SECRET, R2_*,
-  # Stripe/Resend, or any frontend/API secret it has no need for (§19). DB URL is the
-  # non-superuser app role, present for the tenant work B0.3 adds (the demo tasks are DB-free).
+  # .env` — its environment is scoped by hand so it never inherits BETTER_AUTH_SECRET,
+  # Stripe/Resend, or any frontend/API secret it has no need for (§19). It DOES receive
+  # object-storage credentials from B0.5 on, because the ingestion worker stores fetched specs
+  # in R2 (CONNECTOR_SPECIFICATION §18) — here those are the dev-only MinIO credentials, never
+  # production R2 secrets. DB URL is the non-superuser app role (B0.3 tenant work).
   worker:
     # One image, a different command: reuse the API image built above rather than a second
     # build (§16). In production the same prod image runs this `celery worker` command.
@@ -96,14 +133,23 @@ services:
       DATABASE_URL: postgresql+asyncpg://omniai_app:omniai_app@db:5432/omniai
       APP_ENV: development
       LOG_LEVEL: info
+      # Object storage → MinIO (dev-only credentials). The worker writes ingested specs to R2.
+      R2_ENDPOINT: http://minio:9000
+      R2_ACCESS_KEY_ID: minioadmin
+      R2_SECRET_ACCESS_KEY: minioadmin
+      R2_BUCKET: omniai-dev
+      R2_REGION: auto
     command:
       ["celery", "-A", "app.workers.celery_app", "worker", "-Q", "ingestion",
        "--concurrency=2", "--loglevel=INFO", "--without-gossip", "--without-mingle"]
     depends_on:
       redis:
         condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
     volumes:
       - ./apps/api:/app
 
 volumes:
   pgdata:
+  miniodata:

@@ -1080,3 +1080,73 @@ rollback-emits-nothing, fail-closed tenant-match, A/B isolation, A×8/B×8/C×8 
 request-path emission) — plus a B0.4 mutation audit of 23 constructible mutations, **all killed, 0
 survivors**, and a live in-process publish→commit→dispatch run. R2 (B0.5) remains a separate slice;
 the ingestion pipeline that first publishes `connector.ingested` is M1.4-B1.
+
+## ADR-0024 — Object storage: one S3-compatible boundary, tenant-isolated by object key (M1.4-B0.5)
+
+**Status:** Accepted (2026-08-15) · **Context:** M1.4-B0.5, the fifth ingestion-infrastructure
+slice. Canon (SYSTEM_ARCHITECTURE, CONNECTOR_ENGINE) stores spec files, export artifacts, and
+oversized/binary runtime payloads in Cloudflare R2, referenced by a server-constructed object key
+(`raw_spec_ref`). This ADR builds only the storage client and its **tenant-key isolation** — the
+named B0.5 deliverable — and nothing else: no importer, no `raw_spec_ref` persistence (that column
+lands with ingestion in B1), no DB row, no public route, no presigned URLs.
+
+**Decision:**
+
+1. **One `ObjectStore` abstraction over the S3 API** (`app/core/object_store.py`). Production is
+   Cloudflare R2; local/CI is MinIO; the two differ only by `R2_ENDPOINT`. `aioboto3` (async, so
+   the storage path is non-blocking like the rest of the worker/request path) is the only S3 SDK
+   and is **confined to this module** — no application code imports boto3/botocore, and the untyped
+   SDK surface never escapes the module's fully-typed public API. The store exposes exactly
+   `put`/`get`/`head`/`delete` (+ a dev/CI-only `ensure_bucket`); no list, no versioning, no
+   presigned URLs, no multipart — none are canon in B0.5.
+
+2. **A single bucket is infrastructure; tenant isolation is the object key.** Every key is
+   `ws/<workspace_id>/<relative_path>`, produced only by `TenantObjectKey.for_workspace` from a
+   **trusted** workspace UUID (a resolved `WorkspaceContext` or worker tenant context — never a
+   request body, payload, JWT claim, or task field) and an **explicit allowlist grammar** (not
+   pathlib): each `/`-separated segment must match `[A-Za-z0-9._-]+` and never be `.`/`..`. That
+   grammar rejects traversal, backslashes, encoded traversal (`%2e` has `%`), null bytes, control
+   characters, whitespace, unicode, absolute/UNC paths, and empty segments — by construction, so a
+   hostile path is refused before any provider call. `ObjectStore` operations take a
+   `TenantObjectKey`, never a raw string, so a caller cannot present an unvalidated or cross-tenant
+   key; even a relative path shaped like `ws/<B>/x` nests under the caller's own prefix and can
+   never address tenant B. The provider is never the authorization system, and R2/MinIO
+   credentials are never tenant credentials.
+
+3. **Config is validated and fails closed.** `resolve_object_store_config` requires
+   endpoint/bucket/access-key/secret and, in production, an `https://` endpoint — there is **no
+   silent MinIO fallback in production**. Errors name the missing setting, never its value; the
+   secret is a pydantic `SecretStr` unwrapped only at the SDK call, so a stray repr/log cannot leak
+   it. New settings `R2_ENDPOINT`/`R2_REGION` were added (canon named neither).
+
+4. **Errors are translated to a safe hierarchy** (`ObjectKeyError`/`ObjectNotFoundError`/
+   `StorageConfigError`/`StorageProviderError`): a 404/NoSuchKey becomes not-found; anything else
+   surfaces only the operation and the S3 error *code* — never the raw SDK string (which can embed
+   the endpoint/bucket/signed request), never a credential. Storage retries are botocore's bounded
+   `standard` mode (idempotent ops only); the store is never a second scheduler — Celery owns task
+   retries (ADR-0021).
+
+5. **Client lifecycle.** A client is opened per operation via `async with`, which both guarantees
+   sockets are closed (no leak) and is loop-safe for the prefork ingestion worker (fresh
+   `asyncio.run` loop per task, ADR-0022) — the same reasoning as B0.3's per-task DB connection.
+   Ingestion is not a hot path; a lifespan-shared client is a future optimisation.
+
+6. **Credential scoping.** Storage credentials reach only the services that need them: the API and
+   the ingestion **worker** (which writes fetched specs to R2, CONNECTOR_SPECIFICATION §18). In
+   compose these are dev-only MinIO credentials; MinIO itself receives no R2 secret. (The `web`
+   service inherits the empty `R2_*` placeholders from the shared dev `.env` via its pre-existing
+   broad `env_file`; those values are empty, Next.js does not read them, and production web on
+   Vercel carries no R2 secret — tightening `web`'s env is a separate hardening task, out of the
+   B0.5 storage-boundary scope.)
+
+**Consequences:** One new dependency (`aioboto3`, pure-Python; mypy-scoped like celery/kombu). No
+migration; no table; no SECURITY DEFINER; no new RLS policy or DB privilege (RLS/catalog unchanged,
+migration head still 0007). No public bucket, no anonymous access, no presigned URLs, no public
+file route (all deferred/absent). Proven by 72 tests — an adversarial `TenantObjectKey` grammar
+matrix (traversal/encoding/absolute/UNC/null/control/prefix-collision), fail-closed config
+resolution (TLS-in-prod, no secret leak), and **real-MinIO** integration (PUT/GET/HEAD/DELETE,
+missing-object, cross-tenant isolation, A×8/B×8/C×8 concurrency, per-op client lifecycle,
+unreachable-endpoint and wrong-credential failure without leakage) — plus a B0.5 mutation audit of
+17 constructible mutations (16 killed; the lone survivor is inert, botocore selecting path-style for
+a bare-host MinIO endpoint regardless), and a live cross-tenant isolation run. The importer that
+first writes `raw_spec_ref` is M1.4-B1.
