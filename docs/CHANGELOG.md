@@ -13,6 +13,23 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Worker tenant execution boundary (M1.4-B0.3, ADR-0022).** `app/workers/context.py`
+  (`worker_tenant_uow`) binds a background task to its tenant **fail-closed**, reusing the
+  existing `UnitOfWork` + `SET LOCAL app.workspace_id` GUC — **no second GUC/transaction system,
+  no migration, no new SECURITY DEFINER, no new DB role**. Core invariant: **a worker task
+  payload must never become authorization** — `workspace_id` selects *WHERE* (the tenant), never
+  *WHO/ROLE/PERMISSION*; the boundary reads only `workspace_id` (no `role`/`permission`/`member_id`
+  code path). A missing/null/empty/malformed context raises `WorkerContextError` **before any DB
+  access** (no default/first/system tenant). Order is load-bearing — *validate → BEGIN → SET
+  LOCAL → read-back verify → yield*; the transaction COMMITs tenant writes on success and ROLLs
+  BACK on error, and `SET LOCAL` cannot survive to the next task on a reused connection or across
+  a rollback/retry. A `NullPool` engine keeps the prefork worker (fresh `asyncio.run` loop per
+  task) fork-safe and loop-safe. The worker runs as `omniai_app` (non-superuser, non-BYPASSRLS);
+  RLS remains the sole authority. Proven by 18 real-Postgres context tests (fail-closed validation,
+  RLS isolation A/B, RLS-*independent* binding-correctness, `SET LOCAL` non-leak via a `pool_size=1`
+  reuse proof, rollback cleanup, commit-on-success, A×8/B×8 concurrency), a **real Redis → worker →
+  RLS** tenant task + a deployed-worker end-to-end run (returns the RLS-filtered count), and a B0.3
+  mutation audit (6 killed, 0 meaningful survivors). No ingestion, event bus, or R2 (B0.4/B0.5/B1).
 - **Celery worker execution foundation (M1.4-B0.2, ADR-0021).** The Celery substrate future
   ingestion runs on — `app/workers/celery_app.py` + a scoped `worker` compose service — with
   **no ingestion, tenant-context, event bus, or R2** (those are B0.3/B0.4/B0.5/M1.4-B1).

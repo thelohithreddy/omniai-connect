@@ -72,9 +72,14 @@ def test_arbitrary_queues_are_not_auto_created() -> None:
     assert celery_app.conf.task_create_missing_queues is False
 
 
-def test_the_three_demo_tasks_are_registered() -> None:
+def test_the_demo_tasks_are_registered() -> None:
     names = {t for t in celery_app.tasks if t.startswith("workers.")}
-    assert names == {"workers.ping", "workers.always_fails", "workers.retry_probe"}
+    assert names == {
+        "workers.ping",
+        "workers.always_fails",
+        "workers.retry_probe",
+        "workers.count_visible_connectors",  # B0.3 tenant-boundary demo task
+    }
 
 
 def test_the_worker_autodiscovers_tasks_via_include() -> None:

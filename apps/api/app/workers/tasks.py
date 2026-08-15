@@ -10,9 +10,13 @@ Nothing here logs a payload dump: only the task's own id (via Celery) and non-se
 
 from __future__ import annotations
 
+import asyncio
+
 import structlog
+from sqlalchemy import text
 
 from app.workers.celery_app import DEFAULT_TASK_RETRY, celery_app
+from app.workers.context import worker_tenant_uow
 
 log = structlog.get_logger(__name__)
 
@@ -30,6 +34,26 @@ def ping(nonce: str) -> dict[str, str]:
     """
     log.info("worker.ping", nonce=nonce)
     return {"pong": nonce}
+
+
+@celery_app.task(name="workers.count_visible_connectors")
+def count_visible_connectors(workspace_id: str) -> int:
+    """Demo TENANT task (B0.3): count the connectors visible under the bound workspace — i.e.
+    only *this* tenant's, enforced by RLS. Proves the worker → UnitOfWork → transaction-local
+    GUC → RLS boundary end to end.
+
+    Read-only, creates nothing. `workspace_id` is the tenant *selector* only; no role,
+    permission, member id, or identity is read from the payload — the persisted DB + RLS decide
+    what is visible. Runs the async boundary in a fresh loop (`asyncio.run`), the prefork-worker
+    idiom.
+    """
+
+    async def _run() -> int:
+        async with worker_tenant_uow(workspace_id) as uow:
+            count = await uow.session.scalar(text("SELECT count(*) FROM connectors"))
+            return int(count or 0)
+
+    return asyncio.run(_run())
 
 
 # A separate, fast probe (no backoff) so the *bounded-retry behaviour* is observable in a unit

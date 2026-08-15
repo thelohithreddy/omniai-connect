@@ -13,16 +13,22 @@ behaviour is asserted directly in tests/unit/test_celery_app.py.
 
 from __future__ import annotations
 
+import asyncio
 import time
+import uuid
 from collections.abc import Iterator
 
 import pytest
 from celery import Celery
 from celery.contrib.testing.worker import start_worker
 from kombu import Queue
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.core.config import settings
 from app.workers.celery_app import INGESTION_QUEUE
+from app.workers.context import worker_tenant_uow
+from tests.conftest import SeededWorkspace
 
 
 def _isolated(db: int) -> str:
@@ -74,6 +80,19 @@ def always_fails(self: object, marker: str) -> None:  # noqa: ARG001
     raise _TransientError(marker)
 
 
+@worker_app.task(name="b0.tenant_count")
+def tenant_count(workspace_id: str) -> int:
+    """Runs the PRODUCTION worker tenant boundary (`worker_tenant_uow`) inside a real worker,
+    the prefork idiom (`asyncio.run`): binds the workspace GUC and counts connectors visible
+    under RLS. Proves the full Redis → worker → UnitOfWork → GUC → RLS path for a tenant task."""
+
+    async def _run() -> int:
+        async with worker_tenant_uow(workspace_id) as uow:
+            return int(await uow.session.scalar(text("SELECT count(*) FROM connectors")) or 0)
+
+    return asyncio.run(_run())
+
+
 def _wait_until(predicate: object, timeout: float = 20.0, interval: float = 0.2) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -111,3 +130,22 @@ def test_retry_is_bounded_over_the_real_worker_path(live_worker: None) -> None:
     assert _wait_until(lambda: len(_attempts) >= 4), f"expected 4 attempts, saw {len(_attempts)}"
     time.sleep(1.0)  # settle: assert it stopped at the bound, no runaway
     assert len(_attempts) == 4
+
+
+async def test_a_real_worker_runs_a_tenant_scoped_task_under_rls(
+    live_worker: None, admin_engine: AsyncEngine, workspace_a: SeededWorkspace
+) -> None:
+    """A real worker executes the production tenant boundary end to end: seed 2 connectors in A,
+    enqueue the tenant task for A, and the worker (binding A's GUC, filtered by RLS) returns 2 —
+    the full Redis → worker → UnitOfWork → GUC → RLS path, not eager, not in-process."""
+    async with admin_engine.begin() as conn:
+        for i in range(2):
+            await conn.execute(
+                text(
+                    "INSERT INTO connectors (id, workspace_id, name, slug, source_type, base_url,"
+                    " status) VALUES (:i, :w, :n, :s, 'manual', 'https://api.example.com', 'draft')"
+                ),
+                {"i": uuid.uuid4(), "w": workspace_a.id, "n": f"t{i}", "s": f"t{i}"},
+            )
+    result = tenant_count.apply_async(args=[str(workspace_a.id)], queue=INGESTION_QUEUE)
+    assert result.get(timeout=20) == 2

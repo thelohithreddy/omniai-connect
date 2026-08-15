@@ -956,3 +956,57 @@ fail-closed (bounded reconnect retries, no crash-loop; verified). Proven by 15 c
 tests, a real broker+worker execution+bounded-retry test (`start_worker`, not eager), and a
 12-mutation B0.2 audit with zero survivors. The tenant-context, event-bus, and R2 foundations
 remain separate slices.
+
+## ADR-0022 — Worker tenant execution boundary (M1.4-B0.3)
+
+**Status:** Accepted (2026-08-15) · **Context:** M1.4-B0.3, the third ingestion-infrastructure
+slice. B0.2 (ADR-0021) established the Celery substrate and deliberately deferred tenant binding;
+this ADR is that binding. A background task has no HTTP request, no JWT, and no membership lookup,
+yet it still touches tenant tables — so it needs a way to establish *which* tenant it acts for
+that does **not** reintroduce the payload as an authority. The governing invariant (SECURITY.md,
+ADR-0004 RLS, ADR-0014 identity severance): **a worker task payload must never become
+authorization** — a `workspace_id` selects **WHERE** (the tenant), never **WHO / ROLE /
+PERMISSION / AUTHORITY**.
+
+**Decision:**
+
+1. **One boundary, reusing the request-path machinery** (`app/workers/context.py`,
+   `worker_tenant_uow`). It reuses the *existing* `UnitOfWork` and `bind_workspace`
+   (`SET LOCAL app.workspace_id` via `set_config(..., true)`) — **no second GUC, no second
+   transaction system, no new migration, no new SECURITY DEFINER function, no new DB role**. The
+   persisted database + RLS remain the sole authority; the worker runs as `omniai_app`
+   (non-superuser, **non-BYPASSRLS**), exactly like the request path.
+
+2. **Fail-closed context validation.** `validate_workspace_id` accepts *only* one canonical UUID
+   string — `None`, `""`, whitespace, a non-string, or a malformed value raises
+   `WorkerContextError` **before any DB access**. There is **no** default / first-workspace /
+   system tenant to fall back to; a task without a valid tenant never opens a transaction. The
+   error never carries the offending value into a message a caller might log.
+
+3. **A load-bearing order:** *validate → BEGIN → SET LOCAL → read the binding back → yield*.
+   Nothing tenant-scoped runs before the GUC is bound; a binding that does not read back is a
+   fail-closed error, never a silent unbound execution. The transaction's end clears the GUC —
+   **COMMIT** on success (a task's tenant writes persist), **ROLLBACK** on exception (nothing
+   leaks). Because binding is transaction-local (`SET LOCAL`, not `SET`/session-global), it
+   **cannot survive to the next task** on a reused pooled connection, and a rollback/retry cannot
+   carry the previous tenant forward.
+
+4. **The one worker-specific detail: a `NullPool` engine.** A prefork worker runs each task on a
+   *fresh* event loop (`asyncio.run`), and an asyncpg connection is bound to the loop that opened
+   it — so a pooled connection cannot cross tasks. `NullPool` opens a fresh connection per checkout
+   on the current loop: fork-safe and loop-safe. Transaction-local binding still guarantees
+   isolation independently of pooling.
+
+5. **The payload is a selector, never an authority.** The boundary reads *only* `workspace_id`.
+   There is no code path that reads a `role`, `permission`, `member_id`, or `kind` from a task
+   payload; supplying them confers nothing. Identity/role decisions stay where ADR-0014 put them.
+
+**Consequences:** No migration; no new dependency; no new SECURITY DEFINER function; no new DB
+role; RLS ENABLE+FORCE and `omniai_app`'s non-superuser/non-BYPASSRLS status are unchanged
+(catalog-verified). Proven by 18 real-Postgres worker-context tests (fail-closed validation;
+RLS isolation A/B; RLS-*independent* binding-correctness; `SET LOCAL` non-leak across a reused
+connection via a `pool_size=1` engine; rollback cleanup; commit-on-success; A×8/B×8 concurrency),
+a **real Redis → worker → RLS** tenant task (`start_worker`, not eager), a deployed-compose-worker
+end-to-end run, and a B0.3 mutation audit (6 constructible mutations killed; the lone survivor is
+inert redundant defense-in-depth — the fail-closed read-back verify, kept as cheap insurance).
+The event bus (B0.4) and R2 (B0.5) remain separate slices; the ingestion pipeline itself is M1.4-B1.
