@@ -45,7 +45,9 @@ table and role matrix, `api_tokens` issue/revoke endpoints, `/health/ready`.
 **M1.3+** — OpenAPI ingestion with api_key auth, Execution Runtime v1, audit log, minimal
 dashboard slice. docs/ROADMAP.md remains authoritative for M1 scope.
 
-_M1.3-A/B/C/D/E/F/G complete on feature branches (member endpoints, human JWT verification, X-Workspace-Id selection, Better Auth web integration, human authorization integration, workspace invitations, session security hardening). main remains 236dc48; none merged._
+_M1.3-A/B/C/D/E/F/G (member endpoints, human JWT verification, X-Workspace-Id selection, Better Auth web integration, human authorization integration, workspace invitations, session security hardening) **merged to main as c641794** (--no-ff release merge of RC 5fdad07, M1.3-MAINLINE: PASS; 705 tests, CI 4/4 green)._
+
+_M1.4-A (Connector Engine v1, first slice, ADR-0019) in progress on `feat/m1.4-a-connectors`: the tenant-owned `connectors` domain + manual CRUD + `connectors:manage` (owner/admin) + `base_url` SSRF lint + soft-delete; migration 0007. OpenAPI/Swagger ingestion deferred to M1.4-B (blocked on provisioning a Celery worker service + R2 object storage)._
 
 _M1.3-G (session security hardening, ADR-0018) locked the human session/JWT revocation boundary with tests, hardened the duplicate-`Authorization` header (fail-closed), and recorded the deferred, topology-/product-dependent decisions (deployment origin topology & CORS, immediate JWT revocation, rate limiting, security headers, session-lifetime cap, account-lifecycle) rather than inventing them. No migration; one production-code change._
 
