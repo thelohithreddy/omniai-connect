@@ -855,3 +855,57 @@ its permission, and its boundary; it does not reopen ADR-0003/0004/0009.
 **Consequences:** One additive, reversible migration (0007); `identity` untouched. One new
 permission (7 total). No new identity, tenant-authority, or authorization mechanism. The
 connectors-enforcement mutation audit (A01–A08) left zero survivors.
+
+---
+
+## ADR-0020 — Guarded egress fetcher for connector-spec ingestion (M1.4-B0)
+
+**Status:** Accepted (2026-08-15) · **Context:** M1.4-B0 (ingestion infrastructure + security
+foundation)
+
+**Context:** Bible §6.3 / SECURITY.md §6 make the Execution Runtime the *only* egress for
+**tenant** traffic, concentrating SSRF defense in one place. Connector-spec ingestion
+(CONNECTOR_SPECIFICATION.md §18) introduces a **second, distinct egress class**: a Celery
+worker fetches an operator-supplied — therefore attacker-influenced — spec URL (and its
+external `$ref`s) *before any Connection or Credential exists*, so the runtime's
+per-Connection egress allowlist cannot govern it. This is the one reconciliation the M1.4-B
+discovery flagged. The founder ratified the infra-first (Option A) path; this ADR records the
+guarded fetcher that is built and proven **ahead of** any importer consuming it.
+
+**Decision:**
+
+1. **Ingestion spec-fetch is egress-class, worker-only, and owned by one guarded fetcher**
+   (`app/core/net.py`). Importers never perform egress themselves; they will receive the
+   fetched bytes. This is the *second* sanctioned egress alongside the runtime, not a
+   loophole in "runtime is the only egress" — it is a separate class with its own, equally
+   strict, guard.
+
+2. **DNS is validated and the validated IP is the one dialed (TOCTOU-closed).** A custom
+   `httpcore` network backend resolves the host, validates **every** returned A/AAAA record,
+   and connects to a *validated* IP; TLS still verifies the original hostname. A naive
+   `resolve → validate → get(host)` re-resolves at connect time and is a rebinding TOCTOU —
+   this is not that.
+
+3. **The blocklist covers the forms Python 3.11's stdlib misses.** Loopback, unspecified,
+   link-local (incl. 169.254.169.254 metadata), private, multicast, and reserved are rejected
+   across IPv4 and IPv6, and **IPv4-mapped (`::ffff:`), NAT64 (`64:ff9b::/96`), and 6to4
+   (`2002::/16`)** IPv6 forms are unwrapped to their embedded IPv4 and re-checked —
+   `ipaddress.is_private` does not unwrap NAT64/6to4.
+
+4. **`https` only; no embedded credentials; `trust_env=False`.** An `http` URL (incl. an
+   `https→http` redirect downgrade) is refused; a `user:pass@host` URL is refused; the client
+   never honors an `HTTP(S)_PROXY` (a proxy would do its own DNS/connect and bypass the guard).
+
+5. **Redirects are bounded (≤5) and re-validated per hop** (scheme + credentials + the backend
+   re-resolves/re-validates the new host).
+
+6. **Response size is capped on decompressed bytes (10 MB) with a streaming early-abort**, and
+   connect/read/total timeouts (5s/15s/30s) bound a hostile server. Every failure is
+   fail-closed (`SSRFError` or timeout), never a partial/oversized body.
+
+**Consequences:** No migration, no new dependency (httpx/httpcore already present). No importer,
+normalization, `connector_versions`, or `tools` — those remain deferred. Proven by a 44-case
+adversarial matrix (IP validation incl. NAT64/6to4/mapped, rebinding fail-closed, scheme/creds,
+proxy isolation, redirect re-validation/downgrade/bounds, decompressed size cap). The remaining
+M1.4-B0 foundations (Celery worker service + tenant-context, internal event bus, R2 client +
+tenant-key isolation, local/CI object store) are separate slices under the same infra-first plan.

@@ -13,6 +13,20 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Guarded egress fetcher — ingestion SSRF foundation (M1.4-B0, ADR-0020).** The first,
+  most security-critical slice of the ingestion infrastructure foundation: `app/core/net.py`,
+  the one SSRF-safe fetcher connector-spec ingestion will use, built and proven **ahead of**
+  any OpenAPI/Swagger importer. **No importer, normalization, `connector_versions`, or `tools`
+  — those remain deferred.** Fail-closed properties: `https`-only, no embedded credentials,
+  `trust_env=False` (env proxies cannot bypass); DNS resolved-and-validated with the validated
+  IP pinned at connect (closes the rebinding TOCTOU) via a custom `httpcore` backend, TLS still
+  verifying the real hostname; blocklist covering loopback/unspecified/link-local (incl.
+  169.254.169.254 metadata)/private/multicast/reserved across IPv4+IPv6, **unwrapping the
+  IPv4-mapped / NAT64 / 6to4 forms `ipaddress.is_private` misses on Python 3.11**; bounded
+  (≤5) redirects re-validated per hop with no `https→http` downgrade; a decompressed 10 MB
+  size cap with streaming early-abort; and connect/read/total timeouts. Proven by a 44-case
+  adversarial matrix; no migration, no new dependency.
+
 - **Connectors — Connector Engine v1, first slice (M1.4-A, ADR-0019).** The tenant-owned
   `connectors` domain: a Connector is a Workspace's definition of an external API (name, base
   URL, auth *requirements*, Tool-Schema status). Manual definition only — OpenAPI/Swagger
