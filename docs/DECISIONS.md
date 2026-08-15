@@ -909,3 +909,50 @@ adversarial matrix (IP validation incl. NAT64/6to4/mapped, rebinding fail-closed
 proxy isolation, redirect re-validation/downgrade/bounds, decompressed size cap). The remaining
 M1.4-B0 foundations (Celery worker service + tenant-context, internal event bus, R2 client +
 tenant-key isolation, local/CI object store) are separate slices under the same infra-first plan.
+
+---
+
+## ADR-0021 — Celery worker execution foundation (M1.4-B0.2)
+
+**Status:** Accepted (2026-08-15) · **Context:** M1.4-B0.2 (Celery + worker execution
+foundation), the second slice of the ingestion infrastructure. Implements the Celery substrate
+ADR-0007 mandated; deliberately does NOT implement ingestion, tenant-context binding (B0.3), the
+event bus (B0.4), or R2 (B0.5).
+
+**Decision:**
+
+1. **A dedicated Celery app** (`app/workers/celery_app.py`) with every security-sensitive
+   setting explicit — Celery's defaults are not trusted:
+   - **JSON only.** `task_serializer`/`result_serializer` = json, `accept_content` = ['json'].
+     Pickle is remote code execution on the broker and can never be accepted.
+   - **No result backend.** Correctness never depends on a persisted return value.
+   - **One declared queue, `ingestion`, no auto-creation** (`task_create_missing_queues=False`)
+     — a task cannot conjure or route itself to an arbitrary queue.
+   - **At-least-once, late ack** (`task_acks_late` + `task_reject_on_worker_lost`): a crashed
+     worker's job is redelivered, not lost — so tasks must be idempotent (owned from B0.3).
+   - **Bounded execution:** hard/soft time limits (300/270s) and `worker_prefetch_multiplier=1`
+     (one long job per slot, no hoarding).
+   - **Never eager in production** (`task_always_eager=False`; eager is a test-only override).
+   - **Retry foundation:** bounded (`max_retries=5`), exponential (`retry_backoff`, cap 60s),
+     jittered — applied per task, not globally (a global would retry non-idempotent work).
+
+2. **Redis broker via an explicit `CELERY_BROKER_URL`** (falls back to `redis_url` — the same
+   canonical Redis, no second server). A dedicated logical DB for the broker is left to that
+   setting in production. No result backend, so no persistent-result Redis dependency.
+
+3. **The worker is not an HTTP surface and holds no authority.** It runs `celery worker`
+   (not uvicorn), exposes no port, consumes only `ingestion`, and — critically — its
+   environment is hand-scoped (NOT `env_file: .env`): it never inherits `BETTER_AUTH_SECRET`,
+   `R2_*`, Stripe/Resend, or any frontend/API secret. Demo tasks (`ping`, `retry_probe`,
+   `always_fails`) exist only to prove registration/routing/serialization/execution/retry —
+   they touch no connector, DB, R2, or event bus, and no task payload is ever trusted for
+   identity, role, or permission. **Binding a WorkspaceContext / GUC to a task is B0.3.**
+
+4. **Deployment:** one image, a different command. The worker reuses the API image and runs the
+   `celery worker` command (local compose service; the same prod image on Railway).
+
+**Consequences:** No migration; no new dependency (celery/kombu already present). Broker-loss is
+fail-closed (bounded reconnect retries, no crash-loop; verified). Proven by 15 config/security
+tests, a real broker+worker execution+bounded-retry test (`start_worker`, not eager), and a
+12-mutation B0.2 audit with zero survivors. The tenant-context, event-bus, and R2 foundations
+remain separate slices.

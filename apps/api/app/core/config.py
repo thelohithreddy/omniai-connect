@@ -57,6 +57,15 @@ class Settings(BaseSettings):
 
     # --- Cache / Queue ---
     redis_url: str = "redis://localhost:6379/0"
+    # The Celery broker (ADR-0007, ADR-0021). Kept an *explicit* setting rather than silently
+    # reusing `redis_url` so a deployment can put the broker on its own Redis / logical DB
+    # without disturbing the app cache. Empty → falls back to `redis_url` (the least-invasive
+    # local default; the same canonical Redis, no second server).
+    celery_broker_url: str = ""
+
+    @property
+    def resolved_celery_broker_url(self) -> str:
+        return self.celery_broker_url or self.redis_url
 
     # --- Auth (Better Auth — provider in apps/web per ADR-0002/0014; verified here per
     # ADR-0015) ---

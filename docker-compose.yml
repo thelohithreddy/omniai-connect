@@ -80,5 +80,30 @@ services:
       - /repo/apps/web/node_modules
       - /repo/apps/web/.next
 
+  # Celery ingestion worker (M1.4-B0.2, ADR-0021). Reuses the API image (one image, a
+  # different command — it runs `celery worker`, never uvicorn) and consumes ONLY the
+  # `ingestion` queue. It publishes no port, exposes no HTTP surface, and is NOT `env_file:
+  # .env` — its environment is scoped by hand so it never inherits BETTER_AUTH_SECRET, R2_*,
+  # Stripe/Resend, or any frontend/API secret it has no need for (§19). DB URL is the
+  # non-superuser app role, present for the tenant work B0.3 adds (the demo tasks are DB-free).
+  worker:
+    # One image, a different command: reuse the API image built above rather than a second
+    # build (§16). In production the same prod image runs this `celery worker` command.
+    image: omniai-connect-api
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://omniai_app:omniai_app@db:5432/omniai
+      APP_ENV: development
+      LOG_LEVEL: info
+    command:
+      ["celery", "-A", "app.workers.celery_app", "worker", "-Q", "ingestion",
+       "--concurrency=2", "--loglevel=INFO", "--without-gossip", "--without-mingle"]
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./apps/api:/app
+
 volumes:
   pgdata:

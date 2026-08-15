@@ -13,6 +13,21 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Celery worker execution foundation (M1.4-B0.2, ADR-0021).** The Celery substrate future
+  ingestion runs on — `app/workers/celery_app.py` + a scoped `worker` compose service — with
+  **no ingestion, tenant-context, event bus, or R2** (those are B0.3/B0.4/B0.5/M1.4-B1).
+  Security-sensitive settings are all explicit: **JSON-only serialization (no pickle)**, no
+  result backend, a single `ingestion` queue with **no auto-creation**, at-least-once with
+  late ack + reject-on-worker-lost, `worker_prefetch_multiplier=1`, hard/soft time limits, a
+  bounded/backed-off/jittered retry policy (`max_retries=5`), and **never eager in production**.
+  The worker runs `celery worker` (one image, different command; no HTTP port) and its
+  environment is hand-scoped so it inherits **no** `BETTER_AUTH_SECRET`/`R2_*`/Stripe/Resend
+  secret. Demo tasks (`ping`/`retry_probe`/`always_fails`) prove the substrate only — no
+  connector/DB/R2/event touched, no task payload trusted for authority. Proven by 15
+  config/security tests, a **real broker+worker** execution + bounded-retry test (`start_worker`,
+  not eager), broker-loss resilience (bounded reconnect, no crash-loop), and a 12-mutation B0.2
+  audit with 0 survivors. No migration; no new dependency.
+
 - **Guarded egress fetcher — ingestion SSRF foundation (M1.4-B0, ADR-0020).** The first,
   most security-critical slice of the ingestion infrastructure foundation: `app/core/net.py`,
   the one SSRF-safe fetcher connector-spec ingestion will use, built and proven **ahead of**
