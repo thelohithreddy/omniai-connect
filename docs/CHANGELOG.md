@@ -13,6 +13,34 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Human multi-workspace selection (M1.3-C).** A human who belongs to more than one
+  Workspace now names their target with the `X-Workspace-Id` header (ADR-0016). It is a
+  *selection*, verified against persisted membership, never authority: the JWT proves who,
+  the header states where, the server proves membership, the persisted row proves role,
+  RBAC proves what, RLS is the final boundary.
+  - `get_workspace_context`'s human path (not a parallel resolver) reads the header, looks
+    the subject's memberships up via `auth.resolve_member_workspaces`, and binds only a
+    matched one. One membership auto-binds (M1.3-B preserved); many require the header; a
+    foreign, absent, malformed, or **duplicate** selector fails closed as the uniform 401,
+    with no existence oracle. Duplicate headers are rejected explicitly — Starlette's
+    `.get()` returns only the first, so the resolver reads the whole list and denies more
+    than one. The role is always re-resolved from the bound member row under RLS; no JWT,
+    query, body, cookie, or header claim ever sets role, member_id, or identity.
+  - New `GET /v1/workspaces`: a human-only listing of the caller's own memberships as
+    `{id, role}` (display role only), so a client can discover what it may select. Backed by
+    `auth.resolve_member_workspace_roles` (migration 0005), which reuses migration 0004's
+    `members` exemption — no new grant or policy on `workspaces`, and no other tenant's
+    existence, name, or metadata is disclosed.
+  - Machine authentication is unchanged: a machine token ignores `X-Workspace-Id` (its
+    workspace is the token's), and the two planes never cross.
+  - Tests: a pure-function policy suite (RLS-independent proof), a full cross-tenant matrix
+    with a three-user/two-workspace world (owner/admin/member/viewer), workspace switching,
+    membership revocation, role changes, header-parsing edge cases, GUC/connection safety,
+    genuine concurrency, a log audit, and a real-provider E2E (live login → JWT →
+    `X-Workspace-Id` → RBAC → RLS). Mutation audit C01–C48 left zero meaningful survivors.
+  - Resolves the workspace-selection Open Question recorded in M1.3-B. No frontend UI ships
+    (none exists yet); the switcher will consume this contract when the dashboard is built.
+
 - **Human JWT authentication in the API (M1.3-B).** FastAPI now verifies Better Auth's
   EdDSA JWTs against the published JWKS and resolves them to a tenant-scoped
   `WorkspaceContext`, completing the human half of ADR-0002. This is the first time an

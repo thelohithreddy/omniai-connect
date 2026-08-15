@@ -39,6 +39,7 @@ from sqlalchemy.ext.asyncio import (
 from app.core import human_auth, readiness
 from app.core.config import settings
 from app.core.db import UnitOfWork, get_uow
+from app.core.human_auth import get_jwks_cache
 from app.core.ids import new_id
 from app.core.logging import configure_logging
 from app.core.security import GeneratedToken, generate_token
@@ -228,6 +229,28 @@ def authority() -> SigningAuthority:
 @pytest.fixture
 def jwks_endpoint(authority: SigningAuthority) -> FakeJWKSEndpoint:
     return FakeJWKSEndpoint(authority.jwks_document())
+
+
+@pytest.fixture
+async def human_client(
+    client: AsyncClient, jwks_endpoint: FakeJWKSEndpoint
+) -> AsyncIterator[tuple[AsyncClient, FakeJWKSEndpoint]]:
+    """The app client with the JWKS dependency pointing at the in-process endpoint.
+
+    Shared by every human-auth suite (M1.3-B verification and M1.3-C selection). One cache
+    instance for the whole test — the override returns the same object on every request,
+    exactly like production's module singleton; a fresh cache per request would reset the
+    fetch counter and make the amplification/single-flight assertions vacuous.
+    """
+    cache = jwks_endpoint.cache()
+    app.dependency_overrides[get_jwks_cache] = lambda: cache
+    # `client`'s teardown clears ALL overrides, including this one.
+    yield client, jwks_endpoint
+
+
+def bearer(token: str) -> dict[str, str]:
+    """Authorization header for a bearer credential (JWT or api token)."""
+    return {"Authorization": f"Bearer {token}"}
 
 
 @pytest.fixture

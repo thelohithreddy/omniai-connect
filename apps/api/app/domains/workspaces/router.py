@@ -16,7 +16,12 @@ from app.core.authz import Permission
 from app.core.db import UnitOfWork, get_uow
 from app.core.exceptions import ValidationFailedError
 from app.core.pagination import DEFAULT_LIMIT, MAX_LIMIT
-from app.core.security import CurrentWorkspace, WorkspaceContext
+from app.core.security import (
+    CurrentHumanSubject,
+    CurrentWorkspace,
+    WorkspaceContext,
+    resolve_human_memberships,
+)
 from app.domains.workspaces.repository import (
     ApiTokenRepository,
     MemberRepository,
@@ -30,6 +35,8 @@ from app.domains.workspaces.schemas import (
     MemberList,
     MemberRead,
     MemberRoleUpdate,
+    MembershipList,
+    MembershipRead,
     WorkspaceRead,
 )
 from app.domains.workspaces.service import ApiTokenService, MemberService, WorkspaceService
@@ -74,6 +81,31 @@ def get_workspace_service(
     invoking the handler.
     """
     return WorkspaceService(WorkspaceRepository(uow.session, ctx))
+
+
+@router.get(
+    "",
+    response_model=MembershipList,
+    summary="List the authenticated human's own workspace memberships",
+)
+async def list_my_workspaces(
+    subject: CurrentHumanSubject,
+    uow: Annotated[UnitOfWork, Depends(get_uow)],
+) -> MembershipList:
+    """The workspaces the authenticated human belongs to, with their role in each (ADR-0016 §7).
+
+    Human-only and pre-selection: a human calls this to discover what they may put in
+    `X-Workspace-Id` before selecting a workspace, so it authenticates via the verified JWT
+    subject **without** binding a workspace. It reads only the caller's own memberships
+    through the `auth.resolve_member_workspace_roles` bootstrap function — no other tenant's
+    existence, name, members, or metadata is reachable, and `role` is display-only (never an
+    authorization input). A machine token is not a human credential and fails the human
+    verifier uniformly.
+    """
+    memberships = await resolve_human_memberships(subject, uow.session)
+    return MembershipList(
+        data=[MembershipRead(id=m.workspace_id, role=m.role) for m in memberships]
+    )
 
 
 @router.get("/me", response_model=WorkspaceRead, summary="Get the caller's Workspace")

@@ -25,6 +25,28 @@ class WorkspaceRead(BaseModel):
     created_at: datetime
 
 
+class MembershipRead(BaseModel):
+    """One of the authenticated human's own workspace memberships (ADR-0016 §7).
+
+    `id` is the Workspace id — the value the client echoes back in `X-Workspace-Id` to
+    select it. `role` is the caller's persisted role there, for DISPLAY only: it is never
+    an authorization input (authorization always re-resolves the role under RLS after the
+    workspace binds). Deliberately narrow — no other tenant's existence, name, member
+    count, or metadata is disclosed.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    role: str
+
+
+class MembershipList(BaseModel):
+    """The caller's workspaces. A bounded personal set, returned whole (ADR-0016 §7)."""
+
+    data: list[MembershipRead]
+
+
 class ApiTokenRead(BaseModel):
     """Token metadata. Never the secret — that exists once, at creation."""
 

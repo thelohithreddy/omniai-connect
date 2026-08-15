@@ -544,3 +544,95 @@ migration (0004) extending the `auth` schema — reversible, and `identity` rema
 untouched by Alembic. Multi-workspace humans cannot authenticate until the selection
 decision lands; that is deliberate deny-by-default, not an oversight, and it is the
 recorded Open Question.
+
+## ADR-0016 — Human workspace selection: the `X-Workspace-Id` header, verified against membership
+
+**Status:** Accepted (2026-08-15) · **Context:** M1.3-C
+
+**Context:** M1.3-B verified human JWTs into a `WorkspaceContext` but deferred one thing: a
+human who belongs to more than one Workspace has no way to say *which* one a request targets.
+M1.3-B failed such requests closed and recorded the mechanism as an Open Question, because
+no canonical document defines it — confirmed by an exhaustive audit across the Bible,
+BACKEND_SPEC, API_GUIDELINES, FRONTEND_SPEC, SYSTEM_ARCHITECTURE, PRD and every ADR: the
+machine channel is canonical (the API token *is* the workspace), the human channel was
+absent. This ADR closes that gap.
+
+**Decision:**
+
+1. **A human request selects its target Workspace with the `X-Workspace-Id: <uuid>` header.**
+   It is the single canonical human workspace-selection mechanism. It is a **selection
+   signal, never authority**: the server binds a workspace only after independently proving
+   membership.
+
+2. **Resolution (extends the M1.3-B human path; no parallel resolver).** verified JWT → `sub`
+   → all of the subject's memberships (`auth.resolve_member_workspaces`) → the header names
+   which membership to bind → persisted role (existing `resolve_member_role`, read under RLS
+   after binding) → existing RBAC → RLS. `CallerIdentity.kind` stays `"member"`; only
+   `WorkspaceContext.workspace_id`, and hence the resolved role and permissions, change with
+   the selection.
+
+3. **Exact semantics.**
+   - *Zero memberships* → fail closed (uniform 401), header or not; never auto-create or
+     auto-select.
+   - *One membership, no header* → bind it (the M1.3-B auto-bind, preserved).
+   - *One membership, header* → must match that membership, else fail closed.
+   - *Many memberships, no header* → fail closed; the header is required, and the server
+     never picks first/newest/oldest/previous/arbitrary.
+   - *Header names a Workspace the subject is not a member of* (foreign, random, deleted,
+     nonexistent) → fail closed, indistinguishable from any other human-auth failure.
+   - *Malformed / duplicate / ambiguous header* → fail closed. Duplicate headers are
+     rejected explicitly: Starlette's `Headers.get()` silently returns only the *first*
+     repeated value, so the resolver reads the full list and denies anything that is not
+     exactly one well-formed UUID — a repeated `X-Workspace-Id` never binds the first tenant
+     by accident. This is "invalid, not silently reconciled", proven by a test that sends two
+     headers on the wire.
+
+4. **Uniform failure.** Every human context-resolution failure returns the one 401
+   `HUMAN_AUTH_FAILED`, so a foreign selection is not an existence oracle — "you are not a
+   member of workspace X" is indistinguishable from "that JWT is invalid". The reason goes
+   to structured logs (reason codes only, never token material or foreign-tenant data).
+
+5. **The header is authority for nothing but *which membership to check*.** Role, permission,
+   `member_id`, `user_id`, and `kind` are never read from the request. A `workspace_id` in
+   the JWT, the query string, the body, or a cookie remains inert (M1.3-B); activating any
+   of them would be a second authorization channel.
+
+6. **Machine authentication is untouched.** A machine token carries its Workspace implicitly;
+   `X-Workspace-Id` is ignored on the machine path. The composite resolver still dispatches
+   by the `omc_` prefix with no fallthrough.
+
+7. **`GET /v1/workspaces` (my-workspaces).** A human-only listing of the authenticated
+   subject's memberships as `{id, role}`, so a client can discover what it may select before
+   selecting. Backed by a new bootstrap function `auth.resolve_member_workspace_roles`
+   (migration 0005) that reuses the existing `members` RLS exemption — no new grant or policy
+   on `workspaces`. Its `role` is for **display only**; authorization always flows through
+   bind → `resolve_member_role` → RBAC, never through this listing. It returns only the
+   caller's own workspaces; it discloses no other tenant's existence, name, members, or
+   metadata. The set is a bounded personal list, returned whole in the standard envelope.
+
+**Alternatives rejected** (each falsified against a released decision during the M1.3-C
+discovery audit):
+
+- **URL path** `/v1/workspaces/{id}/members` — contradicts API_GUIDELINES §1 (resources are
+  flat, map 1:1, "nesting is shallow"; `/v1/members` is top-level) and would break the
+  released M1.3-A routes. A header changes no path.
+- **Query parameter** `?workspace_id=` — API_GUIDELINES §4 reserves query params for
+  filters/sorts; a filter is not an authorization scope, and M1.3-B rejects unknown query
+  params.
+- **JWT claim** — ADR-0015 §11 forbids workspace-as-authority from the token; the Better
+  Auth `jwt()` plugin emits none.
+- **Better Auth session / cookie** — architecturally inaccessible: the API cannot read the
+  `identity` schema or resolve the opaque session cookie (ADR-0014).
+- **Arbitrary cookie / frontend (Zustand) state** — client state is explicitly "never the
+  source of truth" (FRONTEND_SPEC §4); a malicious user edits it freely.
+
+The header is the only option that fits the flat, context-scoped resource design, breaks no
+released route, works uniformly across every method, and reuses the M1.3-B verify-don't-trust
+chain unchanged.
+
+**Consequences:** One migration (0005), additive, reversible, extending the `auth` schema in
+the ADR-0008 pattern; `identity` untouched by Alembic. A frontend workspace switcher will
+consume this contract when the dashboard is built — no UI ships in M1.3-C because none exists
+yet (FRONTEND_SPEC's switcher is unbuilt). Multi-workspace humans can now authenticate; the
+M1.3-B "fail closed for many memberships" becomes "fail closed unless a valid selection is
+supplied."

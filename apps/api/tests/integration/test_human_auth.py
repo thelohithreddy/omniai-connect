@@ -19,16 +19,14 @@ import asyncio
 import contextlib
 import io
 import uuid
-from collections.abc import AsyncIterator
 
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from app.core.human_auth import HUMAN_AUTH_FAILED, JWKSCache, get_jwks_cache
+from app.core.human_auth import HUMAN_AUTH_FAILED, JWKSCache
 from app.core.ids import new_id
-from app.main import app
 from tests.conftest import FakeJWKSEndpoint, SeededWorkspace, SigningAuthority
 
 MACHINE_AUTH_FAILED = "Invalid or revoked API token."
@@ -53,26 +51,10 @@ async def seed_member(
     return member_id
 
 
-@pytest.fixture
-async def human_client(
-    client: AsyncClient, jwks_endpoint: FakeJWKSEndpoint
-) -> AsyncIterator[tuple[AsyncClient, FakeJWKSEndpoint]]:
-    """The app client with the JWKS dependency pointing at the in-process endpoint.
-
-    One cache instance for the whole test — the override returns the same object on every
-    request, exactly like production's module singleton. Returning a fresh cache per
-    request would silently reset the fetch counter and make every amplification assertion
-    vacuous.
-    """
-    cache: JWKSCache = jwks_endpoint.cache()
-    app.dependency_overrides[get_jwks_cache] = lambda: cache
-    # `client`'s teardown clears ALL overrides, including this one.
-    yield client, jwks_endpoint
-
-
-def bearer(token: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {token}"}
-
+# `human_client` and `bearer` now live in conftest.py (shared with the M1.3-C selection
+# suite). Re-exported here so `from tests.integration.test_human_auth import bearer` — used
+# by the E2E suite — keeps working.
+from tests.conftest import bearer  # noqa: E402
 
 # ---------------------------------------------------------------------------------------
 # The chain: JWT → membership → workspace → RBAC → endpoint
@@ -240,32 +222,54 @@ async def test_a_human_sees_only_their_workspace(
     assert {item["user_id"] for item in response.json()["data"]} == {"a-owner"}
 
 
-async def test_request_supplied_workspace_identity_is_inert(
+async def test_only_the_canonical_header_selects_and_it_is_verified(
     human_client: tuple[AsyncClient, FakeJWKSEndpoint],
     authority: SigningAuthority,
     admin_engine: AsyncEngine,
     workspace_a: SeededWorkspace,
     workspace_b: SeededWorkspace,
 ) -> None:
-    """Headers naming workspace B change nothing; a query parameter cannot even be
-    expressed (the router rejects unknown parameters)."""
+    """The M1.3-B → M1.3-C integration change (ADR-0016).
+
+    `X-Workspace-Id` is now the one honoured selector, but it is *verified*, not trusted:
+    a single-membership human who points it at a workspace they do not belong to fails
+    closed rather than silently getting their own. Every OTHER request-supplied identity —
+    `X-Member-Id`, a bare `Workspace-Id`, a `workspace_id` query param — stays inert or
+    rejected. This is the precise boundary between "selection" and "authority".
+    """
     client, _ = human_client
     await seed_member(admin_engine, workspace_a.id, user_id="a-only", role="owner")
     await seed_member(admin_engine, workspace_b.id, user_id="b-victim", role="owner")
     token = authority.sign("a-only")
 
-    smuggled = await client.get(
+    # X-Workspace-Id naming a workspace the caller is NOT a member of → fail closed.
+    foreign = await client.get(
+        "/v1/members", headers={**bearer(token), "X-Workspace-Id": str(workspace_b.id)}
+    )
+    assert foreign.status_code == 401
+    assert foreign.json()["error"]["message"] == HUMAN_AUTH_FAILED
+
+    # X-Workspace-Id naming the caller's OWN workspace → binds it, succeeds.
+    own = await client.get(
+        "/v1/members", headers={**bearer(token), "X-Workspace-Id": str(workspace_a.id)}
+    )
+    assert own.status_code == 200
+    assert {i["user_id"] for i in own.json()["data"]} == {"a-only"}
+
+    # Non-canonical identity signals remain inert: a bare `Workspace-Id` header and an
+    # `X-Member-Id` are ignored, so the single-membership auto-bind still lands on A.
+    noise = await client.get(
         "/v1/members",
         headers={
             **bearer(token),
-            "X-Workspace-Id": str(workspace_b.id),
             "X-Member-Id": str(uuid.uuid4()),
             "Workspace-Id": str(workspace_b.id),
         },
     )
-    assert smuggled.status_code == 200
-    assert {i["user_id"] for i in smuggled.json()["data"]} == {"a-only"}
+    assert noise.status_code == 200
+    assert {i["user_id"] for i in noise.json()["data"]} == {"a-only"}
 
+    # A `workspace_id` query parameter is a rejected unknown param, never a selector.
     as_query = await client.get(
         "/v1/members",
         params={"workspace_id": str(workspace_b.id)},

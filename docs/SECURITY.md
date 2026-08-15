@@ -127,14 +127,17 @@ the human path, and neither falls through to the other. The human verifier:
   the matrix in §4.1. A claim-stuffed token (`role: owner`, `permissions: [...]`) moves
   nothing.
 
-**Workspace is established, never asserted.** A human's workspace is resolved from persisted
-membership via `auth.resolve_member_workspaces` (a SECURITY DEFINER bootstrap twin of
-`auth.resolve_api_token`, ADR-0008/0015), not from any request signal. A subject with
-exactly one membership binds to it; zero or many fail closed with the uniform 401. Supplying
-`X-Workspace-Id`, a `workspace_id` query parameter, or a `workspace_id` JWT claim changes
-nothing — selecting a workspace among several that a user belongs to is an undefined
-public-API decision (recorded as an Open Question in PROJECT_STATUS.md), and the interim is
-deny-by-default.
+**Workspace is established, never asserted (ADR-0016).** A human's workspace is resolved
+from persisted membership via `auth.resolve_member_workspaces` (a SECURITY DEFINER bootstrap
+twin of `auth.resolve_api_token`, ADR-0008/0015), never trusted from a request. A human who
+belongs to several Workspaces selects one with the **`X-Workspace-Id` header** — a
+*selection signal* the server verifies against membership before binding. One membership
+auto-binds; many require the header; a header naming a Workspace the caller is not a member
+of, or a malformed/duplicate header, fails closed as the uniform 401 with no existence
+oracle. A `workspace_id` in the query, body, or JWT is never authority; the role is always
+re-resolved from the bound member row under RLS, so no request field sets role or identity.
+`GET /v1/workspaces` lists only the caller's own memberships (id + display role), disclosing
+no other tenant. Machine tokens ignore the header — their Workspace is the token's.
 
 **Revocation.** A verified JWT is bearer-valid until `exp` (≤ 900 s); logout ends the Better
 Auth session but cannot invalidate an outstanding JWT, and FastAPI never sees the session

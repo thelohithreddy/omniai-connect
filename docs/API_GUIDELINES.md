@@ -32,6 +32,15 @@ Version 1.0 · 2026-08-02
 - Every response carries `X-Request-Id`; the same value appears in structured logs and in
   error bodies (Bible §6.6).
 
+- **Human workspace selection: `X-Workspace-Id: <uuid>`** (ADR-0016). A human (Better Auth
+  JWT) that belongs to more than one Workspace names its target with this header; it is a
+  *selection*, verified against membership server-side, never authorization. Required when
+  the caller has multiple memberships; optional (auto-bound) when they have exactly one. A
+  value naming a Workspace the caller is not a member of — or a duplicate/malformed header —
+  fails as the uniform 401, with no disclosure of whether that Workspace exists. Machine API
+  tokens ignore it: their Workspace is the token's. It is the single selection mechanism — a
+  `workspace_id` in the path, query, body, or JWT is never authority.
+
 ## 2. Methods and status codes
 
 | Method | Use | Success | Notes |

@@ -53,9 +53,12 @@ or client.
 - **`get_uow()`** yields a per-request **UnitOfWork** wrapping one async SQLAlchemy
   session: one request = one session = one transaction, committed on success, rolled
   back on any exception. Services receive the UoW; repositories are constructed from it.
-- **`get_workspace_context()`** resolves the caller (Better Auth session token for
-  humans per ADR-0002, workspace-scoped API token for machines) into a
-  `WorkspaceContext(workspace_id, actor, role, request_id)`. Repositories **require**
+- **`get_workspace_context()`** resolves the caller into a `WorkspaceContext`. For
+  machines, a workspace-scoped API token implies the Workspace (ADR-0002). For humans,
+  a verified Better Auth JWT (EdDSA/JWKS, ADR-0015) proves identity and the
+  `X-Workspace-Id` header selects which of the subject's Workspaces to bind — verified
+  against persisted membership, never trusted (ADR-0016). One membership auto-binds;
+  many require the header; a foreign/absent/ambiguous selection fails closed. Repositories **require**
   a `WorkspaceContext` to be constructed — an unscoped query is unrepresentable
   (Bible tenet 1). The UoW also sets the `app.workspace_id` GUC for RLS
   (DATABASE_DESIGN.md §6).

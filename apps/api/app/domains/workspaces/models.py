@@ -117,6 +117,13 @@ class Member(UUIDPrimaryKeyMixin, WorkspaceScopedMixin, TimestampMixin, Base):
         # The column-scoped `ON DELETE SET NULL (invited_by)` (Postgres 15+) nulls only
         # the inviter. A bare SET NULL would try to null workspace_id too, which is
         # NOT NULL, and every inviter deletion would fail.
+        # The bootstrap lookup index (migration 0004): humans are resolved by `user_id`
+        # alone, before any workspace is bound (ADR-0015/0016), so this is the one members
+        # index that does NOT lead with workspace_id — the same documented exception
+        # `api_tokens.token_hash` embodies. Declared here so it matches the migration and
+        # autogenerate stays clean; without the declaration Alembic proposes dropping it on
+        # every run (the drift this fixes).
+        Index("ix_members_user_id", "user_id"),
         ForeignKeyConstraint(
             ["workspace_id", "invited_by"],
             ["members.workspace_id", "members.id"],

@@ -34,6 +34,7 @@ from typing import Annotated, Literal
 import structlog
 from fastapi import Depends, Request
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import UnitOfWork, get_uow
 from app.core.exceptions import UnauthorizedError
@@ -140,6 +141,22 @@ _RESOLVE_MEMBER_SQL = text(
     "SELECT member_id, workspace_id FROM auth.resolve_member_workspaces(:user_id)"
 )
 
+# The listing twin (migration 0005, ADR-0016 §7): the subject's workspaces + display role,
+# for GET /v1/workspaces. Distinct from the resolver above precisely because it returns
+# `role` — a value used only for display, never for authorization, so it must never sit on
+# the binding path that get_workspace_context takes.
+_RESOLVE_MEMBER_WORKSPACE_ROLES_SQL = text(
+    "SELECT workspace_id, role FROM auth.resolve_member_workspace_roles(:user_id)"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class HumanMembership:
+    """One membership row for the listing endpoint: a Workspace id and the caller's role."""
+
+    workspace_id: uuid.UUID
+    role: str
+
 
 async def get_workspace_context(
     request: Request,
@@ -186,37 +203,74 @@ async def _machine_context(request: Request, uow: UnitOfWork, presented: str) ->
     )
 
 
+# The canonical human workspace-selection header (ADR-0016). A *selection signal*, never
+# authority: it names which membership to bind, and binding happens only after the row is
+# found among the subject's own memberships.
+WORKSPACE_SELECTION_HEADER = "X-Workspace-Id"
+
+
+def _read_selected_workspace(request: Request) -> uuid.UUID | None:
+    """Parse `X-Workspace-Id` as an untrusted selection, or None if absent.
+
+    Returns None when the header is not present at all (the no-selector case). Raises the
+    uniform human 401 when the header is present but unusable:
+
+    - *Duplicate/ambiguous.* `Headers.get()` silently returns only the FIRST of repeated
+      headers, so relying on it would let `X-Workspace-Id: <mine>, X-Workspace-Id: <theirs>`
+      quietly bind the first — the directive's forbidden "silently reconciled" case. We take
+      the full list instead and reject anything that is not exactly one value; a single
+      comma-joined header (`"A, B"`) also fails, on the UUID parse below. Ambiguity denies.
+    - *Malformed.* Anything that is not one canonical UUID. Whitespace is stripped so a
+      padded but otherwise valid id still works.
+    """
+    values = request.headers.getlist(WORKSPACE_SELECTION_HEADER)
+    if not values:
+        return None
+    if len(values) > 1:
+        log.debug("human_auth.workspace_selection_rejected", reason="ambiguous_selector")
+        raise UnauthorizedError(HUMAN_AUTH_FAILED)
+    try:
+        return uuid.UUID(values[0].strip())
+    except (ValueError, AttributeError):
+        log.debug("human_auth.workspace_selection_rejected", reason="malformed_selector")
+        raise UnauthorizedError(HUMAN_AUTH_FAILED) from None
+
+
 async def _human_context(
     request: Request, uow: UnitOfWork, presented: str, jwks_cache: JWKSCache
 ) -> WorkspaceContext:
-    """Verified human JWT → membership → context (ADR-0015 §§8–11).
+    """Verified human JWT + `X-Workspace-Id` selection → membership-bound context (ADR-0016).
 
     `resolve_human_subject` owns every cryptographic and claim check; by the time it
-    returns, `sub` is proven to come from our issuer. What remains is pure membership:
+    returns, `sub` is proven to come from our issuer. What remains is binding the requested
+    workspace to a *verified* membership — the header says where the human wants to act, the
+    membership set says where they may:
 
-    - zero memberships   → uniform 401. The subject is real but has no tenant context;
-      distinguishing this from a forged token would let a stolen-JWT holder probe which
+    - zero memberships                → fail closed. Header or not, there is no tenant to
+      bind, and distinguishing this from a forged token would let a stolen JWT probe which
       accounts have workspaces.
-    - one membership     → that workspace, the degenerate case where no selection exists.
-    - many memberships   → uniform 401, fail closed. Selecting among workspaces is an
-      undecided public-API-shape question (the Open Question in PROJECT_STATUS.md), and
-      guessing here would invent the answer. Deny-by-default is the only safe interim.
+    - one membership, no header        → bind it (the M1.3-B auto-bind, preserved).
+    - a header naming an own membership → bind that one; role and permissions follow it.
+    - a header naming any other        → fail closed, indistinguishable from an invalid JWT.
+      No existence oracle: "not a member of X" reads exactly like "bad token".
+    - many memberships, no header       → fail closed; the header is required and the server
+      never picks first/newest/arbitrary.
 
-    The role is deliberately NOT read here. `resolve_member_role` reads it from the
-    member row under RLS after binding — one source of truth, already tested, and a
-    bootstrap function that returned roles would be a second authorization surface.
+    Role is deliberately NOT read here. `resolve_member_role` reads it from the bound
+    member row under RLS — one authorization source of truth (ADR-0015 §7, ADR-0016 §2).
     """
     sub = await resolve_human_subject(presented, jwks_cache)
+    selected = _read_selected_workspace(request)
 
     rows = (await uow.session.execute(_RESOLVE_MEMBER_SQL, {"user_id": sub})).all()
-    if len(rows) != 1:
-        log.debug(
-            "human_auth.membership_unresolved",
-            membership_count=len(rows),
-        )
+    # workspace_id → member_id over the subject's OWN memberships. Membership is unique per
+    # (workspace, user), so this map is the complete, authoritative set of bindable targets.
+    memberships = {row.workspace_id: row.member_id for row in rows}
+
+    member_id, workspace_id = _select_membership(selected, memberships)
+    if member_id is None or workspace_id is None:
         raise UnauthorizedError(HUMAN_AUTH_FAILED)
 
-    member_id, workspace_id = rows[0].member_id, rows[0].workspace_id
     await uow.bind_workspace(workspace_id)
     structlog.contextvars.bind_contextvars(workspace_id=str(workspace_id), member_id=str(member_id))
 
@@ -232,4 +286,74 @@ async def _human_context(
     )
 
 
+def _select_membership(
+    selected: uuid.UUID | None, memberships: dict[uuid.UUID, uuid.UUID]
+) -> tuple[uuid.UUID | None, uuid.UUID | None]:
+    """Resolve (member_id, workspace_id) to bind, or (None, None) to fail closed.
+
+    Pure function over the requested workspace and the subject's own membership map, so the
+    whole selection policy (ADR-0016 §3) is auditable in one place with no IO. Every deny
+    path returns the same sentinel; the caller maps it to the single uniform 401.
+    """
+    if selected is not None:
+        # An explicit selection binds only if it is one of the caller's OWN memberships.
+        # A foreign/random/deleted id is simply absent from the map → deny, no disclosure.
+        member_id = memberships.get(selected)
+        if member_id is None:
+            log.debug("human_auth.workspace_selection_rejected", reason="not_a_member")
+            return None, None
+        return member_id, selected
+
+    # No selector supplied.
+    if len(memberships) == 1:
+        # The degenerate case: exactly one membership, nothing to choose. Preserve the
+        # M1.3-B auto-bind so single-workspace humans need not send the header.
+        (workspace_id, member_id) = next(iter(memberships.items()))
+        return member_id, workspace_id
+
+    # Zero memberships, or many without a selection: both fail closed.
+    log.debug(
+        "human_auth.workspace_selection_rejected",
+        reason="no_membership" if not memberships else "selector_required",
+        membership_count=len(memberships),
+    )
+    return None, None
+
+
 CurrentWorkspace = Annotated[WorkspaceContext, Depends(get_workspace_context)]
+
+
+async def require_human_subject(
+    request: Request,
+    jwks_cache: Annotated[JWKSCache, Depends(get_jwks_cache)],
+) -> str:
+    """FastAPI dependency: a verified human JWT → its `sub`, with NO workspace bound.
+
+    The pre-selection identity dependency for `GET /v1/workspaces` (ADR-0016 §7): a human
+    lists the workspaces they may select *before* selecting one, so binding a single
+    workspace is impossible here by definition. This reuses the M1.3-B verifier —
+    `resolve_human_subject` — and stops at the verified subject; it is not a second resolver.
+
+    Human-only. A machine `omc_` credential is fed to the JWT verifier like anything else,
+    where it fails as a malformed token with the uniform human 401. There is deliberately no
+    early `omc_` branch and no fallthrough to the machine plane: a machine token is simply
+    not a valid credential for a human-identity endpoint, and saying so with a distinct
+    message would be a plane oracle.
+    """
+    presented = extract_bearer_token(request)
+    return await resolve_human_subject(presented, jwks_cache)
+
+
+CurrentHumanSubject = Annotated[str, Depends(require_human_subject)]
+
+
+async def resolve_human_memberships(subject: str, session: AsyncSession) -> list[HumanMembership]:
+    """The verified subject's own workspaces + display role (ADR-0016 §7).
+
+    Reads only the caller's memberships via the `auth.resolve_member_workspace_roles`
+    bootstrap function, which reuses migration 0004's `members` exemption — so it discloses
+    a workspace id and the caller's own role, and nothing about any other tenant. The role
+    is for display; it never authorizes anything.
+    """
+    rows = (await session.execute(_RESOLVE_MEMBER_WORKSPACE_ROLES_SQL, {"user_id": subject})).all()
+    return [HumanMembership(workspace_id=row.workspace_id, role=row.role) for row in rows]

@@ -58,7 +58,8 @@ Full records: docs/DECISIONS.md.
 2. MCP protocol version pinning policy: which spec revisions do we commit to at M2? (docs/MCP_RUNTIME.md flags churn risk.)
 3. Free-tier limits: which quota (Tool Calls/week) balances evaluation value vs egress cost? (RISKS.md R-cost.)
 4. Neon vs Railway Postgres for staging parity — validate Neon branching workflow in Sprint 1.
-5. **Human workspace-selection mechanism (raised M1.3-B, 2026-08-15).** When a human belongs
+5. **[RESOLVED 2026-08-15 — ADR-0016]** ~~Human workspace-selection mechanism (raised M1.3-B).~~ Decided: the `X-Workspace-Id` header, a selection verified against membership. Implemented in M1.3-C.  
+   _Original question, for history:_ When a human belongs
    to more than one Workspace, how does a request select which one it acts in? No canonical
    document defines a mechanism (path segment, header, an "active workspace" in the Better
    Auth session, or a selection endpoint), and FRONTEND_SPEC.md's client-side "workspace
