@@ -13,6 +13,39 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Human workspace invitations (M1.3-F, ADR-0017).** A `members:manage` owner/admin invites
+  a person to a Workspace by email; that person accepts with a verified Better Auth identity
+  and becomes a Member. The invitation is a temporary membership-establishment mechanism — the
+  resulting `members` row is the only authority; the invitation confers nothing.
+  - **Endpoints (all `/v1`):** `POST /invitations` (create, `members:manage`),
+    `GET /invitations` (list this workspace's pending, `members:manage`),
+    `DELETE /invitations/{id}` (cancel, `members:manage`), and `POST /invitations/accept`
+    (accept — authenticated human, not gated by membership, since the accepter is joining).
+  - **Identity binding is the one narrow, explicitly-authorized exception to ADR-0015's
+    claim-distrust rule (ADR-0017 §3).** Acceptance requires a verified JWT whose
+    provider-verified email (`emailVerified = true`) equals the invitation's `invited_email`
+    (both lower-cased). The email binds the invitation to the identity and nothing else —
+    `members.user_id` is always the verified `sub`; role and workspace are server-established.
+    An unverified email can never accept.
+  - **Token:** 256-bit `secrets.token_urlsafe(32)`; only `SHA-256(token)` is stored; the raw
+    token lives only in the delivered email and is never logged or persisted. 7-day expiry,
+    server-enforced. Single-use and atomic: acceptance resolves the token pre-RLS through the
+    `auth.resolve_invitation` SECURITY DEFINER bootstrap (twin of `auth.resolve_api_token`),
+    binds the invitation's workspace, creates the membership, and consumes the invitation under
+    `WHERE status = 'pending'` — concurrent acceptances yield exactly one membership.
+  - **Already a member → 409, invitation not consumed;** the existing membership stays
+    authoritative and its role is never silently changed. At most one pending invitation per
+    `(workspace, lower(email))` (partial unique index), so a fresh invite cannot race a stale
+    one to a different role.
+  - **No enumeration oracle:** bad/expired/cancelled/consumed/foreign/wrong-email acceptances
+    all fail with one uniform 404; create/list/cancel disclose only the caller's own tenant.
+  - **Delivery via Resend**, a first-party control-plane call (not tenant egress through the
+    Execution Runtime); the Resend key, raw token, and invite URL never appear in logs. Better
+    Auth email verification enabled (`sendOnSignUp`, non-blocking for sign-in).
+  - One additive, reversible migration (0006): the `invitations` table (`workspace_id NOT
+    NULL`, RLS ENABLE+FORCE) and the `auth.resolve_invitation` bootstrap function; `identity`
+    untouched. Invitation-layer mutation audit (F-series) left zero meaningful survivors.
+
 - **Human authorization integration & hardening (M1.3-E).** Proves the released
   authorization chain (JWT → `X-Workspace-Id` → membership → persisted role → centralized
   RBAC → RLS) end-to-end on **every** protected endpoint through the real human path — not

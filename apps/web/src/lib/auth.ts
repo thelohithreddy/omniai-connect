@@ -82,6 +82,25 @@ function createAuth() {
     },
 
     /**
+     * Email verification, enabled for invitation acceptance (ADR-0017 §2). The API refuses
+     * to accept a targeted invitation unless the JWT's `emailVerified` is true, so verified
+     * email is a real, achievable signal rather than one that is false forever.
+     *
+     * `requireEmailVerification` is deliberately NOT set: verification gates *invitation
+     * acceptance* server-side, not sign-in, so existing flows are unchanged. The delivery
+     * callback logs the verification URL rather than sending — control-plane email (Resend)
+     * is wired in the API for invitations; the web-tier verification email is a dashboard
+     * concern for when that UI lands. It must never throw (that would fail sign-up) and
+     * never log anything but the URL Better Auth constructs.
+     */
+    emailVerification: {
+      sendOnSignUp: true,
+      sendVerificationEmail: async ({ url }: { url: string }): Promise<void> => {
+        console.log(`[better-auth] email verification link generated: ${url}`);
+      },
+    },
+
+    /**
      * Better Auth ships a telemetry package and is already off twice over — it returns a
      * no-op publisher unless `BETTER_AUTH_TELEMETRY_ENDPOINT` is set, and `enabled`
      * defaults to false. Stated anyway, because SYSTEM_ARCHITECTURE.md makes the Execution

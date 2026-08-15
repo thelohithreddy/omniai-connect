@@ -76,6 +76,13 @@ class Settings(BaseSettings):
         """The JWKS document location: the override, or derived from the issuer URL."""
         return self.better_auth_jwks_url or f"{self.better_auth_url}/api/auth/jwks"
 
+    # --- Invitations (ADR-0017) ---
+    # The From address for first-party invitation email sent via Resend. A plain str, not a
+    # secret: it appears in every message header. Verify the domain in Resend before use.
+    invitation_from_email: str = "OmniAI Connect <invites@omni.example>"
+    # Server-enforced invitation lifetime. 7 days per the ratified contract.
+    invitation_expiry_days: int = 7
+
     # --- Encryption (credential vault — SECURITY.md §2.1) ---
     credential_master_key: SecretStr = SecretStr("change-me")
 

@@ -40,8 +40,10 @@ from app.core.db import UnitOfWork, get_uow
 from app.core.exceptions import UnauthorizedError
 from app.core.human_auth import (
     HUMAN_AUTH_FAILED,
+    HumanIdentity,
     JWKSCache,
     get_jwks_cache,
+    resolve_human_identity,
     resolve_human_subject,
 )
 
@@ -111,6 +113,18 @@ def generate_token() -> GeneratedToken:
 def hash_token(plaintext: str) -> str:
     """SHA-256 hex digest — the only form ever persisted."""
     return hashlib.sha256(plaintext.encode("utf-8")).hexdigest()
+
+
+def generate_invitation_token() -> str:
+    """A fresh 256-bit opaque invitation token (ADR-0017 §4).
+
+    `secrets.token_urlsafe(32)` is 32 CSPRNG bytes — 256 bits — URL-safe so it can ride in
+    the invite link. No prefix (unlike `omc_` machine tokens): an invitation token is never
+    a bearer credential for the API, only the one-time key that establishes a membership.
+    Only its `hash_token` is ever stored; the raw value exists during creation, delivery,
+    and acceptance and is never logged.
+    """
+    return secrets.token_urlsafe(_TOKEN_ENTROPY_BYTES)
 
 
 def extract_bearer_token(request: Request) -> str:
@@ -345,6 +359,25 @@ async def require_human_subject(
 
 
 CurrentHumanSubject = Annotated[str, Depends(require_human_subject)]
+
+
+async def require_human_identity(
+    request: Request,
+    jwks_cache: Annotated[JWKSCache, Depends(get_jwks_cache)],
+) -> HumanIdentity:
+    """FastAPI dependency: a verified human JWT → its identity (sub + email-binding claims).
+
+    Used only by invitation acceptance (ADR-0017 §3), which needs the provider-verified
+    email to bind an invitation to the accepting person. Like `require_human_subject` it is
+    human-only and binds no workspace — the invitation, resolved from its token, establishes
+    the workspace. A machine `omc_` credential is fed to the JWT verifier and fails as a
+    malformed token, with no fallthrough to the machine plane.
+    """
+    presented = extract_bearer_token(request)
+    return await resolve_human_identity(presented, jwks_cache)
+
+
+CurrentHumanIdentity = Annotated[HumanIdentity, Depends(require_human_identity)]
 
 
 async def resolve_human_memberships(subject: str, session: AsyncSession) -> list[HumanMembership]:

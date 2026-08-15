@@ -636,3 +636,89 @@ consume this contract when the dashboard is built — no UI ships in M1.3-C beca
 yet (FRONTEND_SPEC's switcher is unbuilt). Multi-workspace humans can now authenticate; the
 M1.3-B "fail closed for many memberships" becomes "fail closed unless a valid selection is
 supplied."
+
+## ADR-0017 — Workspace invitations: targeted, email-bound, hashed single-use token
+
+**Status:** Accepted (2026-08-15) · **Context:** M1.3-F
+
+**Context:** PRD FR-CP-1 (P0) requires "Member invitations with roles". No canonical
+document defined the mechanism, and M1.3-A/F discovery found a genuine architectural gap:
+an invitation addresses a *person by email* before they are a user, but the API cannot map
+an email to a Better Auth subject — it has no access to the `identity` schema (ADR-0014) and
+distrusts every JWT claim but `sub` (ADR-0015). The founder ratified the contract this ADR
+records; it is not derived, it is decided.
+
+**Decision:**
+
+1. **Targeted email invitation only.** An invitation is created for one email address and
+   one workspace. No open join codes, public links, or client-created memberships.
+
+2. **The invitation is a temporary membership-establishment mechanism, never authority.**
+   After acceptance the *membership row* is authoritative; the invitation confers nothing.
+   The permanent authority chain is unchanged: verified `sub` → `members.user_id` →
+   persisted role → centralized RBAC → RLS.
+
+3. **Identity binding — the one narrow, explicitly-authorized exception to ADR-0015.**
+   Acceptance requires a verified Better Auth JWT whose **provider-verified** email
+   (`email_verified = true`) equals the invitation's `invited_email` (both normalized to
+   lower-case). The email claim is used *only* to bind the invitation to the accepting
+   identity — never for role, permission, workspace, or member identity. An unverified email
+   can never accept, so an attacker who signs up under a victim's address without verifying
+   it gains nothing. The resulting `members.user_id` is always the verified `sub`, never the
+   email and never a request field.
+
+4. **Token.** 256 bits from `secrets.token_urlsafe(32)` (OS CSPRNG), never derived from
+   workspace/email/user/timestamp. Only `SHA-256(token)` is stored (reusing
+   `core/security.hash_token`); the raw token exists only during creation, delivery, and
+   acceptance processing, and is never logged or persisted. Resolution is by hash, in
+   constant work, through a SECURITY DEFINER bootstrap function (below).
+
+5. **7-day expiry, server-enforced; single-use; atomic.** Acceptance is one transaction:
+   resolve the token pre-RLS, bind the invitation's workspace, create the membership, and
+   consume the invitation (`status → accepted`) guarded by `WHERE status = 'pending'`. Two
+   concurrent acceptances yield exactly one membership and one consumption — the guarded
+   `UPDATE` and the `members` unique `(workspace_id, user_id)` are the DB-level arbiters, not
+   an application lock. Any failure rolls the whole transaction back.
+
+6. **Bootstrap resolution.** `auth.resolve_invitation(p_token_hash)` (migration 0006) is the
+   SECURITY DEFINER twin of `auth.resolve_api_token`: an accepting user is not yet a member
+   of the workspace, so the token lookup that *discovers* the workspace cannot run under a
+   policy that needs one. Owned by `omniai_auth`, `search_path` pinned, EXECUTE to
+   `omniai_app` only. Everything after the lookup runs under the bound workspace's RLS.
+
+7. **Storage.** A tenant-owned `invitations` table (`workspace_id NOT NULL`, RLS
+   ENABLE+FORCE, tenant policy), with `invited_email`, `role` (CHECK against the canonical
+   domain), `invited_by` (composite intra-tenant FK to `members`, the M1.3 pattern),
+   `token_hash` (unique), `status` (`pending|accepted|cancelled`), `expires_at`,
+   `created_at`, `accepted_at`, `cancelled_at`. At most **one `pending` invitation per
+   `(workspace_id, lower(invited_email))`** (partial unique index), so a fresh invite never
+   lets a stale one grant a different role.
+
+8. **Authorization.** Creating, listing, and cancelling invitations require
+   `members:manage` (owner/admin) with the workspace from `X-Workspace-Id` — the existing
+   centralized RBAC, no new permission and no endpoint-local role check. The invitation
+   `role` is server-persisted at creation and the recipient can never see or change it. Role
+   validity is checked against the canonical domain; **which** roles an inviter may assign
+   is the same role-transition open question M1.3-A left to SECURITY.md §4.1 (an admin may
+   already promote to owner), deliberately not narrowed here.
+
+9. **Already a member → reject (409), do not consume.** The existing membership stays
+   authoritative; the invitation is neither re-created nor role-changed.
+
+10. **Delivery via Resend, a first-party control-plane operation.** The invitation email is
+    platform mail sent by the API, not tenant egress through the Execution Runtime — the
+    same class of first-party call as the JWKS fetch (ADR-0015 §6). The Resend key, the raw
+    token, and the invite URL never appear in logs. Email verification is enabled on Better
+    Auth so `email_verified` is a real, achievable signal; sign-in is not blocked by it, so
+    existing flows are unchanged.
+
+11. **No enumeration oracle.** Bad token, expired, cancelled, consumed, foreign, and
+    wrong-user acceptances all fail with one uniform response; the create/list/cancel
+    surfaces disclose only the caller's own workspace, never another tenant's invitations,
+    emails, inviters, or roles.
+
+**Consequences:** One migration (0006), additive and reversible; `identity` untouched by
+Alembic. The verifier gains an identity-returning path (`resolve_human_subject` still
+returns only `sub`; a sibling returns `sub + email + email_verified` used solely by
+acceptance). No frontend UI ships (the dashboard is unbuilt); the accept URL targets a web
+route the dashboard will implement.

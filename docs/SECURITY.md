@@ -338,6 +338,51 @@ a decision. It is treated as an information-disclosure boundary:
   Creating a token grants no authority over it: `created_by_member_id` is provenance, and
   authority comes from the role matrix alone.
 
+### 4.7 Invitation issuance and acceptance
+
+Invitations let an `owner`/`admin` add a person to a Workspace by email; the recipient
+accepts with a verified Better Auth identity and becomes a Member (ADR-0017). The invitation
+is a temporary membership-establishment mechanism — the resulting membership row is the only
+authority, and the permanent chain (verified `sub` → `members.user_id` → persisted role →
+RBAC → RLS) is unchanged.
+
+- **Creating, listing, and cancelling require `members:manage`**, the same capability as
+  member management (§4.3), with the workspace taken from `X-Workspace-Id`. No new permission
+  and no endpoint-local role check. A machine token cannot invite: machine identity resolves
+  to no membership (ADR-0002), so it is denied like every other `members:manage` action.
+- **The role is server-set at creation and the recipient never sees or chooses it.** The
+  creation schema forbids unknown fields, so supplying `invited_by`, `token`, or `status` is a
+  `400 validation_error`, not a silent no-op. Role validity is checked against the canonical
+  domain; *which* roles an inviter may assign is the same role-transition question §4.1 leaves
+  open, deliberately not narrowed here.
+- **Acceptance is the one narrow, explicitly-authorized exception to the claim-distrust rule**
+  (ADR-0015; ADR-0017 §3). It requires a verified JWT whose **provider-verified** email
+  (`email_verified = true`) equals the invitation's `invited_email`, both lower-cased. The
+  email is used *only* to bind the invitation to the accepting identity — never for role,
+  permission, workspace, or member identity. `members.user_id` is always the verified `sub`.
+  **An unverified email can never accept**, so signing up under a victim's address without
+  proving control of it gains nothing.
+- **The token is a 256-bit secret; only its SHA-256 digest is stored.** The raw token exists
+  only in the delivered email and in-flight during acceptance — never logged, persisted, or
+  returned. Resolution is by hash through the `auth.resolve_invitation` SECURITY DEFINER
+  bootstrap: an accepting user has no workspace yet, so the lookup that discovers it runs
+  pre-RLS (DATABASE_DESIGN.md §6); everything after runs under the bound workspace's RLS.
+- **Single-use and atomic.** Acceptance is one transaction: resolve → bind workspace → create
+  membership → consume under `WHERE status = 'pending'`. Two concurrent acceptances serialize
+  on the row lock, so exactly one consumes it, and the `(workspace_id, user_id)` membership
+  unique constraint makes a second membership impossible; any failure rolls the whole thing
+  back, leaving the invitation unconsumed. Expiry (7 days) is server-enforced.
+- **Already a member → `409`, and the invitation is not consumed.** The existing membership
+  stays authoritative and its role is never silently changed.
+- **No enumeration oracle.** A bad, expired, cancelled, consumed, foreign, or wrong-email
+  acceptance all return one uniform `404` — nothing reveals whether an invitation exists, for
+  whom, or in which workspace. The create/list/cancel surfaces disclose only the caller's own
+  tenant; a cross-tenant invitation id is byte-identical to one that never existed (§3).
+- **Delivery is a first-party control-plane call.** The invitation email goes through Resend —
+  platform mail sent by the API, not tenant egress through the Execution Runtime, the same
+  class as the JWKS fetch (§6 permits first-party calls). The Resend key, the raw token, and
+  the invite URL never appear in logs.
+
 ## 5. Secrets handling rules
 
 1. Secrets live in `.env` files (local) and platform secret stores (Railway/Vercel) —

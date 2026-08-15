@@ -4,7 +4,7 @@
 > AI engineers: read this at session start (per CLAUDE.md). Detail lives in the linked
 > docs — this file is the dashboard, not the archive.
 >
-> **Last updated:** 2026-08-04 · **Updated by:** CTO Agent
+> **Last updated:** 2026-08-15 · **Updated by:** CTO Agent
 
 ## Current phase
 
@@ -45,7 +45,7 @@ table and role matrix, `api_tokens` issue/revoke endpoints, `/health/ready`.
 **M1.3+** — OpenAPI ingestion with api_key auth, Execution Runtime v1, audit log, minimal
 dashboard slice. docs/ROADMAP.md remains authoritative for M1 scope.
 
-_M1.3-A/B/C/D/E complete on feature branches (member endpoints, human JWT verification, X-Workspace-Id selection, Better Auth web integration, human authorization integration). main remains 236dc48; none merged._
+_M1.3-A/B/C/D/E/F complete on feature branches (member endpoints, human JWT verification, X-Workspace-Id selection, Better Auth web integration, human authorization integration, workspace invitations). main remains 236dc48; none merged._
 
 ## Architecture decisions
 

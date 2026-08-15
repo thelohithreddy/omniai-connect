@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import FastAPI, Request, Response, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -22,7 +23,7 @@ from app.core.exceptions import DomainError
 from app.core.logging import configure_logging, get_logger
 from app.core.middleware import REQUEST_ID_HEADER, RequestContextMiddleware
 from app.core.readiness import check_readiness
-from app.domains.workspaces.router import api_tokens_router, members_router
+from app.domains.workspaces.router import api_tokens_router, invitations_router, members_router
 from app.domains.workspaces.router import router as workspaces_router
 
 configure_logging()
@@ -42,6 +43,7 @@ app.add_middleware(RequestContextMiddleware)
 app.include_router(workspaces_router)
 app.include_router(api_tokens_router)
 app.include_router(members_router)
+app.include_router(invitations_router)
 
 
 def _envelope(
@@ -86,13 +88,19 @@ async def handle_validation_error(request: Request, exc: RequestValidationError)
 
     Left in FastAPI's default shape they would be the one endpoint family emitting a
     different error format — the exact inconsistency P-38 exists to prevent.
+
+    `exc.errors()` is rendered JSON-safe first: a custom `field_validator` that raises
+    `ValueError` puts the raw exception object into each error's `ctx`, which a plain
+    `JSONResponse` cannot serialize — a 500 masking a 400. `jsonable_encoder` coerces those
+    (and any other non-primitive) to strings, so the envelope stays well-formed no matter
+    what a validator raises.
     """
     return _envelope(
         status_code=400,
         code="validation_error",
         message="Request validation failed.",
         request_id=_request_id(request),
-        details={"fields": exc.errors()},
+        details={"fields": jsonable_encoder(exc.errors())},
     )
 
 

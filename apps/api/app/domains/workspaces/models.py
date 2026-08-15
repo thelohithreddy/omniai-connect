@@ -194,4 +194,77 @@ class ApiToken(UUIDPrimaryKeyMixin, WorkspaceScopedMixin, TimestampMixin, Base):
         return not (self.expires_at is not None and self.expires_at <= now)
 
 
-__all__ = ["MEMBER_ROLES", "WORKSPACE_PLANS", "ApiToken", "Member", "Workspace"]
+INVITATION_STATUSES = ("pending", "accepted", "cancelled")
+
+
+class Invitation(UUIDPrimaryKeyMixin, WorkspaceScopedMixin, Base):
+    """A targeted, email-bound, single-use invitation to join a Workspace (ADR-0017).
+
+    Not `TimestampMixin`: an invitation has no meaningful `updated_at` — its lifecycle is
+    the explicit `accepted_at` / `cancelled_at` stamps — so `created_at` is declared alone.
+    The token is never stored; only its `token_hash` is, and resolution runs pre-RLS through
+    `auth.resolve_invitation` because an accepting user is not yet a member of the workspace.
+    """
+
+    __tablename__ = "invitations"
+
+    # Stored lower-cased by the application; the acceptance email comparison is normalized.
+    invited_email: Mapped[str] = mapped_column(String(320), nullable=False)
+    # The role the resulting membership will carry. Server-set at creation; the recipient
+    # never sees or chooses it (ADR-0017 §8).
+    role: Mapped[str] = mapped_column(String(20), nullable=False)
+    # The inviting Member. Composite intra-tenant FK (below); nullable because the inviter
+    # may later be removed (column-scoped SET NULL keeps the invitation).
+    invited_by: Mapped[UUID | None] = mapped_column(postgresql.UUID(as_uuid=True), nullable=True)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default=text("'pending'")
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "role IN ('owner', 'admin', 'member', 'viewer')", name="invitation_role_valid"
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'accepted', 'cancelled')", name="invitation_status_valid"
+        ),
+        # The composite intra-tenant FK to the inviting member — a single-column reference
+        # could point at another tenant's member row, since FK checks bypass RLS.
+        ForeignKeyConstraint(
+            ["workspace_id", "invited_by"],
+            ["members.workspace_id", "members.id"],
+            name="fk_invitations_invited_by",
+            ondelete="SET NULL (invited_by)",
+        ),
+        # At most one PENDING invitation per (workspace, email): a fresh invite never lets a
+        # stale one grant a different role. Partial + `lower()` — must match the migration
+        # exactly or autogenerate proposes dropping and recreating it every run.
+        Index(
+            "uq_invitations_pending_email",
+            "workspace_id",
+            text("lower(invited_email)"),
+            unique=True,
+            postgresql_where=text("status = 'pending'"),
+        ),
+    )
+
+    def is_acceptable(self, *, now: datetime) -> bool:
+        """Domain rule: a pending, unexpired invitation is the only acceptable one."""
+        return self.status == "pending" and self.expires_at > now
+
+
+__all__ = [
+    "INVITATION_STATUSES",
+    "MEMBER_ROLES",
+    "WORKSPACE_PLANS",
+    "ApiToken",
+    "Invitation",
+    "Member",
+    "Workspace",
+]

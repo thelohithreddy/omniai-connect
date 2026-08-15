@@ -197,14 +197,33 @@ def reset_jwks_cache() -> None:
     _cache = None
 
 
-async def resolve_human_subject(token: str, cache: JWKSCache) -> str:
-    """Verify a Better Auth JWT and return its `sub`. Everything else raises 401.
+@dataclass(frozen=True, slots=True)
+class HumanIdentity:
+    """A verified human's identity claims.
 
-    The failure mapping is deliberately total: *any* `PyJWTError` — malformed segments,
-    bad base64, invalid JSON, disallowed algorithm, bad signature, expired, wrong
-    issuer/audience, missing claims — becomes the one uniform UnauthorizedError. There is
-    no error class this function lets escape as a 500, because an authentication endpoint
-    that can be crashed by a crafted token is an availability oracle.
+    `sub` is the permanent, authoritative identity (the value `members.user_id` stores).
+    `email` and `email_verified` are the ONE narrow exception to ADR-0015's "claims confer
+    nothing" rule, ratified for M1.3-F (ADR-0017 §3): they exist solely so the invitation
+    acceptance path can bind an invitation to the accepting person. They never inform role,
+    permission, workspace, or member identity — `email` is a *matching* value, never
+    authority. Every path that only needs the subject uses `resolve_human_subject`, which
+    returns `sub` alone and never surfaces these.
+    """
+
+    sub: str
+    email: str | None
+    email_verified: bool
+
+
+async def _verify(token: str, cache: JWKSCache) -> dict[str, object]:
+    """Cryptographically verify a Better Auth JWT and return its claims, or raise 401.
+
+    The single verification path shared by `resolve_human_subject` and
+    `resolve_human_identity`. The failure mapping is deliberately total: *any* `PyJWTError`
+    — malformed segments, bad base64, invalid JSON, disallowed algorithm, bad signature,
+    expired, wrong issuer/audience, missing claims — becomes the one uniform
+    UnauthorizedError. No error class escapes as a 500; an auth endpoint that a crafted
+    token can crash is an availability oracle.
     """
     try:
         header = jwt.get_unverified_header(token)
@@ -220,7 +239,7 @@ async def resolve_human_subject(token: str, cache: JWKSCache) -> str:
         _reject("unknown_kid")
 
     try:
-        claims = jwt.decode(
+        claims: dict[str, object] = jwt.decode(
             token,
             key=key,
             algorithms=list(ALLOWED_ALGORITHMS),
@@ -238,7 +257,33 @@ async def resolve_human_subject(token: str, cache: JWKSCache) -> str:
         # and is rejected here rather than being coerced into a lookup value.
         _reject("invalid_sub")
 
-    return sub
+    return claims
+
+
+async def resolve_human_subject(token: str, cache: JWKSCache) -> str:
+    """Verify a Better Auth JWT and return its `sub`. Everything else raises 401."""
+    claims = await _verify(token, cache)
+    return str(claims["sub"])
+
+
+async def resolve_human_identity(token: str, cache: JWKSCache) -> HumanIdentity:
+    """Verify a Better Auth JWT and return `sub` plus the email-binding claims (ADR-0017 §3).
+
+    Used ONLY by invitation acceptance. `email_verified` defaults to False for any shape
+    that is not exactly the boolean `true`, so a missing, string, or absent claim can never
+    pass an acceptance's verified-email gate — fail closed. The email is lower-cased and
+    stripped here so the caller compares normalized values.
+    """
+    claims = await _verify(token, cache)
+    raw_email = claims.get("email")
+    email = raw_email.strip().lower() if isinstance(raw_email, str) and raw_email.strip() else None
+    # Better Auth emits `emailVerified` (camelCase). Only the boolean `true` passes; a
+    # missing/string/None claim is treated as unverified — fail closed.
+    return HumanIdentity(
+        sub=str(claims["sub"]),
+        email=email,
+        email_verified=claims.get("emailVerified") is True,
+    )
 
 
 def _reject(reason: str) -> NoReturn:

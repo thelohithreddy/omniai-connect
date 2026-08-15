@@ -62,6 +62,14 @@ or client.
   a `WorkspaceContext` to be constructed — an unscoped query is unrepresentable
   (Bible tenet 1). The UoW also sets the `app.workspace_id` GUC for RLS
   (DATABASE_DESIGN.md §6).
+- **Invitation acceptance is the one deliberate exception** to "a single resolver binds the
+  workspace." The accepting human is not yet a Member, so `get_workspace_context` cannot bind
+  their target — the invitation, resolved from its token pre-RLS, is what *establishes* the
+  workspace. That flow (`domains/workspaces/acceptance.py`) therefore holds the UnitOfWork
+  directly and binds tenant context itself, exactly as `get_workspace_context`'s token path
+  does. It is not a layering escape hatch but the same bootstrap shape, kept out of the
+  service module so the service layer's "no session, no raw SQL" rule (§2) still holds
+  (ADR-0017 §6).
 - Provider functions live next to what they provide (`core/db.py`, `core/security.py`);
   routers depend on service factories, e.g.
   `service: ConnectorService = Depends(get_connector_service)`.

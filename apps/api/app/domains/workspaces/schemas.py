@@ -10,7 +10,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class WorkspaceRead(BaseModel):
@@ -45,6 +45,87 @@ class MembershipList(BaseModel):
     """The caller's workspaces. A bounded personal set, returned whole (ADR-0016 §7)."""
 
     data: list[MembershipRead]
+
+
+def _normalize_email(value: str) -> str:
+    """Lightweight email validation + normalization (ADR-0017).
+
+    Not a full RFC validator — deliberately no `email-validator` dependency — because the
+    real gate is exact equality against the accepting user's *provider-verified* Better Auth
+    email, compared lower-cased. This rejects the obviously-malformed and normalizes case and
+    surrounding whitespace so the stored value can match the verified claim. Anything that
+    passes here but is not a real address simply never matches a verified email and can never
+    be accepted.
+    """
+    email = value.strip().lower()
+    local, sep, domain = email.partition("@")
+    if not sep or not local or "." not in domain or domain.startswith(".") or domain.endswith("."):
+        raise ValueError("invited_email must be a valid email address")
+    if any(ch.isspace() for ch in email):
+        raise ValueError("invited_email must not contain whitespace")
+    return email
+
+
+class InvitationCreate(BaseModel):
+    """The client-controlled surface of creating an invitation: an email and a role.
+
+    `extra="forbid"` so an attempt to supply a server-owned field — `workspace_id`,
+    `invited_by`, `token`, `status`, `expires_at` — is a 400, never a silent no-op. The
+    workspace is the `X-Workspace-Id` selection, the inviter is the authenticated member, and
+    the token is server-generated; none of them are inputs. `role` is validated against the
+    canonical domain in the service (the single source of truth), exactly as
+    `MemberRoleUpdate` is.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: str = Field(min_length=3, max_length=320, description="The invitee's email address.")
+    role: str = Field(description="The role the resulting membership will carry.")
+
+    @field_validator("email")
+    @classmethod
+    def _email(cls, value: str) -> str:
+        return _normalize_email(value)
+
+
+class InvitationRead(BaseModel):
+    """An invitation as returned to a `members:manage` holder in its workspace.
+
+    Deliberately narrow: no `token`, no `token_hash`, no `invited_by`. The token never
+    leaves the creation email; the hash is a secret at rest; provenance is omitted for the
+    same reason `MemberRead` omits `invited_by`. This model is structurally incapable of
+    leaking the token.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    invited_email: str
+    role: str
+    status: str
+    expires_at: datetime
+    created_at: datetime
+
+
+class InvitationList(BaseModel):
+    """This workspace's invitations. Envelope shape per API_GUIDELINES.md §3."""
+
+    data: list[InvitationRead]
+
+
+class InvitationAccept(BaseModel):
+    """The acceptance request: the raw invitation token, in the body (never the URL/logs)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    token: str = Field(min_length=1, description="The opaque invitation token from the email.")
+
+
+class AcceptedInvitation(BaseModel):
+    """What the recipient joined: the workspace and their new role. No invitation details."""
+
+    workspace_id: uuid.UUID
+    role: str
 
 
 class ApiTokenRead(BaseModel):

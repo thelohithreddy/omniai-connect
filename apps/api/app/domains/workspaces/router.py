@@ -14,24 +14,33 @@ from fastapi import APIRouter, Depends, Query, Request, Response, status
 from app.core.authorization import require_permission
 from app.core.authz import Permission
 from app.core.db import UnitOfWork, get_uow
+from app.core.email import EmailSender, get_email_sender
 from app.core.exceptions import ValidationFailedError
 from app.core.pagination import DEFAULT_LIMIT, MAX_LIMIT
 from app.core.security import (
+    CurrentHumanIdentity,
     CurrentHumanSubject,
     CurrentWorkspace,
     WorkspaceContext,
     resolve_human_memberships,
 )
+from app.domains.workspaces.acceptance import InvitationAcceptanceService
 from app.domains.workspaces.repository import (
     ApiTokenRepository,
+    InvitationRepository,
     MemberRepository,
     WorkspaceRepository,
 )
 from app.domains.workspaces.schemas import (
+    AcceptedInvitation,
     ApiTokenCreate,
     ApiTokenCreated,
     ApiTokenList,
     ApiTokenRead,
+    InvitationAccept,
+    InvitationCreate,
+    InvitationList,
+    InvitationRead,
     MemberList,
     MemberRead,
     MemberRoleUpdate,
@@ -39,7 +48,12 @@ from app.domains.workspaces.schemas import (
     MembershipRead,
     WorkspaceRead,
 )
-from app.domains.workspaces.service import ApiTokenService, MemberService, WorkspaceService
+from app.domains.workspaces.service import (
+    ApiTokenService,
+    InvitationService,
+    MemberService,
+    WorkspaceService,
+)
 
 router = APIRouter(prefix="/v1/workspaces", tags=["workspaces"])
 api_tokens_router = APIRouter(prefix="/v1/api-tokens", tags=["api-tokens"])
@@ -409,4 +423,140 @@ async def create_api_token(
     )
 
 
-__all__ = ["WorkspaceContext", "api_tokens_router", "members_router", "router"]
+invitations_router = APIRouter(prefix="/v1/invitations", tags=["invitations"])
+
+
+def get_invitation_service(
+    uow: Annotated[UnitOfWork, Depends(get_uow)],
+    ctx: AuthorizedMemberAdmin,
+    email_sender: Annotated[EmailSender, Depends(get_email_sender)],
+) -> InvitationService:
+    """Composition root for invitation management (ADR-0017 §8).
+
+    Gated by `AuthorizedMemberAdmin` (`members:manage`) exactly like member management —
+    creating, listing, and cancelling invitations is managing who belongs to the workspace.
+    The permission is checked before the service is built, so an unauthorized caller never
+    reaches the logic.
+    """
+    return InvitationService(InvitationRepository(uow.session, ctx), email_sender)
+
+
+@invitations_router.post(
+    "",
+    response_model=InvitationRead,
+    status_code=status.HTTP_201_CREATED,
+    summary="Invite a person to the Workspace by email",
+    responses={
+        201: {"description": "Created and emailed. The token is never in the response."},
+        400: {"description": "Invalid email, unknown role, or a server-owned field."},
+        401: {"description": "Missing or invalid credentials."},
+        403: {"description": "Caller does not hold `members:manage` in this Workspace."},
+        409: {"description": "A pending invitation already exists for that email here."},
+    },
+)
+async def create_invitation(
+    payload: InvitationCreate,
+    ctx: AuthorizedMemberAdmin,
+    service: Annotated[InvitationService, Depends(get_invitation_service)],
+) -> InvitationRead:
+    """Create a targeted invitation and email it (ADR-0017).
+
+    The Workspace is the `X-Workspace-Id` selection, the inviter is the authenticated
+    member (`ctx.caller.member_id`, never a request field), and the role is server-persisted
+    at creation — the recipient can neither see nor change it. The response is the invitation
+    record **without** the token: the raw token exists only in the email and is never
+    returned or logged.
+    """
+    issued = await service.invite(
+        email=payload.email, role=payload.role, invited_by=ctx.caller.member_id
+    )
+    return InvitationRead.model_validate(issued.invitation)
+
+
+@invitations_router.get(
+    "",
+    response_model=InvitationList,
+    summary="List this Workspace's pending invitations",
+    responses={
+        200: {"description": "Pending invitations for the selected Workspace, newest first."},
+        401: {"description": "Missing or invalid credentials."},
+        403: {"description": "Caller does not hold `members:manage` in this Workspace."},
+    },
+)
+async def list_invitations(
+    service: Annotated[InvitationService, Depends(get_invitation_service)],
+    _: Annotated[None, Depends(reject_unknown_query_params)],
+) -> InvitationList:
+    """Pending invitations for the selected Workspace only.
+
+    Workspace-scoped by the same context every management endpoint uses, so another
+    tenant's invitations are not a request this API can express. Tokens and hashes are
+    absent from `InvitationRead` by construction.
+    """
+    invitations = await service.list_pending()
+    return InvitationList(data=[InvitationRead.model_validate(i) for i in invitations])
+
+
+@invitations_router.delete(
+    "/{invitation_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Cancel a pending invitation",
+    responses={
+        204: {"description": "Cancelled. It can never be accepted."},
+        401: {"description": "Missing or invalid credentials."},
+        403: {"description": "Caller does not hold `members:manage` in this Workspace."},
+        404: {"description": "No such pending invitation in this Workspace."},
+    },
+)
+async def cancel_invitation(
+    invitation_id: uuid.UUID,
+    service: Annotated[InvitationService, Depends(get_invitation_service)],
+) -> Response:
+    """Cancel a pending invitation. Workspace-scoped: a foreign id is simply not found.
+
+    A cancelled invitation can never be accepted — its status leaves `pending`, so the
+    acceptance guard fails.
+    """
+    await service.cancel(invitation_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@invitations_router.post(
+    "/accept",
+    response_model=AcceptedInvitation,
+    summary="Accept an invitation and join the Workspace",
+    responses={
+        200: {"description": "Joined. Returns the workspace and the granted role."},
+        401: {"description": "Missing or invalid human credential."},
+        404: {"description": "Invitation not found or not acceptable (uniform, no oracle)."},
+        409: {"description": "You are already a member of this Workspace."},
+    },
+)
+async def accept_invitation(
+    payload: InvitationAccept,
+    identity: CurrentHumanIdentity,
+    uow: Annotated[UnitOfWork, Depends(get_uow)],
+    request: Request,
+) -> AcceptedInvitation:
+    """Accept an invitation with the token from its email (ADR-0017 §8).
+
+    Not workspace-scoped and not RBAC-gated: the invitation, resolved from its token,
+    establishes the Workspace, and the gate is the verified-email binding, not a permission.
+    The token is in the body — never the URL — so it stays out of access logs. The whole
+    sequence (resolve, verify email, bind, consume, create membership) is one transaction;
+    any failure rolls all of it back. Every unacceptable case returns the one uniform 404.
+    """
+    request_id: str = getattr(request.state, "request_id", "")
+    result = await InvitationAcceptanceService(uow).accept(
+        token=payload.token, identity=identity, request_id=request_id
+    )
+    return AcceptedInvitation(workspace_id=result.workspace_id, role=result.role)
+
+
+__all__ = [
+    "WorkspaceContext",
+    "api_tokens_router",
+    "invitations_router",
+    "members_router",
+    "router",
+]
