@@ -9,7 +9,12 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 
+import structlog
+
+from app.core.config import settings
+from app.core.email import EmailMessage, EmailSender
 from app.core.exceptions import NotFoundError, ValidationFailedError
 from app.core.pagination import (
     DEFAULT_LIMIT,
@@ -18,10 +23,11 @@ from app.core.pagination import (
     encode_cursor,
     resolve_limit,
 )
-from app.core.security import generate_token
-from app.domains.workspaces.models import MEMBER_ROLES, ApiToken, Member, Workspace
+from app.core.security import generate_invitation_token, generate_token, hash_token
+from app.domains.workspaces.models import MEMBER_ROLES, ApiToken, Invitation, Member, Workspace
 from app.domains.workspaces.repository import (
     ApiTokenRepository,
+    InvitationRepository,
     MemberRepository,
     RevocationOutcome,
     WorkspaceRepository,
@@ -100,6 +106,34 @@ class MemberService:
         if member is None:
             raise NotFoundError("Member not found.")
         return member
+
+    async def list_members_page(
+        self, *, limit: int = DEFAULT_LIMIT, cursor: str | None = None
+    ) -> MemberPage:
+        """One page of this Workspace's Members, newest first.
+
+        Mirrors `ApiTokenService.list_tokens` exactly, including the over-fetch: asking for
+        `limit + 1` and discarding the extra answers "is there another page?" from the same
+        snapshot as the page itself, which a separate `count(*)` cannot do — it would be a
+        second scan taken at a different instant, and a member added between the two makes
+        them disagree.
+
+        The cursor is decoded before the query runs, so an unusable one is a
+        `ValidationFailedError` rather than a silently empty page (§3).
+        """
+        position = decode_cursor(cursor) if cursor is not None else None
+        page_size = resolve_limit(limit)
+
+        rows = await self._repository.list_page(limit=page_size + 1, after=position)
+
+        has_more = len(rows) > page_size
+        members = rows[:page_size]
+        next_cursor = (
+            encode_cursor(CursorPosition(created_at=members[-1].created_at, id=members[-1].id))
+            if has_more and members
+            else None
+        )
+        return MemberPage(members=members, next_cursor=next_cursor, has_more=has_more)
 
     async def list_members(self) -> list[Member]:
         """Every Member of this Workspace.
@@ -192,6 +226,15 @@ def _require_valid_role(role: str) -> str:
             details={"role": role, "allowed": list(MEMBER_ROLES)},
         )
     return role
+
+
+@dataclass(frozen=True, slots=True)
+class MemberPage:
+    """One page of Members plus the cursor that continues it (API_GUIDELINES.md §3)."""
+
+    members: list[Member]
+    next_cursor: str | None
+    has_more: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -365,3 +408,83 @@ def _require_token_name(name: str) -> str:
 #: Matches `api_tokens.name` (String(120)). Over-length input is a domain error here rather
 #: than a `DataError` surfacing from the driver (BACKEND_SPEC.md §6).
 _TOKEN_NAME_MAX_LEN = 120
+
+log = structlog.get_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class IssuedInvitation:
+    """The created invitation plus its raw token — the token exists only here and in the
+    email, never in a response body or a log."""
+
+    invitation: Invitation
+    raw_token: str
+
+
+class InvitationService:
+    """Create, list, and cancel invitations for one Workspace (ADR-0017).
+
+    Framework-free like its siblings. It owns invitation *policy* — role validity, token
+    generation, expiry, and handing the message to the email sender — while the repository
+    owns persistence and the UnitOfWork owns the transaction. It never sees an HTTP request.
+    """
+
+    def __init__(self, repository: InvitationRepository, email_sender: EmailSender) -> None:
+        self._repository = repository
+        self._email_sender = email_sender
+
+    async def invite(
+        self, *, email: str, role: str, invited_by: uuid.UUID | None
+    ) -> IssuedInvitation:
+        """Mint a pending invitation and deliver it, or fail without persisting either.
+
+        The token is generated here, stored only as its hash, and delivered by email inside
+        the request's transaction: if delivery fails, the exception rolls the whole request
+        back and no dangling, undeliverable invitation is left behind. The role is validated
+        against the canonical domain (the same `_require_valid_role` every write uses).
+
+        The email is normalized (stripped, lower-cased) HERE, not only in the request
+        schema, so the stored value matches the normalized verified email the acceptance
+        path compares against — regardless of how the service is reached. The pending-email
+        unique index keys on `lower(invited_email)`, so this also keeps that invariant
+        honest for a caller that bypasses the schema.
+        """
+        now = datetime.now(UTC)
+        raw_token = generate_invitation_token()
+        invitation = await self._repository.create(
+            invited_email=email.strip().lower(),
+            role=_require_valid_role(role),
+            token_hash=hash_token(raw_token),
+            expires_at=now + timedelta(days=settings.invitation_expiry_days),
+            invited_by=invited_by,
+        )
+        await self._deliver(invitation.invited_email, raw_token)
+        return IssuedInvitation(invitation=invitation, raw_token=raw_token)
+
+    async def _deliver(self, email: str, raw_token: str) -> None:
+        """Send the invite email. The URL and token appear only in the message, never a log."""
+        accept_url = f"{settings.next_public_app_url}/accept-invite?token={raw_token}"
+        await self._email_sender.send(
+            EmailMessage(
+                to=email,
+                subject="You've been invited to a workspace on OmniAI Connect",
+                html=(
+                    "<p>You've been invited to join a workspace on OmniAI Connect.</p>"
+                    f'<p><a href="{accept_url}">Accept the invitation</a></p>'
+                    "<p>This link expires in "
+                    f"{settings.invitation_expiry_days} days and can be used once.</p>"
+                ),
+            )
+        )
+
+    async def list_pending(self) -> list[Invitation]:
+        return await self._repository.list_pending()
+
+    async def cancel(self, invitation_id: uuid.UUID) -> None:
+        """Cancel a pending invitation. `NotFoundError` if absent, foreign, or not pending.
+
+        Workspace-scoped in the repository, so a foreign invitation id is simply not found —
+        the 404 an unauthorized cancellation and a genuinely-absent one share, no oracle.
+        """
+        if not await self._repository.cancel(invitation_id):
+            raise NotFoundError("Invitation not found.")

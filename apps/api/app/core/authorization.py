@@ -18,20 +18,23 @@ in a closure when the route is defined, at import time, and no request field can
 A caller can influence *whether* they satisfy a requirement; never *which* requirement
 applies.
 
-**Machine identity currently has no membership, and therefore no permissions.** ADR-0002
-establishes two identity planes that are "never mixed": humans authenticate via Better
-Auth and map to a Member, while workspace-scoped API tokens are machine credentials that
-DATABASE_DESIGN.md §3 states explicitly "do not" map to a Member. Since the only
-authentication path implemented today issues `kind="api_token"`, every request currently
-resolves to no membership and every permission check denies.
+**Machine identity has no membership, and therefore no permissions.** ADR-0002 establishes
+two identity planes that are "never mixed": humans authenticate via Better Auth and map to
+a Member (`kind="member"`, since M1.3-B/C), while workspace-scoped API tokens are machine
+credentials that DATABASE_DESIGN.md §3 states explicitly "do not" map to a Member. A machine
+request (`kind="api_token"`) resolves to no membership, so every permission check denies it.
 
 That is the correct behaviour, not a bug to work around. The tempting shortcuts —
 treating a token as its workspace's owner, or granting a token the strongest role in the
 workspace — are exactly the confused-deputy patterns this boundary exists to prevent, and
 they would silently merge two identity planes the architecture keeps apart. Machine
-authorization is the token's own `scopes` field, a separate mechanism (M1.2-I). Until
-human authentication lands, this dependency is defined, tested, and deliberately not
-attached to any endpoint.
+authorization is the token's own `scopes` field, a separate mechanism (M1.2-I).
+
+Human authentication landed in M1.3-B/C, so this dependency is now **live and attached** to
+every protected endpoint (`members:manage` on `/v1/members`, `api_tokens:manage` on
+`/v1/api-tokens`). A human's role is resolved from `members.role` for the workspace they
+selected with `X-Workspace-Id` (ADR-0016), and it is that persisted role — never a JWT,
+header, or request field — that the policy below is asked about.
 
 **Layering.** This module imports `MemberRepository` from the workspaces domain. That
 follows the precedent set by `core/security.py`, which already reads the `api_tokens`

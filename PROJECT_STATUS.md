@@ -4,7 +4,7 @@
 > AI engineers: read this at session start (per CLAUDE.md). Detail lives in the linked
 > docs — this file is the dashboard, not the archive.
 >
-> **Last updated:** 2026-08-04 · **Updated by:** CTO Agent
+> **Last updated:** 2026-08-15 · **Updated by:** CTO Agent
 
 ## Current phase
 
@@ -45,6 +45,10 @@ table and role matrix, `api_tokens` issue/revoke endpoints, `/health/ready`.
 **M1.3+** — OpenAPI ingestion with api_key auth, Execution Runtime v1, audit log, minimal
 dashboard slice. docs/ROADMAP.md remains authoritative for M1 scope.
 
+_M1.3-A/B/C/D/E/F/G complete on feature branches (member endpoints, human JWT verification, X-Workspace-Id selection, Better Auth web integration, human authorization integration, workspace invitations, session security hardening). main remains 236dc48; none merged._
+
+_M1.3-G (session security hardening, ADR-0018) locked the human session/JWT revocation boundary with tests, hardened the duplicate-`Authorization` header (fail-closed), and recorded the deferred, topology-/product-dependent decisions (deployment origin topology & CORS, immediate JWT revocation, rate limiting, security headers, session-lifetime cap, account-lifecycle) rather than inventing them. No migration; one production-code change._
+
 ## Architecture decisions
 
 ADR-0001 modular monolith · ADR-0002 auth boundary (Better Auth in web, API verifies) ·
@@ -58,6 +62,17 @@ Full records: docs/DECISIONS.md.
 2. MCP protocol version pinning policy: which spec revisions do we commit to at M2? (docs/MCP_RUNTIME.md flags churn risk.)
 3. Free-tier limits: which quota (Tool Calls/week) balances evaluation value vs egress cost? (RISKS.md R-cost.)
 4. Neon vs Railway Postgres for staging parity — validate Neon branching workflow in Sprint 1.
+5. **[RESOLVED 2026-08-15 — ADR-0016]** ~~Human workspace-selection mechanism (raised M1.3-B).~~ Decided: the `X-Workspace-Id` header, a selection verified against membership. Implemented in M1.3-C.  
+   _Original question, for history:_ When a human belongs
+   to more than one Workspace, how does a request select which one it acts in? No canonical
+   document defines a mechanism (path segment, header, an "active workspace" in the Better
+   Auth session, or a selection endpoint), and FRONTEND_SPEC.md's client-side "workspace
+   switcher" is UI state, not server authority. Until this is decided, `get_workspace_context`
+   binds a single-membership human to their one workspace and **fails closed (uniform 401)
+   for multi-workspace humans** (ADR-0015 §8) — deny-by-default, never a guess. This is a
+   public-API-shape decision: it needs a canonical answer before multi-workspace humans can
+   authenticate, and whatever the answer, the server must establish membership independently
+   of any request-supplied workspace id (a request is a *selection*, never *authority*).
 
 ## Technical debt (known, accepted, tracked)
 

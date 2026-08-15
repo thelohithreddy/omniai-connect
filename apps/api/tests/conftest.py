@@ -15,11 +15,18 @@ while the system leaks.
 
 from __future__ import annotations
 
+import base64
+import time
 import uuid
 from collections.abc import AsyncIterator, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
+import httpx
+import jwt as pyjwt
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
@@ -29,9 +36,10 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from app.core import readiness
+from app.core import human_auth, readiness
 from app.core.config import settings
 from app.core.db import UnitOfWork, get_uow
+from app.core.human_auth import get_jwks_cache
 from app.core.ids import new_id
 from app.core.logging import configure_logging
 from app.core.security import GeneratedToken, generate_token
@@ -103,6 +111,148 @@ def _readiness_probe_uses_the_per_test_engine(app_engine: AsyncEngine) -> Iterat
     readiness.engine = original
 
 
+@pytest.fixture(autouse=True)
+def _isolate_jwks_cache() -> Iterator[None]:
+    """Fresh JWKS cache singleton per test.
+
+    Two reasons, both load-bearing. Isolation: the cache carries fetched keys and a
+    cooldown timestamp, so a test that poisoned or warmed it must not leak that state into
+    the next. Event loops: the cache holds an `asyncio.Lock`, which binds to the loop that
+    first acquires it — pytest-asyncio gives every test a fresh loop, so a singleton
+    surviving across tests raises "attached to a different loop" exactly like the engine
+    problem `client` solves for `get_uow`.
+    """
+    human_auth.reset_jwks_cache()
+    yield
+    human_auth.reset_jwks_cache()
+
+
+@dataclass
+class SigningAuthority:
+    """A local Ed25519 issuer able to mint real, verifiable Better Auth-shaped JWTs.
+
+    This is a *test double for the provider*, not for the verifier: everything it signs is
+    verified by the actual production code path over genuine cryptography. Tests use it to
+    produce the shapes an attacker or a rotated provider would produce — wrong keys, wrong
+    claims, unknown kids — with full control over every field.
+    """
+
+    kid: str = "test-key-1"
+    # Named `signer`, not `private_key`: the latter reads as a secret assignment to
+    # gitleaks, which flags the type annotation as a high-entropy value (a false
+    # positive that failed CI once). This is a test signing key generated per run.
+    signer: Ed25519PrivateKey = field(default_factory=Ed25519PrivateKey.generate)
+
+    @property
+    def jwk(self) -> dict[str, str]:
+        raw = self.signer.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
+        )
+        return {
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "alg": "EdDSA",
+            "kid": self.kid,
+            "x": base64.urlsafe_b64encode(raw).rstrip(b"=").decode(),
+        }
+
+    def jwks_document(self) -> dict[str, Any]:
+        return {"keys": [self.jwk]}
+
+    def sign(
+        self,
+        sub: str | object = "user-under-test",
+        *,
+        headers: dict[str, Any] | None = None,
+        drop: tuple[str, ...] = (),
+        **overrides: Any,
+    ) -> str:
+        """A token with valid defaults; every deviation is explicit at the call site."""
+        now = int(time.time())
+        claims: dict[str, Any] = {
+            "sub": sub,
+            "iss": settings.better_auth_url,
+            "aud": settings.better_auth_url,
+            "iat": now,
+            "exp": now + 900,
+        }
+        claims.update(overrides)
+        for claim in drop:
+            claims.pop(claim, None)
+        return pyjwt.encode(
+            claims,
+            self.signer,
+            algorithm="EdDSA",
+            headers={"kid": self.kid, **(headers or {})},
+        )
+
+
+class FakeJWKSEndpoint:
+    """An in-process JWKS endpoint with a controllable failure mode and a call counter.
+
+    Backed by `httpx.MockTransport`, injected through the JWKSCache's transport parameter —
+    the seam the cache exposes by design — so no network, no monkeypatching, and the fetch
+    count is a hard fact tests can assert (amplification bounds, single-flight).
+    """
+
+    def __init__(self, document: dict[str, Any]) -> None:
+        self.document = document
+        self.calls = 0
+        self.mode = "ok"  # ok | http_error | timeout | not_json | wrong_shape
+
+    def transport(self) -> httpx.MockTransport:
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.calls += 1
+            if self.mode == "http_error":
+                return httpx.Response(500, text="upstream broke")
+            if self.mode == "timeout":
+                raise httpx.ConnectTimeout("simulated timeout")
+            if self.mode == "not_json":
+                return httpx.Response(200, text="<html>definitely not a jwks</html>")
+            if self.mode == "wrong_shape":
+                return httpx.Response(200, json={"not_keys": []})
+            return httpx.Response(200, json=self.document)
+
+        return httpx.MockTransport(handler)
+
+    def cache(self) -> human_auth.JWKSCache:
+        return human_auth.JWKSCache(
+            url="http://jwks.test/api/auth/jwks", transport=self.transport()
+        )
+
+
+@pytest.fixture
+def authority() -> SigningAuthority:
+    return SigningAuthority()
+
+
+@pytest.fixture
+def jwks_endpoint(authority: SigningAuthority) -> FakeJWKSEndpoint:
+    return FakeJWKSEndpoint(authority.jwks_document())
+
+
+@pytest.fixture
+async def human_client(
+    client: AsyncClient, jwks_endpoint: FakeJWKSEndpoint
+) -> AsyncIterator[tuple[AsyncClient, FakeJWKSEndpoint]]:
+    """The app client with the JWKS dependency pointing at the in-process endpoint.
+
+    Shared by every human-auth suite (M1.3-B verification and M1.3-C selection). One cache
+    instance for the whole test — the override returns the same object on every request,
+    exactly like production's module singleton; a fresh cache per request would reset the
+    fetch counter and make the amplification/single-flight assertions vacuous.
+    """
+    cache = jwks_endpoint.cache()
+    app.dependency_overrides[get_jwks_cache] = lambda: cache
+    # `client`'s teardown clears ALL overrides, including this one.
+    yield client, jwks_endpoint
+
+
+def bearer(token: str) -> dict[str, str]:
+    """Authorization header for a bearer credential (JWT or api token)."""
+    return {"Authorization": f"Bearer {token}"}
+
+
 @pytest.fixture
 async def admin_engine() -> AsyncIterator[AsyncEngine]:
     engine = create_async_engine(settings.database_admin_url)
@@ -130,8 +280,13 @@ async def app_session(app_engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
 
 async def _create_workspace(engine: AsyncEngine, label: str) -> SeededWorkspace:
     workspace_id = new_id()
-    # Unique per run so parallel or repeated runs never collide on the slug constraint.
-    slug = f"test-{label}-{workspace_id.hex[:10]}"
+    # The FULL id hex, not a prefix. `new_id()` is UUIDv7 and its first 10 hex characters
+    # are pure timestamp advancing once every ~256 ms — so a truncated slug is identical
+    # for every workspace created inside that window, and any row a failed teardown left
+    # behind collided with later tests in nondeterministic bursts (found during M1.3-B's
+    # regression: one mid-suite failure cascaded into 15-38 setup errors). The full hex is
+    # unique unconditionally and, at 32 chars + prefix, still fits slug's String(64).
+    slug = f"test-{label}-{workspace_id.hex}"
     token = generate_token()
     async with engine.begin() as conn:
         await conn.execute(

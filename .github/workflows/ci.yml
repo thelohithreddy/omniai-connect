@@ -30,8 +30,31 @@ concurrency:
 
 jobs:
   web:
-    name: Web — lint, typecheck, build
+    name: Web — lint, typecheck, test, build
     runs-on: ubuntu-latest
+
+    # Better Auth stores users, sessions and signing keys in Postgres, and the auth contract
+    # suite drives its real handler against real rows. Mocking the database here would leave
+    # the assertions that matter — that sign-out deletes a session, that a wrong password is
+    # refused — testing a fake instead of the thing being shipped.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: omniai
+          POSTGRES_PASSWORD: omniai
+          POSTGRES_DB: omniai
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U omniai"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      BETTER_AUTH_URL: http://localhost:3000
+      BETTER_AUTH_DATABASE_URL: postgresql://omniai_identity:omniai_identity@localhost:5432/omniai
+
     steps:
       - uses: actions/checkout@v4
       # No `version:` input on purpose. package.json pins `packageManager: pnpm@9.15.0`,
@@ -48,6 +71,28 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint
       - run: pnpm typecheck
+
+      # Same provisioning as infra/docker/postgres-init/02-identity-role.sh, which service
+      # containers never run. Better Auth owns this schema and migrates it itself.
+      - name: Provision the Better Auth identity schema
+        run: |
+          PGPASSWORD=omniai psql -h localhost -U omniai -d omniai -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE ROLE omniai_identity LOGIN PASSWORD 'omniai_identity';
+          GRANT CONNECT ON DATABASE omniai TO omniai_identity;
+          CREATE SCHEMA IF NOT EXISTS identity AUTHORIZATION omniai_identity;
+          REVOKE ALL ON SCHEMA identity FROM PUBLIC;
+          SQL
+
+      # Generated per run and discarded with the job's database. It signs nothing that
+      # outlives the run, and no secret literal enters the repository. Exported once so the
+      # migration and the tests agree — a mismatch would fail to decrypt the signing key,
+      # which is exactly what BETTER_AUTH_SECRET rotation does to a real deployment.
+      - name: Auth contract tests
+        run: |
+          export BETTER_AUTH_SECRET="$(openssl rand -base64 32)"
+          pnpm --filter web migrate:identity
+          pnpm --filter web test
+
       - run: pnpm --filter web build
 
   api:
@@ -107,6 +152,67 @@ jobs:
           CREATE ROLE omniai_app LOGIN PASSWORD 'omniai_app';
           GRANT CONNECT ON DATABASE omniai TO omniai_app;
           SQL
+
+      # Better Auth owns human identity in apps/web, in its own schema through its own role
+      # (ADR-0014). Mirrors infra/docker/postgres-init/02-identity-role.sh, which service
+      # containers never run. `omniai_app` is granted nothing — that absence is the boundary,
+      # and tests/integration/test_identity_boundary.py asserts it.
+      - name: Provision the Better Auth identity schema
+        run: |
+          PGPASSWORD=omniai psql -h localhost -U omniai -d omniai -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE ROLE omniai_identity LOGIN PASSWORD 'omniai_identity';
+          GRANT CONNECT ON DATABASE omniai TO omniai_identity;
+          CREATE SCHEMA IF NOT EXISTS identity AUTHORIZATION omniai_identity;
+          REVOKE ALL ON SCHEMA identity FROM PUBLIC;
+          SQL
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      # Create Better Auth's tables before the Alembic steps below, for two reasons.
+      #
+      # Without them the placement assertions would be vacuous: "no Better Auth table exists
+      # in public" passes trivially when no Better Auth table exists anywhere, and a green
+      # test proving nothing is worse than no test.
+      #
+      # And running this *before* `alembic downgrade base` is what turns the reversibility
+      # check into a proof. That downgrade executes `DROP SCHEMA auth CASCADE`; the suite
+      # then asserts `identity` is still intact. Choosing a schema Alembic already owned
+      # would fail right here, which is exactly how this module found that hazard.
+      #
+      # Since M1.3-B the provider is also STARTED: the human-auth E2E tests sign in against
+      # the real Better Auth and the API's verifier fetches its real JWKS — those tests
+      # fail rather than skip when the provider is absent, deliberately. One secret is
+      # exported for the whole step so the migration, the running server, and the jwks row
+      # it mints all agree; a mismatch is exactly the failed-decrypt outage ADR-0014
+      # documents. The secret is generated per-run and dies with the job's database.
+      - name: Apply Better Auth's schema and start the provider
+        working-directory: ${{ github.workspace }}
+        env:
+          BETTER_AUTH_URL: http://localhost:3000
+          BETTER_AUTH_DATABASE_URL: postgresql://omniai_identity:omniai_identity@localhost:5432/omniai
+        run: |
+          export BETTER_AUTH_SECRET="$(openssl rand -base64 32)"
+          pnpm install --frozen-lockfile
+          pnpm --filter web migrate:identity
+          # `next dev`, not `next start` — deliberately. `next start` runs with
+          # NODE_ENV=production, and the M1.3-D boot guard in apps/web/src/lib/auth.ts
+          # correctly REFUSES to start a production server on an http:// BETTER_AUTH_URL
+          # (it would issue session cookies without the Secure attribute). CI's provider is
+          # a localhost http test fixture, so it must run in development mode — exactly as
+          # the docker-compose `web` service does. Weakening the guard to make prod boot on
+          # http would defeat the very control M1.3-D added.
+          nohup pnpm --filter web dev > /tmp/better-auth-web.log 2>&1 &
+          for i in $(seq 1 90); do
+            curl -sf http://localhost:3000/api/auth/jwks > /dev/null && break
+            sleep 1
+          done
+          curl -sf http://localhost:3000/api/auth/jwks > /dev/null || {
+            echo "Better Auth provider failed to start"; tail -50 /tmp/better-auth-web.log; exit 1;
+          }
 
       # --frozen: fail if uv.lock is stale rather than re-resolving (P-59).
       - run: uv sync --frozen

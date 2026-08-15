@@ -105,8 +105,52 @@ Two identity planes, per ADR-0002 — never mixed:
 
 | Plane | Who | Mechanism |
 |---|---|---|
-| Human | Dashboard users | Better Auth in apps/web owns signup/login/sessions/social OAuth; FastAPI verifies the signed session/JWT via shared JWKS/secret and resolves a Member + Workspace context per request. |
+| Human | Dashboard users | Better Auth in apps/web owns signup/login/sessions/social OAuth; FastAPI verifies the issued **EdDSA JWT** against Better Auth's published JWKS (`/api/auth/jwks`) and resolves a Member + Workspace context per request (ADR-0015). |
 | Machine | AI clients, automation | Workspace-scoped API tokens issued by the API itself. Shown once at creation, stored hashed (never recoverable), revocable individually, and bound to exactly one Workspace. |
+
+**Human JWT verification (ADR-0015).** The single composite resolver `get_workspace_context`
+dispatches by credential shape: the `omc_` prefix takes the machine path, everything else
+the human path, and neither falls through to the other. The human verifier:
+
+- pins the algorithm allowlist to `("EdDSA",)` — `alg=none`, HMAC confusion, and every
+  RSA/EC variant are refused before key material is touched (the token cannot choose its
+  own algorithm), and the `PyJWK` key binding refuses a mismatched `alg` as a second gate;
+- validates `iss` and `aud` against `BETTER_AUTH_URL`, so a token minted by any *other*
+  Better Auth deployment does not authenticate here;
+- requires `exp`, `iat`, `sub`, `iss`, `aud`; honors `nbf` when present; 30 s leeway;
+- reads keys only from the configured JWKS URL — never from the token (`jku`/`x5u`/embedded
+  keys are ignored) — through a bounded cache: 300 s TTL, single-flight refresh, one forced
+  refresh per unknown `kid` behind a 30 s cooldown (amplification-bounded), stale-on-error,
+  fail-closed when no keys have ever been fetched;
+- uses the verified `sub` for one thing only — the membership lookup. **No JWT claim confers
+  authorization**: role comes from the persisted Member row read under RLS, permissions from
+  the matrix in §4.1. A claim-stuffed token (`role: owner`, `permissions: [...]`) moves
+  nothing.
+
+**Workspace is established, never asserted (ADR-0016).** A human's workspace is resolved
+from persisted membership via `auth.resolve_member_workspaces` (a SECURITY DEFINER bootstrap
+twin of `auth.resolve_api_token`, ADR-0008/0015), never trusted from a request. A human who
+belongs to several Workspaces selects one with the **`X-Workspace-Id` header** — a
+*selection signal* the server verifies against membership before binding. One membership
+auto-binds; many require the header; a header naming a Workspace the caller is not a member
+of, or a malformed/duplicate header, fails closed as the uniform 401 with no existence
+oracle. A `workspace_id` in the query, body, or JWT is never authority; the role is always
+re-resolved from the bound member row under RLS, so no request field sets role or identity.
+`GET /v1/workspaces` lists only the caller's own memberships (id + display role), disclosing
+no other tenant. Machine tokens ignore the header — their Workspace is the token's.
+
+**Revocation.** A verified JWT is bearer-valid until `exp` (≤ 900 s); logout ends the Better
+Auth session but cannot invalidate an outstanding JWT, and FastAPI never sees the session
+(it cannot read the `identity` schema, ADR-0014). Immediate lockout is achieved by removing
+the Member — authorization is the membership row, not the token, so removal takes effect on
+the next request. Rotating `BETTER_AUTH_SECRET` invalidates all outstanding tokens within
+one cache TTL.
+
+**Uniform failure.** Every human-credential failure — malformed, bad signature, wrong
+issuer/audience, expiry, unknown `kid`, JWKS outage, no membership, ambiguous membership —
+returns the one 401 message; the reason goes to structured logs (event names only, never
+token material). Authentication (401) and authorization (403) stay distinct (§4.2); a failed
+cross-tenant read is the canonical 404, never a 403 existence oracle.
 
 ### 4.1 Role matrix
 
@@ -198,7 +242,29 @@ they resolve no role and every check denies. Treating a token as its workspace's
 as the member who created it, would be a confused deputy. Machine authorization is the
 token's own `scopes` field — a separate mechanism, not yet enforced.
 
-### 4.3 API token issuance
+### 4.3 Member management
+
+`GET /v1/members`, `PATCH /v1/members/{id}` and `DELETE /v1/members/{id}` require
+`members:manage`, so only an `owner` or `admin` may read the roster or change it.
+
+- **A role change binds on the target's very next request.** Authorization reads the role
+  from the persisted row every time (§4.2), so a demotion takes effect immediately — there
+  is no cached role and nothing to invalidate.
+- **No role-transition rules are enforced**, and none are invented: whether an admin may
+  re-role an owner, and whether the last owner may be demoted or removed, are open
+  questions §4.1 does not answer. Recorded rather than decided.
+- **A machine token cannot read or change the roster.** Listing members is reconnaissance,
+  re-roling one is escalation, and removing one is denial of service; machine identity
+  resolves to no membership (ADR-0002), so all three deny.
+- **A Member from another Workspace is byte-identical to one that never existed** (`404`,
+  §3) on both mutating endpoints, so the API is not an existence oracle for other tenants.
+- **Removing a Member does not revoke the API tokens they created.** Those are
+  workspace-owned credentials; the composite FK clears provenance with
+  `ON DELETE SET NULL` and revocation stays a separate, explicit act (§4.5).
+- The response exposes `id`, `user_id`, `role` and `created_at` only — never `workspace_id`
+  or `invited_by`.
+
+### 4.4 API token issuance
 
 `POST /v1/api-tokens` requires `api_tokens:manage`, so only an `owner` or `admin` may mint
 a machine credential. Three properties hold at that endpoint:
@@ -211,16 +277,18 @@ a machine credential. Three properties hold at that endpoint:
   creation schema forbids unknown fields, so an attempt to supply `created_by_member_id`,
   `scopes`, or a chosen `token` is a `400 validation_error` rather than a silent no-op.
 - **A token cannot mint another token.** Machine identity resolves to no membership
-  (ADR-0002), so a leaked credential cannot issue a successor that would survive revoking
-  the original. This is a deliberate consequence of the two identity planes, not an
-  oversight: until human authentication lands (M1.2-G), the only way to issue a token is
-  the bootstrap script.
+  (ADR-0002), so a leaked credential is denied `api_tokens:manage` and cannot issue a
+  successor that would survive revoking the original. This is a deliberate consequence of
+  the two identity planes. Since M1.3-B/C, token issuance is available to **human** members
+  holding `api_tokens:manage` (owner/admin) — authenticated by JWT, scoped by
+  `X-Workspace-Id`, and recorded with the creating member's id — alongside the bootstrap
+  script that seeds a workspace's first token before any Member exists.
 
 Tokens are currently issued **unscoped** (`scopes = []`). A scope vocabulary is not yet
 defined (ADR-0010) — and `[]` is the deny-by-default
 value, not a placeholder meaning "everything".
 
-### 4.4 API token listing
+### 4.5 API token listing
 
 `GET /v1/api-tokens` requires `api_tokens:manage` — the same capability as issuance, because
 no separate read capability exists in §4.1 and inventing one would widen the policy without
@@ -242,7 +310,7 @@ a decision. It is treated as an information-disclosure boundary:
   names a Workspace, and the pagination cursor carries a position rather than an authority
   (ADR-0011), so a forged cursor cannot cross a tenant boundary.
 
-### 4.5 API token revocation
+### 4.6 API token revocation
 
 `DELETE /v1/api-tokens/{id}` requires `api_tokens:manage` and returns 204.
 
@@ -269,6 +337,89 @@ a decision. It is treated as an information-disclosure boundary:
   (§3), so the endpoint cannot be used to probe which token ids are real elsewhere.
   Creating a token grants no authority over it: `created_by_member_id` is provenance, and
   authority comes from the role matrix alone.
+
+### 4.7 Invitation issuance and acceptance
+
+Invitations let an `owner`/`admin` add a person to a Workspace by email; the recipient
+accepts with a verified Better Auth identity and becomes a Member (ADR-0017). The invitation
+is a temporary membership-establishment mechanism — the resulting membership row is the only
+authority, and the permanent chain (verified `sub` → `members.user_id` → persisted role →
+RBAC → RLS) is unchanged.
+
+- **Creating, listing, and cancelling require `members:manage`**, the same capability as
+  member management (§4.3), with the workspace taken from `X-Workspace-Id`. No new permission
+  and no endpoint-local role check. A machine token cannot invite: machine identity resolves
+  to no membership (ADR-0002), so it is denied like every other `members:manage` action.
+- **The role is server-set at creation and the recipient never sees or chooses it.** The
+  creation schema forbids unknown fields, so supplying `invited_by`, `token`, or `status` is a
+  `400 validation_error`, not a silent no-op. Role validity is checked against the canonical
+  domain; *which* roles an inviter may assign is the same role-transition question §4.1 leaves
+  open, deliberately not narrowed here.
+- **Acceptance is the one narrow, explicitly-authorized exception to the claim-distrust rule**
+  (ADR-0015; ADR-0017 §3). It requires a verified JWT whose **provider-verified** email
+  (`email_verified = true`) equals the invitation's `invited_email`, both lower-cased. The
+  email is used *only* to bind the invitation to the accepting identity — never for role,
+  permission, workspace, or member identity. `members.user_id` is always the verified `sub`.
+  **An unverified email can never accept**, so signing up under a victim's address without
+  proving control of it gains nothing.
+- **The token is a 256-bit secret; only its SHA-256 digest is stored.** The raw token exists
+  only in the delivered email and in-flight during acceptance — never logged, persisted, or
+  returned. Resolution is by hash through the `auth.resolve_invitation` SECURITY DEFINER
+  bootstrap: an accepting user has no workspace yet, so the lookup that discovers it runs
+  pre-RLS (DATABASE_DESIGN.md §6); everything after runs under the bound workspace's RLS.
+- **Single-use and atomic.** Acceptance is one transaction: resolve → bind workspace → create
+  membership → consume under `WHERE status = 'pending'`. Two concurrent acceptances serialize
+  on the row lock, so exactly one consumes it, and the `(workspace_id, user_id)` membership
+  unique constraint makes a second membership impossible; any failure rolls the whole thing
+  back, leaving the invitation unconsumed. Expiry (7 days) is server-enforced.
+- **Already a member → `409`, and the invitation is not consumed.** The existing membership
+  stays authoritative and its role is never silently changed.
+- **No enumeration oracle.** A bad, expired, cancelled, consumed, foreign, or wrong-email
+  acceptance all return one uniform `404` — nothing reveals whether an invitation exists, for
+  whom, or in which workspace. The create/list/cancel surfaces disclose only the caller's own
+  tenant; a cross-tenant invitation id is byte-identical to one that never existed (§3).
+- **Delivery is a first-party control-plane call.** The invitation email goes through Resend —
+  platform mail sent by the API, not tenant egress through the Execution Runtime, the same
+  class as the JWKS fetch (§6 permits first-party calls). The Resend key, the raw token, and
+  the invite URL never appear in logs.
+
+### 4.8 Human session and JWT lifecycle (ADR-0018)
+
+The human plane is Better Auth (session + cookie) in the web tier and a short-lived EdDSA JWT
+at the API; the two are distinct credentials with distinct lifetimes. M1.3-G pins the boundary
+between them.
+
+- **The API is `Authorization: Bearer`-only.** It never reads the Better Auth session cookie,
+  so a stolen cookie is inert against the API and the machine/human planes cannot be confused.
+  A cookie presented alone is a `401` (missing credential); a cookie value smuggled into the
+  Bearer slot is neither an `omc_` token nor a JWT and fails the uniform human `401`.
+- **A duplicate `Authorization` header is refused, fail-closed.** Two credential headers are
+  never silently resolved to the first — the same rule §4.2 / ADR-0016 §3 apply to
+  `X-Workspace-Id`. Ambiguity denies.
+- **JWT lifetime is 900 s (15 min).** The verifier enforces `exp` (plus issuer/audience/EdDSA);
+  nothing extends it.
+- **Logout revokes the session, not outstanding JWTs.** Sign-out deletes the Better Auth
+  session row and clears the session cookies, so **no new JWT can be minted** afterward — but an
+  **already-issued JWT stays valid on the API until its `exp`** (≤ 15 min). This is the
+  deliberate, documented consequence of a stateless verifier that holds no session state and
+  cannot read the `identity` schema (ADR-0014): there is **no immediate JWT revocation**. The
+  short TTL bounds the replay window. This boundary is claimed here *only because it is
+  empirically tested*, not assumed.
+- **Immediate lockout is Member removal.** Removing the membership denies the caller on their
+  very next request (the role is read from the row every time, §4.2). That is the fast lever;
+  JWT expiry is the slow one.
+- **Break-glass (all sessions at once).** To invalidate *every* outstanding JWT before its exp,
+  an operator removes the signing key from `identity.jwks`; propagation is bounded by the 300 s
+  JWKS cache TTL. Rotating `BETTER_AUTH_SECRET` alone breaks *signing*, not verification, so it
+  is **not** a revocation lever. This is an operator action, not an application feature.
+- **Session fixation is resisted:** no cookie is set before authentication and each login mints
+  a fresh session token.
+- **CORS/CSRF posture.** The API configures no CORS (it is server-to-server; a Bearer API has no
+  cookie for a foreign origin to abuse, and browsers cannot cross-origin-read it). Better Auth's
+  own Origin check defends its cookie-authenticated endpoints. Both depend on a deployment origin
+  topology that is **not yet decided** — see ADR-0018 for that and the other deferred lifecycle
+  decisions (immediate revocation, rate limiting, security headers, session-lifetime cap,
+  password reset, account disable/delete, social OAuth). None are silently defaulted.
 
 ## 5. Secrets handling rules
 

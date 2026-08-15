@@ -13,6 +13,170 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Human session security hardening (M1.3-G, ADR-0018).** Lifecycle hardening *around* the
+  released human-auth architecture (Better Auth → EdDSA JWT/JWKS → `X-Workspace-Id` → membership
+  → role → RBAC → RLS) — not a redesign. Discovery (7-agent map + a live-stack probe) confirmed
+  the core is sound; this locks the settled behavior with tests and closes one asymmetry.
+  - **Duplicate `Authorization` header is now rejected, fail-closed** (`extract_bearer_token`).
+    A smuggled second `Bearer` can no longer be silently resolved to the first — the identical
+    rule ADR-0016 §3 already applies to `X-Workspace-Id`. This is the only production-code change.
+  - **The session/JWT revocation boundary is now a tested invariant (ADR-0018):** logout deletes
+    the Better Auth session and clears cookies so **no new JWT can be minted**, but an
+    already-issued JWT stays valid on the API until its **900 s (15 min)** `exp` — the API holds
+    no session state (there is no stateful JWT revocation; the short TTL is the mitigation, Member
+    removal is the immediate lever, and clearing `identity.jwks` is the break-glass lever).
+  - **New regression/E2E tests** (real Better Auth) pin: the revocation boundary, the 900 s
+    lifetime, logout→no-new-JWT, session-token rotation (fixation), the API being
+    `Bearer`-only (a session cookie never authenticates it), and a non-string `kid` being a clean
+    401 (never a 500).
+  - **Adversarial G-series mutation audit (G01–G70): 0 meaningful survivors** (11 constructible
+    mutations killed; 3 inert redundant-defense mutations classified honestly).
+  - **Documented, not invented:** SECURITY.md §4.8 + ADR-0018 record the session model and every
+    deferred, topology-/product-dependent decision (deployment origin topology & CORS,
+    immediate revocation, rate limiting → Cloudflare WAF, security headers, session-lifetime cap,
+    password reset, account disable/delete, social OAuth). No migration; no schema change.
+
+- **Human workspace invitations (M1.3-F, ADR-0017).** A `members:manage` owner/admin invites
+  a person to a Workspace by email; that person accepts with a verified Better Auth identity
+  and becomes a Member. The invitation is a temporary membership-establishment mechanism — the
+  resulting `members` row is the only authority; the invitation confers nothing.
+  - **Endpoints (all `/v1`):** `POST /invitations` (create, `members:manage`),
+    `GET /invitations` (list this workspace's pending, `members:manage`),
+    `DELETE /invitations/{id}` (cancel, `members:manage`), and `POST /invitations/accept`
+    (accept — authenticated human, not gated by membership, since the accepter is joining).
+  - **Identity binding is the one narrow, explicitly-authorized exception to ADR-0015's
+    claim-distrust rule (ADR-0017 §3).** Acceptance requires a verified JWT whose
+    provider-verified email (`emailVerified = true`) equals the invitation's `invited_email`
+    (both lower-cased). The email binds the invitation to the identity and nothing else —
+    `members.user_id` is always the verified `sub`; role and workspace are server-established.
+    An unverified email can never accept.
+  - **Token:** 256-bit `secrets.token_urlsafe(32)`; only `SHA-256(token)` is stored; the raw
+    token lives only in the delivered email and is never logged or persisted. 7-day expiry,
+    server-enforced. Single-use and atomic: acceptance resolves the token pre-RLS through the
+    `auth.resolve_invitation` SECURITY DEFINER bootstrap (twin of `auth.resolve_api_token`),
+    binds the invitation's workspace, creates the membership, and consumes the invitation under
+    `WHERE status = 'pending'` — concurrent acceptances yield exactly one membership.
+  - **Already a member → 409, invitation not consumed;** the existing membership stays
+    authoritative and its role is never silently changed. At most one pending invitation per
+    `(workspace, lower(email))` (partial unique index), so a fresh invite cannot race a stale
+    one to a different role.
+  - **No enumeration oracle:** bad/expired/cancelled/consumed/foreign/wrong-email acceptances
+    all fail with one uniform 404; create/list/cancel disclose only the caller's own tenant.
+  - **Delivery via Resend**, a first-party control-plane call (not tenant egress through the
+    Execution Runtime); the Resend key, raw token, and invite URL never appear in logs. Better
+    Auth email verification enabled (`sendOnSignUp`, non-blocking for sign-in).
+  - One additive, reversible migration (0006): the `invitations` table (`workspace_id NOT
+    NULL`, RLS ENABLE+FORCE) and the `auth.resolve_invitation` bootstrap function; `identity`
+    untouched. Invitation-layer mutation audit (F-series) left zero meaningful survivors.
+
+- **Human authorization integration & hardening (M1.3-E).** Proves the released
+  authorization chain (JWT → `X-Workspace-Id` → membership → persisted role → centralized
+  RBAC → RLS) end-to-end on **every** protected endpoint through the real human path — not
+  just `/v1/members` (M1.3-C) but the api-token endpoints, which shared the same
+  `require_permission` dependency yet were unreachable before M1.3-B/C (only machine tokens
+  existed, and machines resolve to no membership → always denied). No new authorization
+  mechanism: the point is that one already exists and is correct.
+  - Full (endpoint × role) matrix over real JWTs: `members:manage` and `api_tokens:manage`
+    admit owner/admin and refuse member/viewer/machine; `/v1/workspaces/me` is any member;
+    `GET /v1/workspaces` is any human. Plus machine/human separation, cross-tenant fail-
+    closed, request-spoofing (JWT/header/query/body-claimed authority all inert), token
+    provenance (`created_by_member_id` = the creator's real member row), and a real-provider
+    E2E. Enforcement-layer mutation audit (E-series) left zero meaningful survivors.
+  - Fixes stale documentation that predated human auth: `authorization.py`'s "the only
+    authentication path today issues `kind='api_token'` … deliberately not attached to any
+    endpoint" and SECURITY.md's "until human authentication lands (M1.2-G)" — both now false.
+  - No production code change beyond the doc corrections; the authorization architecture was
+    already complete. No new endpoints, permissions, roles, or migration.
+
+- **Human multi-workspace selection (M1.3-C).** A human who belongs to more than one
+  Workspace now names their target with the `X-Workspace-Id` header (ADR-0016). It is a
+  *selection*, verified against persisted membership, never authority: the JWT proves who,
+  the header states where, the server proves membership, the persisted row proves role,
+  RBAC proves what, RLS is the final boundary.
+  - `get_workspace_context`'s human path (not a parallel resolver) reads the header, looks
+    the subject's memberships up via `auth.resolve_member_workspaces`, and binds only a
+    matched one. One membership auto-binds (M1.3-B preserved); many require the header; a
+    foreign, absent, malformed, or **duplicate** selector fails closed as the uniform 401,
+    with no existence oracle. Duplicate headers are rejected explicitly — Starlette's
+    `.get()` returns only the first, so the resolver reads the whole list and denies more
+    than one. The role is always re-resolved from the bound member row under RLS; no JWT,
+    query, body, cookie, or header claim ever sets role, member_id, or identity.
+  - New `GET /v1/workspaces`: a human-only listing of the caller's own memberships as
+    `{id, role}` (display role only), so a client can discover what it may select. Backed by
+    `auth.resolve_member_workspace_roles` (migration 0005), which reuses migration 0004's
+    `members` exemption — no new grant or policy on `workspaces`, and no other tenant's
+    existence, name, or metadata is disclosed.
+  - Machine authentication is unchanged: a machine token ignores `X-Workspace-Id` (its
+    workspace is the token's), and the two planes never cross.
+  - Tests: a pure-function policy suite (RLS-independent proof), a full cross-tenant matrix
+    with a three-user/two-workspace world (owner/admin/member/viewer), workspace switching,
+    membership revocation, role changes, header-parsing edge cases, GUC/connection safety,
+    genuine concurrency, a log audit, and a real-provider E2E (live login → JWT →
+    `X-Workspace-Id` → RBAC → RLS). Mutation audit C01–C48 left zero meaningful survivors.
+  - Resolves the workspace-selection Open Question recorded in M1.3-B. No frontend UI ships
+    (none exists yet); the switcher will consume this contract when the dashboard is built.
+
+- **Human JWT authentication in the API (M1.3-B).** FastAPI now verifies Better Auth's
+  EdDSA JWTs against the published JWKS and resolves them to a tenant-scoped
+  `WorkspaceContext`, completing the human half of ADR-0002. This is the first time an
+  authenticated *human* can call the API — every prior request was a machine API token.
+  - New `app/core/human_auth.py`: a pinned-EdDSA verifier (algorithm allowlist,
+    issuer/audience/lifetime validation, `sub`-only output) over a bounded JWKS cache
+    (300 s TTL, single-flight, unknown-`kid` refresh with a cooldown, stale-on-error,
+    fail-closed cold). `get_workspace_context` is now the composite resolver BACKEND_SPEC §3
+    describes — dispatch by the `omc_` prefix, no fallthrough between planes. Machine
+    authentication is byte-for-byte unchanged. Library: `pyjwt[crypto]` (ADR-0015).
+  - Migration 0004 adds `auth.resolve_member_workspaces` (SECURITY DEFINER bootstrap twin of
+    `auth.resolve_api_token`) and `ix_members_user_id`. A verified subject with exactly one
+    membership binds to it; **JWT claims never confer role, permission, or workspace** —
+    authorization stays the persisted Member row + the RBAC matrix (ADR-0009).
+  - Multi-workspace humans fail closed (uniform 401) pending a workspace-selection decision,
+    now a recorded Open Question. Revocation is honest: a JWT is valid until `exp` (≤ 900 s);
+    removing the Member is the immediate lockout.
+  - Tests: 50-case negative verifier matrix (unit), 22 integration tests (RBAC, tenancy,
+    machine/human separation, concurrency/single-flight, log audit), and 4 real-provider
+    E2E tests (live Better Auth login → real JWKS → real RLS). CI's API job now builds and
+    starts the provider so the E2E tests run for real rather than skip.
+  - No FastAPI change to M1.2 machine auth, M1.3-A endpoints, or M1.3-D — verified by the
+    full 590-test suite at both log levels.
+
+- **Better Auth human authentication (M1.3-D).** The control plane now has real human
+  identity: sign-up, sign-in, sign-out, sessions, and a JWKS document at
+  `/api/auth/jwks` that the API will verify against in M1.3-B. Better Auth is mounted at
+  the catch-all route `apps/web/src/app/api/auth/[...all]/route.ts`.
+  - Its tables live in a dedicated `identity` schema owned by a dedicated `omniai_identity`
+    role (ADR-0014). `omniai_app` is granted nothing there and `omniai_identity` cannot read
+    tenant tables, so neither credential can reach the other's data. `identity` is invisible
+    to Alembic, so `alembic downgrade base` cannot destroy human identity data — the hazard
+    that ruled out the `auth` schema, which migration 0001 drops with `CASCADE`.
+  - Better Auth owns its own migrations: `pnpm --filter web migrate:identity`, run through
+    the library's own `getMigrations` rather than the version-skewed `@better-auth/cli`.
+  - Sessions are DB-backed and opaque; JWTs are EdDSA (Ed25519), 15-minute, with `iss`/`aud`
+    derived from `BETTER_AUTH_URL` and the signing private key encrypted at rest.
+  - `BETTER_AUTH_URL` must be `https://` in production, asserted at construction: Better Auth
+    derives the cookie's `Secure` attribute from the scheme, so an http URL would silently
+    downgrade every session cookie.
+  - Adds an auth contract suite (`pnpm --filter web test`, 20 tests, real Postgres) and a
+    database boundary suite (`tests/integration/test_identity_boundary.py`, 11 tests). CI
+    gained a Postgres service on the web job and identity provisioning on both.
+  - No FastAPI JWT verification yet — that is M1.3-B.
+
+- **Member management endpoints (M1.3-A).** `GET /v1/members`, `PATCH /v1/members/{id}`,
+  `DELETE /v1/members/{id}` behind `members:manage` — the router layer M1.2-C deliberately
+  left unbuilt. No migration; no change to `MemberService`'s business rules.
+  - Keyset cursor pagination per API_GUIDELINES.md §3, ordered `(created_at DESC, id DESC)`,
+    reusing `core/pagination.py` from M1.2-G. Unknown query parameters are a
+    `validation_error` (§4).
+  - `MemberRoleUpdate.role` is a plain `str`, not a `Literal`: the canonical role domain
+    already exists as the `members.role` CHECK constraint and `MEMBER_ROLES`, and a third
+    copy in a schema could drift from the database.
+  - A role change binds on the target's next request — proven by promoting a member and
+    watching a previously-403 call return 200.
+  - `DELETE` answers 404 for a Member that is absent *or* foreign, byte-identical. §2's
+    "deleting a deleted resource is 204" cannot hold simultaneously with its own
+    cross-tenant-404 rule for a hard-deleted row; security wins, matching ADR-0012.
+  - 53 tests; 22 adversarial mutations with zero survivors.
+
 - **Readiness probe (M1.2-K).** `GET /health/ready` verifies the two dependencies
   OBSERVABILITY.md §6 names — PostgreSQL `SELECT 1` and a Redis `PING` — each bounded at 2 s
   and run concurrently. 200 `{"status":"ready"}` / 503 `{"status":"not_ready"}`.

@@ -8,16 +8,18 @@ this code can express (P-14). RLS is the second net, not the first.
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 
-from sqlalchemy import delete, func, select, tuple_, update
+from sqlalchemy import delete, func, select, text, tuple_, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import ConflictError
 from app.core.pagination import CursorPosition
 from app.core.security import WorkspaceContext
-from app.domains.workspaces.models import ApiToken, Member, Workspace
+from app.domains.workspaces.models import ApiToken, Invitation, Member, Workspace
 
 
 class RevocationOutcome(StrEnum):
@@ -242,6 +244,29 @@ class MemberRepository:
         member: Member | None = await self._session.scalar(stmt)
         return member
 
+    async def list_page(self, *, limit: int, after: CursorPosition | None = None) -> list[Member]:
+        """One page of this Workspace's Members, newest first.
+
+        Added rather than paginating `list_for_workspace`, which stays exactly as M1.2-B
+        shipped it: that method is unpaginated and ascending, other code depends on it, and
+        API_GUIDELINES.md §3 governs *endpoints*, not every internal read.
+
+        Ordered `(created_at DESC, id DESC)` per §4's default sort, with `id` as the
+        tiebreak because a keyset predicate over a non-unique key skips or repeats rows —
+        two members added in the same microsecond would tie. `id` is UUIDv7, so it orders in
+        agreement with creation time, and `(workspace_id, id)` is already unique.
+
+        `ix_members_workspace_id` narrows to the tenant; no `(workspace_id, created_at)`
+        composite is added because members-per-workspace is bounded by team size, and an
+        index chosen for a table that will hold tens of rows is speculative (P-44 is
+        satisfied by the existing workspace-leading index).
+        """
+        stmt = select(Member).where(Member.workspace_id == self._ctx.workspace_id)
+        if after is not None:
+            stmt = stmt.where(tuple_(Member.created_at, Member.id) < (after.created_at, after.id))
+        stmt = stmt.order_by(Member.created_at.desc(), Member.id.desc()).limit(limit)
+        return list((await self._session.scalars(stmt)).all())
+
     async def list_for_workspace(self) -> list[Member]:
         """Every Member of the current Workspace.
 
@@ -339,3 +364,144 @@ def _is_duplicate_membership(err: IntegrityError) -> bool:
     version-dependent.
     """
     return "uq_members_workspace_id_user_id" in str(getattr(err, "orig", err))
+
+
+# The bootstrap resolver for invitation acceptance (ADR-0017 §6). An accepting user is not
+# yet a member of the invitation's workspace, so the token lookup that DISCOVERS the
+# workspace runs pre-RLS through the SECURITY DEFINER function — the same shape as
+# `auth.resolve_api_token` and `auth.resolve_member_workspaces`.
+_RESOLVE_INVITATION_SQL = text(
+    "SELECT id, workspace_id, invited_email, role, invited_by, status, expires_at "
+    "FROM auth.resolve_invitation(:token_hash)"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedInvitation:
+    """An invitation as discovered pre-RLS from its token, before any workspace is bound."""
+
+    id: uuid.UUID
+    workspace_id: uuid.UUID
+    invited_email: str
+    role: str
+    invited_by: uuid.UUID | None
+    status: str
+    expires_at: datetime
+
+
+class InvitationRepository:
+    """Data access for Invitations, scoped to one Workspace by construction (ADR-0017).
+
+    Scoped exactly like `MemberRepository`: `ctx` is required, every method filters on
+    `workspace_id`, and RLS is the second net. Acceptance is different — the accepting user
+    has no workspace yet — so token resolution is the one unscoped, pre-RLS operation and is
+    a static method backed by the SECURITY DEFINER function. Transactions belong to the
+    UnitOfWork; nothing here commits.
+    """
+
+    def __init__(self, session: AsyncSession, ctx: WorkspaceContext) -> None:
+        self._session = session
+        self._ctx = ctx
+
+    @staticmethod
+    async def resolve(session: AsyncSession, token_hash: str) -> ResolvedInvitation | None:
+        """Discover an invitation by its token hash, pre-RLS. Never trusts the raw token."""
+        row = (await session.execute(_RESOLVE_INVITATION_SQL, {"token_hash": token_hash})).first()
+        if row is None:
+            return None
+        return ResolvedInvitation(
+            id=row.id,
+            workspace_id=row.workspace_id,
+            invited_email=row.invited_email,
+            role=row.role,
+            invited_by=row.invited_by,
+            status=row.status,
+            expires_at=row.expires_at,
+        )
+
+    async def create(
+        self,
+        *,
+        invited_email: str,
+        role: str,
+        token_hash: str,
+        expires_at: datetime,
+        invited_by: uuid.UUID | None,
+    ) -> Invitation:
+        """Persist a pending invitation into the current Workspace.
+
+        `workspace_id` comes from the context, never a parameter. The partial unique index
+        on `(workspace_id, lower(invited_email)) WHERE status='pending'` is the invariant
+        that stops two live invitations for the same person; a violation surfaces here as a
+        `ConflictError` so the service never interprets SQLAlchemy.
+        """
+        invitation = Invitation(
+            workspace_id=self._ctx.workspace_id,
+            invited_email=invited_email,
+            role=role,
+            token_hash=token_hash,
+            expires_at=expires_at,
+            invited_by=invited_by,
+            status="pending",
+        )
+        self._session.add(invitation)
+        try:
+            await self._session.flush()
+        except IntegrityError as err:
+            if "uq_invitations_pending_email" in str(getattr(err, "orig", err)):
+                raise ConflictError(
+                    "A pending invitation already exists for that email in this workspace.",
+                    details={"invited_email": invited_email},
+                ) from err
+            raise
+        return invitation
+
+    async def list_pending(self) -> list[Invitation]:
+        """Every pending invitation for this Workspace, newest first."""
+        stmt = (
+            select(Invitation)
+            .where(
+                Invitation.workspace_id == self._ctx.workspace_id,
+                Invitation.status == "pending",
+            )
+            .order_by(Invitation.created_at.desc(), Invitation.id.desc())
+        )
+        return list((await self._session.scalars(stmt)).all())
+
+    async def consume(self, invitation_id: uuid.UUID) -> bool:
+        """Atomically mark a pending invitation accepted. False if it was not pending.
+
+        The `status = 'pending'` guard in the WHERE clause is the single-use arbiter: under
+        two concurrent acceptances the row lock serializes the updates, so exactly one sees
+        `pending` and consumes it; the other updates zero rows and is rejected. No
+        application lock is involved (ADR-0017 §5).
+        """
+        stmt = (
+            update(Invitation)
+            .where(
+                Invitation.id == invitation_id,
+                Invitation.workspace_id == self._ctx.workspace_id,
+                Invitation.status == "pending",
+            )
+            .values(status="accepted", accepted_at=func.now())
+            .returning(Invitation.id)
+        )
+        return (await self._session.scalar(stmt)) is not None
+
+    async def cancel(self, invitation_id: uuid.UUID) -> bool:
+        """Cancel a pending invitation. False if absent, foreign, or not pending.
+
+        A cancelled invitation can never be accepted (its status is no longer `pending`, so
+        `consume` fails). Workspace-scoped, so a foreign invitation id simply is not found.
+        """
+        stmt = (
+            update(Invitation)
+            .where(
+                Invitation.id == invitation_id,
+                Invitation.workspace_id == self._ctx.workspace_id,
+                Invitation.status == "pending",
+            )
+            .values(status="cancelled", cancelled_at=func.now())
+            .returning(Invitation.id)
+        )
+        return (await self._session.scalar(stmt)) is not None

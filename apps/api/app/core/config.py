@@ -58,9 +58,30 @@ class Settings(BaseSettings):
     # --- Cache / Queue ---
     redis_url: str = "redis://localhost:6379/0"
 
-    # --- Auth (Better Auth — wired in M1.2, ADR-0002) ---
+    # --- Auth (Better Auth — provider in apps/web per ADR-0002/0014; verified here per
+    # ADR-0015) ---
     better_auth_secret: SecretStr = SecretStr("change-me-32-chars-minimum")
+    # Doubles as the expected `iss` and `aud` of every human JWT: Better Auth derives both
+    # claims from its baseURL, so this single value is the trust anchor for issuer pinning.
     better_auth_url: str = "http://localhost:3000"
+    # Where to FETCH the JWKS, when that differs from the public issuer URL. Empty means
+    # "derive from better_auth_url". The only reason this exists is container networking:
+    # inside docker-compose the API reaches the web app at http://web:3000 while tokens
+    # carry iss=http://localhost:3000. It changes the fetch address only — never the
+    # issuer/audience the verifier requires (ADR-0015 §5).
+    better_auth_jwks_url: str = ""
+
+    @property
+    def resolved_jwks_url(self) -> str:
+        """The JWKS document location: the override, or derived from the issuer URL."""
+        return self.better_auth_jwks_url or f"{self.better_auth_url}/api/auth/jwks"
+
+    # --- Invitations (ADR-0017) ---
+    # The From address for first-party invitation email sent via Resend. A plain str, not a
+    # secret: it appears in every message header. Verify the domain in Resend before use.
+    invitation_from_email: str = "OmniAI Connect <invites@omni.example>"
+    # Server-enforced invitation lifetime. 7 days per the ratified contract.
+    invitation_expiry_days: int = 7
 
     # --- Encryption (credential vault — SECURITY.md §2.1) ---
     credential_master_key: SecretStr = SecretStr("change-me")

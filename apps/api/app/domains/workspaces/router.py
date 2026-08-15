@@ -14,21 +14,50 @@ from fastapi import APIRouter, Depends, Query, Request, Response, status
 from app.core.authorization import require_permission
 from app.core.authz import Permission
 from app.core.db import UnitOfWork, get_uow
+from app.core.email import EmailSender, get_email_sender
 from app.core.exceptions import ValidationFailedError
 from app.core.pagination import DEFAULT_LIMIT, MAX_LIMIT
-from app.core.security import CurrentWorkspace, WorkspaceContext
-from app.domains.workspaces.repository import ApiTokenRepository, WorkspaceRepository
+from app.core.security import (
+    CurrentHumanIdentity,
+    CurrentHumanSubject,
+    CurrentWorkspace,
+    WorkspaceContext,
+    resolve_human_memberships,
+)
+from app.domains.workspaces.acceptance import InvitationAcceptanceService
+from app.domains.workspaces.repository import (
+    ApiTokenRepository,
+    InvitationRepository,
+    MemberRepository,
+    WorkspaceRepository,
+)
 from app.domains.workspaces.schemas import (
+    AcceptedInvitation,
     ApiTokenCreate,
     ApiTokenCreated,
     ApiTokenList,
     ApiTokenRead,
+    InvitationAccept,
+    InvitationCreate,
+    InvitationList,
+    InvitationRead,
+    MemberList,
+    MemberRead,
+    MemberRoleUpdate,
+    MembershipList,
+    MembershipRead,
     WorkspaceRead,
 )
-from app.domains.workspaces.service import ApiTokenService, WorkspaceService
+from app.domains.workspaces.service import (
+    ApiTokenService,
+    InvitationService,
+    MemberService,
+    WorkspaceService,
+)
 
 router = APIRouter(prefix="/v1/workspaces", tags=["workspaces"])
 api_tokens_router = APIRouter(prefix="/v1/api-tokens", tags=["api-tokens"])
+members_router = APIRouter(prefix="/v1/members", tags=["members"])
 
 # Built **once**, at import time, and reused. `require_permission` returns a fresh closure
 # per call, and FastAPI's per-request dependency cache is keyed on the callable object — so
@@ -47,6 +76,13 @@ AuthorizedTokenAdmin = Annotated[
     WorkspaceContext, Depends(require_permission(Permission.API_TOKENS_MANAGE))
 ]
 
+#: Built once for the same reason as `AuthorizedTokenAdmin`: `require_permission` returns a
+#: fresh closure per call and FastAPI's per-request dependency cache is keyed on the
+#: callable, so a second construction would run the membership lookup twice per request.
+AuthorizedMemberAdmin = Annotated[
+    WorkspaceContext, Depends(require_permission(Permission.MEMBERS_MANAGE))
+]
+
 
 def get_workspace_service(
     uow: Annotated[UnitOfWork, Depends(get_uow)],
@@ -61,6 +97,31 @@ def get_workspace_service(
     return WorkspaceService(WorkspaceRepository(uow.session, ctx))
 
 
+@router.get(
+    "",
+    response_model=MembershipList,
+    summary="List the authenticated human's own workspace memberships",
+)
+async def list_my_workspaces(
+    subject: CurrentHumanSubject,
+    uow: Annotated[UnitOfWork, Depends(get_uow)],
+) -> MembershipList:
+    """The workspaces the authenticated human belongs to, with their role in each (ADR-0016 §7).
+
+    Human-only and pre-selection: a human calls this to discover what they may put in
+    `X-Workspace-Id` before selecting a workspace, so it authenticates via the verified JWT
+    subject **without** binding a workspace. It reads only the caller's own memberships
+    through the `auth.resolve_member_workspace_roles` bootstrap function — no other tenant's
+    existence, name, members, or metadata is reachable, and `role` is display-only (never an
+    authorization input). A machine token is not a human credential and fails the human
+    verifier uniformly.
+    """
+    memberships = await resolve_human_memberships(subject, uow.session)
+    return MembershipList(
+        data=[MembershipRead(id=m.workspace_id, role=m.role) for m in memberships]
+    )
+
+
 @router.get("/me", response_model=WorkspaceRead, summary="Get the caller's Workspace")
 async def get_current_workspace(
     service: Annotated[WorkspaceService, Depends(get_workspace_service)],
@@ -71,6 +132,120 @@ async def get_current_workspace(
     binding, RLS, and the response envelope in one call.
     """
     return WorkspaceRead.model_validate(await service.get_current())
+
+
+def get_member_service(
+    uow: Annotated[UnitOfWork, Depends(get_uow)],
+    ctx: AuthorizedMemberAdmin,
+) -> MemberService:
+    """Composition root for member management.
+
+    Depending on `AuthorizedMemberAdmin` rather than `CurrentWorkspace` is what puts
+    authorization *before* construction: FastAPI resolves dependencies before the handler
+    runs, so a caller lacking `members:manage` gets a 403 and the service is never built.
+    """
+    return MemberService(MemberRepository(uow.session, ctx))
+
+
+@members_router.get(
+    "",
+    response_model=MemberList,
+    summary="List the Workspace's Members",
+    responses={
+        200: {"description": "A page of Members, newest first."},
+        400: {"description": "Unknown query parameter, bad limit, or an invalid cursor."},
+        401: {"description": "Missing or invalid credentials."},
+        403: {"description": "Caller does not hold `members:manage` in this Workspace."},
+    },
+)
+async def list_members(
+    service: Annotated[MemberService, Depends(get_member_service)],
+    _: Annotated[None, Depends(reject_unknown_query_params)],
+    limit: Annotated[
+        int, Query(ge=1, le=MAX_LIMIT, description="Page size. Defaults to 50, maximum 100.")
+    ] = DEFAULT_LIMIT,
+    cursor: Annotated[str | None, Query(description="Opaque cursor from a prior page.")] = None,
+) -> MemberList:
+    """Page through this Workspace's Members, newest first.
+
+    The Workspace comes from the authenticated context and appears in no parameter of this
+    function, so listing another tenant's members is not a request this API can express.
+
+    Requires `members:manage` (SECURITY.md §4.1), which owner and admin hold. A machine
+    token resolves to no membership and is therefore denied — a leaked credential cannot
+    enumerate who works at the customer.
+    """
+    page = await service.list_members_page(limit=limit, cursor=cursor)
+    return MemberList(
+        data=[MemberRead.model_validate(member) for member in page.members],
+        next_cursor=page.next_cursor,
+        has_more=page.has_more,
+    )
+
+
+@members_router.patch(
+    "/{member_id}",
+    response_model=MemberRead,
+    summary="Change a Member's role",
+    responses={
+        200: {"description": "The updated Member."},
+        400: {"description": "Malformed id, unknown field, or a role outside the domain."},
+        401: {"description": "Missing or invalid credentials."},
+        403: {"description": "Caller does not hold `members:manage` in this Workspace."},
+        404: {"description": "No such Member in this Workspace."},
+    },
+)
+async def change_member_role(
+    member_id: uuid.UUID,
+    payload: MemberRoleUpdate,
+    service: Annotated[MemberService, Depends(get_member_service)],
+) -> MemberRead:
+    """Set a Member's role. Takes effect on that member's very next request.
+
+    The role is read from the persisted row on every authorization check (M1.2-E), so a
+    demotion binds immediately — there is no cached role and nothing to invalidate.
+
+    **No role-transition rules are enforced**, and that is deliberate rather than an
+    oversight: no canonical document defines whether an admin may re-role an owner, or
+    whether the last owner may be demoted. `MemberService` records both as open questions.
+    Inventing them here would place authorization policy in an HTTP adapter and prejudge a
+    decision that belongs in SECURITY.md §4.1.
+    """
+    member = await service.change_member_role(member_id, payload.role)
+    return MemberRead.model_validate(member)
+
+
+@members_router.delete(
+    "/{member_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Remove a Member from the Workspace",
+    responses={
+        204: {"description": "Removed."},
+        400: {"description": "Malformed member id."},
+        401: {"description": "Missing or invalid credentials."},
+        403: {"description": "Caller does not hold `members:manage` in this Workspace."},
+        404: {"description": "No such Member in this Workspace."},
+    },
+)
+async def remove_member(
+    member_id: uuid.UUID,
+    service: Annotated[MemberService, Depends(get_member_service)],
+) -> None:
+    """Remove a Member. Their membership, and the authority it carried, ends immediately.
+
+    **404 for a Member that is absent *or* belongs to another Workspace**, byte-identical in
+    both cases. API_GUIDELINES.md §2 also says "deleting a deleted resource is 204", but the
+    same section requires cross-tenant access to answer 404 — and for a hard-deleted row,
+    "already deleted", "never existed" and "not yours" are indistinguishable. Answering 204
+    for absence would therefore mean answering 204 for another tenant's id too, or
+    distinguishing them and becoming the existence oracle SECURITY.md §3 forbids. Security
+    wins, matching ADR-0012's treatment of the analogous token endpoint.
+
+    Removing a Member does **not** revoke the API tokens they created: those are
+    workspace-owned credentials whose provenance is simply cleared (M1.2-A's composite FK
+    with `ON DELETE SET NULL`). Revoking them is a separate, explicit act.
+    """
+    await service.remove_member(member_id)
 
 
 def get_api_token_service(
@@ -248,4 +423,140 @@ async def create_api_token(
     )
 
 
-__all__ = ["WorkspaceContext", "api_tokens_router", "router"]
+invitations_router = APIRouter(prefix="/v1/invitations", tags=["invitations"])
+
+
+def get_invitation_service(
+    uow: Annotated[UnitOfWork, Depends(get_uow)],
+    ctx: AuthorizedMemberAdmin,
+    email_sender: Annotated[EmailSender, Depends(get_email_sender)],
+) -> InvitationService:
+    """Composition root for invitation management (ADR-0017 §8).
+
+    Gated by `AuthorizedMemberAdmin` (`members:manage`) exactly like member management —
+    creating, listing, and cancelling invitations is managing who belongs to the workspace.
+    The permission is checked before the service is built, so an unauthorized caller never
+    reaches the logic.
+    """
+    return InvitationService(InvitationRepository(uow.session, ctx), email_sender)
+
+
+@invitations_router.post(
+    "",
+    response_model=InvitationRead,
+    status_code=status.HTTP_201_CREATED,
+    summary="Invite a person to the Workspace by email",
+    responses={
+        201: {"description": "Created and emailed. The token is never in the response."},
+        400: {"description": "Invalid email, unknown role, or a server-owned field."},
+        401: {"description": "Missing or invalid credentials."},
+        403: {"description": "Caller does not hold `members:manage` in this Workspace."},
+        409: {"description": "A pending invitation already exists for that email here."},
+    },
+)
+async def create_invitation(
+    payload: InvitationCreate,
+    ctx: AuthorizedMemberAdmin,
+    service: Annotated[InvitationService, Depends(get_invitation_service)],
+) -> InvitationRead:
+    """Create a targeted invitation and email it (ADR-0017).
+
+    The Workspace is the `X-Workspace-Id` selection, the inviter is the authenticated
+    member (`ctx.caller.member_id`, never a request field), and the role is server-persisted
+    at creation — the recipient can neither see nor change it. The response is the invitation
+    record **without** the token: the raw token exists only in the email and is never
+    returned or logged.
+    """
+    issued = await service.invite(
+        email=payload.email, role=payload.role, invited_by=ctx.caller.member_id
+    )
+    return InvitationRead.model_validate(issued.invitation)
+
+
+@invitations_router.get(
+    "",
+    response_model=InvitationList,
+    summary="List this Workspace's pending invitations",
+    responses={
+        200: {"description": "Pending invitations for the selected Workspace, newest first."},
+        401: {"description": "Missing or invalid credentials."},
+        403: {"description": "Caller does not hold `members:manage` in this Workspace."},
+    },
+)
+async def list_invitations(
+    service: Annotated[InvitationService, Depends(get_invitation_service)],
+    _: Annotated[None, Depends(reject_unknown_query_params)],
+) -> InvitationList:
+    """Pending invitations for the selected Workspace only.
+
+    Workspace-scoped by the same context every management endpoint uses, so another
+    tenant's invitations are not a request this API can express. Tokens and hashes are
+    absent from `InvitationRead` by construction.
+    """
+    invitations = await service.list_pending()
+    return InvitationList(data=[InvitationRead.model_validate(i) for i in invitations])
+
+
+@invitations_router.delete(
+    "/{invitation_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Cancel a pending invitation",
+    responses={
+        204: {"description": "Cancelled. It can never be accepted."},
+        401: {"description": "Missing or invalid credentials."},
+        403: {"description": "Caller does not hold `members:manage` in this Workspace."},
+        404: {"description": "No such pending invitation in this Workspace."},
+    },
+)
+async def cancel_invitation(
+    invitation_id: uuid.UUID,
+    service: Annotated[InvitationService, Depends(get_invitation_service)],
+) -> Response:
+    """Cancel a pending invitation. Workspace-scoped: a foreign id is simply not found.
+
+    A cancelled invitation can never be accepted — its status leaves `pending`, so the
+    acceptance guard fails.
+    """
+    await service.cancel(invitation_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@invitations_router.post(
+    "/accept",
+    response_model=AcceptedInvitation,
+    summary="Accept an invitation and join the Workspace",
+    responses={
+        200: {"description": "Joined. Returns the workspace and the granted role."},
+        401: {"description": "Missing or invalid human credential."},
+        404: {"description": "Invitation not found or not acceptable (uniform, no oracle)."},
+        409: {"description": "You are already a member of this Workspace."},
+    },
+)
+async def accept_invitation(
+    payload: InvitationAccept,
+    identity: CurrentHumanIdentity,
+    uow: Annotated[UnitOfWork, Depends(get_uow)],
+    request: Request,
+) -> AcceptedInvitation:
+    """Accept an invitation with the token from its email (ADR-0017 §8).
+
+    Not workspace-scoped and not RBAC-gated: the invitation, resolved from its token,
+    establishes the Workspace, and the gate is the verified-email binding, not a permission.
+    The token is in the body — never the URL — so it stays out of access logs. The whole
+    sequence (resolve, verify email, bind, consume, create membership) is one transaction;
+    any failure rolls all of it back. Every unacceptable case returns the one uniform 404.
+    """
+    request_id: str = getattr(request.state, "request_id", "")
+    result = await InvitationAcceptanceService(uow).accept(
+        token=payload.token, identity=identity, request_id=request_id
+    )
+    return AcceptedInvitation(workspace_id=result.workspace_id, role=result.role)
+
+
+__all__ = [
+    "WorkspaceContext",
+    "api_tokens_router",
+    "invitations_router",
+    "members_router",
+    "router",
+]

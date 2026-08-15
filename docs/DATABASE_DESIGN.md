@@ -109,6 +109,27 @@ would also target `NOT NULL` `workspace_id` and make member removal fail, while 
 would silently revoke every token an offboarded member issued. Tokens are workspace-owned;
 revocation is a separate, explicit act.
 
+### invitations
+A pending invitation for a person (by email) to join a Workspace as a Member (ADR-0017).
+Columns: `id`, `workspace_id`, `invited_email` (lower-cased at creation), `role`
+(`owner|admin|member|viewer`, CHECK against the canonical domain), `invited_by NULL`,
+`token_hash` (SHA-256 of a 256-bit token; the raw token is delivered by email and never
+stored), `status` (`pending|accepted|cancelled`, CHECK), `expires_at`, `accepted_at NULL`,
+`cancelled_at NULL`, `created_at`. Unique on `token_hash`.
+
+`invited_by` uses the composite intra-tenant foreign key convention (§1) —
+`(workspace_id, invited_by) REFERENCES members (workspace_id, id)` with
+`ON DELETE SET NULL (invited_by)`, column-scoped (PG 15+) — for the same reason `api_tokens`
+does: foreign keys validate with RLS bypassed, so a single-column reference would let one
+Workspace name an inviter owned by another, and a bare `SET NULL` would wrongly target
+`NOT NULL` `workspace_id`. **At most one `pending` invitation per
+`(workspace_id, lower(invited_email))`** is enforced by a partial unique index
+(`WHERE status = 'pending'`), so re-inviting after an acceptance or cancellation is allowed
+while two live invitations for the same person — which could grant conflicting roles — are
+not. There is deliberately no `updated_at`: the lifecycle is captured by the explicit
+`accepted_at`/`cancelled_at` timestamps, and consumption is a guarded transition
+(`UPDATE … WHERE status = 'pending'`), the single-use arbiter under concurrent acceptance.
+
 ### connectors
 A definition of an external API: its Tools, auth requirements, and base config
 (Bible §4). Columns: `id`, `workspace_id`, `name`, `slug` (unique per workspace),
@@ -191,8 +212,10 @@ moves to a broker (ADR-0001).
   `ix_connections_workspace_status (workspace_id, status)`,
   `ix_tool_calls_workspace_created (workspace_id, created_at DESC)` for the log UI.
 - Lookups that arrive without workspace context first — `api_tokens.token_hash`,
-  `workspaces.slug` — get their own unique indexes; the resolved workspace scopes
-  everything after.
+  `invitations.token_hash`, `workspaces.slug` — get their own unique indexes; the resolved
+  workspace scopes everything after. `invitations` additionally carries the partial unique
+  index on `(workspace_id, lower(invited_email)) WHERE status = 'pending'`, which enforces
+  one-live-invite and serves the workspace-scoped pending listing.
 - `tool_calls` gets `(workspace_id, connection_id, created_at DESC)` for per-connection
   drill-down; partition pruning on `created_at` keeps these small.
 - `jsonb` columns get GIN indexes only when a real query needs them (none in v1);
@@ -271,17 +294,20 @@ read every tenant's rows. A suite that asserts only `rolsuper = false` passes gr
 isolation is entirely disabled. The integration suite therefore asserts **both** flags are
 false for its own connection before asserting anything about isolation.
 
-**Documented exemption.** Credentials that arrive without a workspace context (§4:
-`api_tokens.token_hash`) cannot be resolved under RLS, since the policy needs the workspace
-the lookup is trying to discover. Exactly one `SECURITY DEFINER` function per such lookup
-performs it, and its shape is deliberate: the function is owned by a dedicated **`NOLOGIN`
-role** (`omniai_auth`) that no one can connect as, and the table carries a second policy
-targeted `TO` that role alone. This grants the exemption through ordinary policy targeting
-rather than through `BYPASSRLS` — which needs superuser to grant and is frequently
-unavailable on managed Postgres. The function pins `SET search_path`, without which a
-caller controlling `search_path` could shadow the target table and have the function read
-it under another role's privileges. `EXECUTE` is revoked from `PUBLIC` and granted only to
-the application role. No other code path is exempt, and each exemption is reviewed as a
+**Documented exemption.** Credentials and tokens that arrive without a workspace context
+(§4: `api_tokens.token_hash`, and an invitation token at acceptance) cannot be resolved
+under RLS, since the policy needs the workspace the lookup is trying to discover. Exactly
+one `SECURITY DEFINER` function per such lookup performs it, and its shape is deliberate:
+the function is owned by a dedicated **`NOLOGIN` role** (`omniai_auth`) that no one can
+connect as, and the table carries a second policy targeted `TO` that role alone. This grants
+the exemption through ordinary policy targeting rather than through `BYPASSRLS` — which needs
+superuser to grant and is frequently unavailable on managed Postgres. The function pins
+`SET search_path`, without which a caller controlling `search_path` could shadow the target
+table and have the function read it under another role's privileges. `EXECUTE` is revoked
+from `PUBLIC` and granted only to the application role. Invitation acceptance adds the second
+such function, `auth.resolve_invitation` (migration 0006, M1.3-F): an accepting user is not
+yet a Member, so the token lookup is precisely what discovers their workspace, and it follows
+this identical shape. No other code path is exempt, and each exemption is reviewed as a
 security change.
 
 RLS policies are created in Alembic migrations like any other DDL and covered by

@@ -45,6 +45,9 @@ services:
       # Alembic only. Owns the schema; never serves a request.
       DATABASE_ADMIN_URL: postgresql+asyncpg://omniai:omniai@db:5432/omniai
       REDIS_URL: redis://redis:6379/0
+      # JWKS fetch address inside the compose network (ADR-0015 §5). The public
+      # issuer stays BETTER_AUTH_URL; only the fetch location differs in here.
+      BETTER_AUTH_JWKS_URL: http://web:3000/api/auth/jwks
     ports:
       - "8000:8000"
     depends_on:
