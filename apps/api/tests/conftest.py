@@ -39,6 +39,7 @@ from sqlalchemy.ext.asyncio import (
 from app.core import human_auth, readiness
 from app.core.config import settings
 from app.core.db import UnitOfWork, get_uow
+from app.core.events import current_sink, event_bus
 from app.core.human_auth import get_jwks_cache
 from app.core.ids import new_id
 from app.core.logging import configure_logging
@@ -331,8 +332,18 @@ async def client(app_engine: AsyncEngine) -> AsyncIterator[AsyncClient]:
     factory = async_sessionmaker(app_engine, expire_on_commit=False, autoflush=False)
 
     async def override_get_uow() -> AsyncIterator[UnitOfWork]:
+        # Faithfully mirror app.core.db.get_uow — including the ambient event sink and the
+        # post-commit dispatch — so request-path domain events (e.g. connector.ingested,
+        # M1.4-B1) actually fire in tests. A no-op for endpoints that buffer nothing.
         async with factory() as session, session.begin():
-            yield UnitOfWork(session=session)
+            uow = UnitOfWork(session=session)
+            previous = current_sink.get()
+            current_sink.set(uow)
+            try:
+                yield uow
+            finally:
+                current_sink.set(previous)
+        await event_bus.dispatch(uow.drain_events())
 
     app.dependency_overrides[get_uow] = override_get_uow
     try:

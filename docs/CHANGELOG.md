@@ -13,6 +13,26 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Connector ingestion: OpenAPI 3.0 → canonical Tool Schema (M1.4-B1.1, ADR-0025).** The first
+  real ingestion pipeline — `POST /v1/connectors/{id}/versions` (async, `connectors:manage`,
+  returns 202 + `ingesting`) composes the foundation: guarded fetch (B0.1) → hostile-input parse +
+  deterministic normalize → `spec_hash` dedup → store raw (B0.5) → persist an immutable
+  `connector_versions` row (migration 0008, RLS `ENABLE`+`FORCE`, INSERT/SELECT-only grants,
+  composite intra-tenant FKs) + advance the connector `ingesting → active` → post-commit
+  `connector.ingested {connector_id, connector_version, spec_hash}` (B0.4), all under the worker
+  tenant context (B0.3). The parser (`domains/connectors/openapi.py`) treats the spec as hostile:
+  JSON/YAML via a hardened `SafeLoader` (no anchors/aliases, no `!!python/...` — no code execution),
+  bounded raw size/depth/`$ref` depth+count, non-finite refused, **local `$ref` only** (remote
+  refused and unfetchable — the resolver has no network capability), cycles broken. Normalization is
+  deterministic (one Tool per `(path, method)`, `{connector_slug}_{op_slug}` names, params+body →
+  `input_schema` + `endpoint.binding`, `security→auth`, `servers→base_url`, safety annotations);
+  `spec_hash` is version-independent so a no-op re-sync creates no version, a changed spec appends
+  the next monotonic version. A hard failure moves the connector to `failed` with a safe
+  `reason_code` (no stack traces/URLs/secrets) + `connector.ingestion_failed`. Proven by 55 tests
+  (37 adversarial parser + 10 real-Postgres+MinIO pipeline incl. tenant isolation + A×8/B×8
+  concurrency + 8 real-HTTP endpoint), a 21-mutation audit with **0 survivors**, and a live
+  real-worker run. One dependency (`pyyaml`, `safe_load` only). **Deferred to B1.2+:** file upload,
+  remote `$ref`, Swagger 2 → OpenAPI 3, OpenAPI 3.1, `diff_summary`/promotion, the `tools` table.
 - **Object storage + tenant-key isolation (M1.4-B0.5, ADR-0024).** One `ObjectStore` abstraction
   (`app/core/object_store.py`) over the S3 API — Cloudflare R2 in production, MinIO in local/CI,
   differing only by `R2_ENDPOINT`. `aioboto3` is the only S3 SDK and is confined to this module (no

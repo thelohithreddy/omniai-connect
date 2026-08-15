@@ -19,7 +19,12 @@ from app.core.exceptions import ValidationFailedError
 from app.core.pagination import DEFAULT_LIMIT, MAX_LIMIT
 from app.core.security import WorkspaceContext
 from app.domains.connectors.repository import ConnectorRepository
-from app.domains.connectors.schemas import ConnectorCreate, ConnectorList, ConnectorRead
+from app.domains.connectors.schemas import (
+    ConnectorCreate,
+    ConnectorList,
+    ConnectorRead,
+    IngestVersionRequest,
+)
 from app.domains.connectors.service import ConnectorService
 
 connectors_router = APIRouter(prefix="/v1/connectors", tags=["connectors"])
@@ -125,6 +130,46 @@ async def list_connectors(
         next_cursor=page.next_cursor,
         has_more=page.has_more,
     )
+
+
+@connectors_router.post(
+    "/{connector_id}/versions",
+    response_model=ConnectorRead,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Ingest an OpenAPI spec (async)",
+    responses={
+        202: {
+            "description": "Accepted; the Connector is now `ingesting`. The Celery pipeline "
+            "fetches, normalizes, persists a new immutable version, and publishes "
+            "`connector.ingested`. Poll the Connector for `active`/`failed`."
+        },
+        400: {"description": "source_url is missing or not https."},
+        401: {"description": "Missing or invalid credentials."},
+        403: {"description": "Caller does not hold `connectors:manage` in this Workspace."},
+        404: {"description": "No such live connector in this Workspace."},
+        409: {"description": "The Connector is already ingesting."},
+    },
+)
+async def ingest_connector_version(
+    connector_id: uuid.UUID,
+    payload: IngestVersionRequest,
+    service: Annotated[ConnectorService, Depends(get_connector_service)],
+    uow: Annotated[UnitOfWork, Depends(get_uow)],
+    ctx: AuthorizedConnectorAdmin,
+) -> ConnectorRead:
+    """Start asynchronous OpenAPI ingestion for a Connector (M1.4-B1.1).
+
+    The Connector transitions to `ingesting` and a post-commit trigger enqueues the Celery
+    pipeline (fetch via the guarded fetcher → normalize → persist an immutable `connector_versions`
+    row → `connector.ingested`). The workspace is the authenticated context — `source_url` names
+    only *where* to fetch, never *which tenant* — so a client cannot ingest into another Workspace.
+    Returns 202 with the Connector in `ingesting`; the terminal state (`active`/`failed`) is
+    reached by the worker.
+    """
+    connector = await service.request_ingestion(
+        uow, workspace_id=ctx.workspace_id, connector_id=connector_id, source_url=payload.source_url
+    )
+    return ConnectorRead.model_validate(connector)
 
 
 @connectors_router.get(

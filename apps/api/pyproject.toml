@@ -31,6 +31,10 @@ dependencies = [
     # pure-Python, so no wheel/compiler risk in the slim image. Isolated behind app.core
     # .object_store — no application code imports boto3/botocore directly (ADR-0024).
     "aioboto3>=13.0",
+    # OpenAPI/Swagger specs are JSON or YAML (M1.4-B1). PyYAML's `safe_load` is used
+    # exclusively — never `load`/`unsafe_load` — so a hostile spec cannot construct Python
+    # objects or execute code. Parsing is confined to app/domains/connectors/openapi.py.
+    "pyyaml>=6.0",
 ]
 
 [dependency-groups]
@@ -39,6 +43,7 @@ dev = [
     "pytest-asyncio>=0.25",
     "ruff>=0.8",
     "mypy>=1.14",
+    "types-pyyaml>=6.0",
 ]
 
 [tool.ruff]

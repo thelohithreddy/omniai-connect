@@ -79,6 +79,7 @@ def test_the_demo_tasks_are_registered() -> None:
         "workers.always_fails",
         "workers.retry_probe",
         "workers.count_visible_connectors",  # B0.3 tenant-boundary demo task
+        "workers.ingest_connector_spec",  # B1.1 connector ingestion pipeline
     }
 
 

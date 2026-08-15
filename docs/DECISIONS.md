@@ -1150,3 +1150,73 @@ unreachable-endpoint and wrong-credential failure without leakage) — plus a B0
 17 constructible mutations (16 killed; the lone survivor is inert, botocore selecting path-style for
 a bare-host MinIO endpoint regardless), and a live cross-tenant isolation run. The importer that
 first writes `raw_spec_ref` is M1.4-B1.
+
+## ADR-0025 — Connector ingestion: OpenAPI 3.0 → canonical Tool Schema (M1.4-B1.1)
+
+**Status:** Accepted (2026-08-16) · **Context:** M1.4-B1, the first real connector-ingestion
+pipeline (ROADMAP §M1, ADR-0003). B1 as canonically specified is an epic (OpenAPI 3.0 **and** 3.1,
+Swagger 2 → OpenAPI 3 conversion, remote `$ref` resolution, `diff_summary`/promotion, the `tools`
+denormalization table, scheduled re-sync), and its endpoint + event-payload contracts are not
+written in canon (§3 forbids inventing them). The founder ratified a bounded **first slice, B1.1**,
+and the two undefined contracts below. This ADR records B1.1; the rest are explicit follow-on
+slices (B1.2 upload + remote `$ref`; B1.3 Swagger→3; B1.4 diff/promotion + `tools`).
+
+**Decision (B1.1 scope):**
+
+1. **`connector_versions` (migration 0008).** The immutable ingested snapshot (DATABASE_DESIGN §5):
+   `version` (monotonic int per connector), `spec_hash`, `raw_spec_ref` (R2 key), `normalized_schema`
+   (jsonb Tool Schema set), `diff_summary` (jsonb, NULL until B1.4). RLS `ENABLE`+`FORCE` +
+   `tenant_isolation`; grants are **INSERT/SELECT only** (immutability enforced at the privilege
+   level — no UPDATE/DELETE). Composite intra-tenant FKs both ways (`(workspace_id, connector_id) →
+   connectors`, and the previously-deferred `connectors.current_version_id → connector_versions`,
+   P-43, `use_alter` for the cycle). No `tools` table (B1.4).
+
+2. **A hostile-input OpenAPI 3.0 parser + deterministic normalizer** (`domains/connectors/
+   openapi.py`), framework-free and with **no network capability** (it imports no HTTP library and
+   the `$ref` resolver is synchronous). Safety: JSON or YAML via a hardened `SafeLoader` that
+   refuses anchors/aliases (billion-laughs) and all `!!python/...` construction (no code execution);
+   bounded raw size (10 MB), structural depth (64), `$ref` depth (32) and count (10 000); non-finite
+   numbers refused; **local `$ref` only** (remote refs refused — and unfetchable regardless);
+   cycles broken. Normalization maps one Tool per `(path, method)` to the canonical Tool Schema
+   (CONNECTOR_SPECIFICATION §2): `name = {connector_slug}_{operation_slug}` (operationId → generated,
+   deterministic `_N` suffixes), params+requestBody merged into `input_schema` with `endpoint.binding`,
+   `security → auth`, `servers → base_url`, safety `annotations`. `spec_hash` = SHA-256 over the
+   canonical JSON (sorted keys, no whitespace) of the ordered set — **version-independent**, so it
+   dedupes no-op re-syncs (§3).
+
+3. **The pipeline composes the proven foundation** (`domains/connectors/ingestion.py`): guarded
+   fetch (B0.1, the only egress) → normalize → dedup → store raw (B0.5, key
+   `ws/<workspace_id>/connectors/<id>/specs/v<n>.json`) → persist `connector_versions` + advance
+   `connectors.current_version_id` and status `ingesting → active` → post-commit `connector.ingested`
+   (B0.4), all under the worker tenant context (B0.3). Same `spec_hash` as the current version →
+   no-op (no empty version); different → append version N+1. A hard `IngestionError` (safe
+   `reason_code`, never a stack trace/URL/secret) rolls back and, in a fresh transaction, moves the
+   connector to `failed` with a `connector.ingestion_failed` event. Ordering is honest: the spec is
+   fetched before the transaction; the object is written before COMMIT (an orphan on rollback is
+   documented, keyed by the not-yet-consumed version number so a retry overwrites it); no
+   distributed transaction is claimed.
+
+4. **Async endpoint** `POST /v1/connectors/{connector_id}/versions` (the ratified contract), gated
+   by the existing `connectors:manage` (owner/admin) — no new authorization. It transitions the
+   connector to `ingesting` and **buffers a post-commit trigger** that enqueues the Celery task, so
+   the worker never reads the connector before the transition is durable and a rolled-back request
+   enqueues nothing. Returns 202 with the connector in `ingesting`; the terminal state is the
+   worker's. The `workspace_id` is the authenticated context — `source_url` names *where* to fetch,
+   never *which tenant*.
+
+5. **Ratified contracts (were undefined in canon).** `connector.ingested` payload =
+   `{connector_id, connector_version, spec_hash}` (+ envelope); `connector.ingestion_failed` =
+   `{connector_id, reason_code}` — no secrets, no raw spec. Endpoint as in (4).
+
+**Consequences:** One migration (0008, reversible, one head); one dependency (`pyyaml`, `safe_load`
+only, confined to `openapi.py`); no new SECURITY DEFINER, no new DB role, no new RBAC/auth, RLS/
+catalog otherwise unchanged. `event_bus.publish`'s ambient-sink contextvar does not cross FastAPI's
+DI boundary, so the request path buffers via the held `uow.buffer_event` (the worker path is
+unaffected); the test `get_uow` override was made faithful to production (it now dispatches
+post-commit). Proven by 55 tests — 37 parser/normalizer unit (adversarial: size/depth/alias/
+non-finite/remote-cyclic-missing-ref bombs; determinism; mapping), 10 real-Postgres+MinIO pipeline
+(persist/activate, dedup no-op, version append, tenant isolation under RLS, storage-key isolation,
+failure→failed, A×8/B×8 concurrency), 8 real-HTTP endpoint (202/RBAC/404/409/400, no smuggled
+workspace) — a 21-mutation B1.1 audit with **0 survivors**, and a live real-worker ingestion run.
+Deferred to B1.2+: file upload, remote `$ref`, Swagger 2 → OpenAPI 3, OpenAPI 3.1, `diff_summary`/
+promotion, the `tools` table, scheduled re-sync — none started.

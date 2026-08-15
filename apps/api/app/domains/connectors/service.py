@@ -17,7 +17,8 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
-from app.core.exceptions import NotFoundError, ValidationFailedError
+from app.core.db import UnitOfWork
+from app.core.exceptions import ConflictError, NotFoundError, ValidationFailedError
 from app.core.pagination import (
     DEFAULT_LIMIT,
     CursorPosition,
@@ -25,6 +26,7 @@ from app.core.pagination import (
     encode_cursor,
     resolve_limit,
 )
+from app.domains.connectors.events import connector_ingestion_requested
 from app.domains.connectors.models import Connector
 from app.domains.connectors.repository import ConnectorRepository
 
@@ -158,6 +160,38 @@ class ConnectorService:
         """Soft-delete a live Connector. A foreign or already-deleted id is a uniform 404."""
         if not await self._repository.soft_delete(connector_id):
             raise NotFoundError("Connector not found.")
+
+    async def request_ingestion(
+        self, uow: UnitOfWork, *, workspace_id: uuid.UUID, connector_id: uuid.UUID, source_url: str
+    ) -> Connector:
+        """Start asynchronous OpenAPI ingestion for a live Connector (M1.4-B1.1).
+
+        Transitions the Connector to `ingesting` and buffers a post-commit trigger that enqueues
+        the Celery pipeline — so the worker never sees the Connector before the transition is
+        durable, and a rolled-back request enqueues nothing. `source_url`'s egress safety is the
+        guarded fetcher's concern (B0.1) at fetch time, not this trigger. `workspace_id` is the
+        request's trusted context, used only for the (worker-re-validated) task tenant — never to
+        form a tenant query (the repository's context still governs every read/write).
+
+        The trigger is buffered directly on the request `uow` (the FastAPI dependency injects the
+        same UoW the repository uses), not via the ambient-sink `event_bus.publish` — a dependency
+        generator's contextvar does not propagate across FastAPI's DI boundary into the handler.
+        `uow.buffer_event` still enforces the workspace-match (the event's tenant must equal the
+        transaction's bound tenant, ADR-0022).
+
+        A Connector already `ingesting` is a 409 (its run is the concurrency lock); a foreign or
+        deleted id is a uniform 404.
+        """
+        connector = await self._repository.get(connector_id)
+        if connector is None:
+            raise NotFoundError("Connector not found.")
+        if not await self._repository.mark_ingesting(connector_id):
+            raise ConflictError(
+                "Connector is already ingesting.", details={"status": connector.status}
+            )
+        uow.buffer_event(connector_ingestion_requested(workspace_id, connector_id, source_url))
+        connector.status = "ingesting"
+        return connector
 
 
 __all__ = ["ConnectorPage", "ConnectorService", "validate_base_url"]

@@ -11,6 +11,7 @@ Nothing here logs a payload dump: only the task's own id (via Celery) and non-se
 from __future__ import annotations
 
 import asyncio
+import uuid
 
 import structlog
 from sqlalchemy import text
@@ -34,6 +35,39 @@ def ping(nonce: str) -> dict[str, str]:
     """
     log.info("worker.ping", nonce=nonce)
     return {"pong": nonce}
+
+
+@celery_app.task(name="workers.ingest_connector_spec")
+def ingest_connector_spec(
+    workspace_id: str, connector_id: str, source_url: str
+) -> dict[str, object]:
+    """Ingest an OpenAPI spec for a connector (M1.4-B1.1). Runs the full pipeline under the worker
+    tenant context: fetch (B0.1) → normalize → dedup → store (B0.5) → persist connector_versions
+    → post-commit `connector.ingested` (B0.4).
+
+    Tenant authority is the server-established `workspace_id` (from the enqueuer, validated by the
+    worker context) — never `source_url`, the spec, or a payload role. A hard `IngestionError`
+    moves the connector to `failed` in a fresh transaction (no partial version persists); the
+    payload carries no secret. Logs only non-secret ids (never the URL or spec body)."""
+    from app.domains.connectors.ingestion import IngestionError, ingest_from_url, mark_failed
+
+    async def _run() -> dict[str, object]:
+        wid, cid = uuid.UUID(workspace_id), uuid.UUID(connector_id)
+        try:
+            async with worker_tenant_uow(workspace_id) as uow:
+                result = await ingest_from_url(uow, wid, cid, source_url)
+            log.info("connector.ingested", connector_id=connector_id, status=result.status)
+            return {"status": result.status, "version": result.version}
+        except IngestionError as exc:
+            # The ingesting transaction rolled back; record failure in a fresh one.
+            async with worker_tenant_uow(workspace_id) as uow:
+                await mark_failed(uow, wid, cid, exc.reason_code)
+            log.warning(
+                "connector.ingestion_failed", connector_id=connector_id, reason=exc.reason_code
+            )
+            return {"status": "failed", "reason": exc.reason_code}
+
+    return asyncio.run(_run())
 
 
 @celery_app.task(name="workers.count_visible_connectors")
@@ -89,4 +123,11 @@ def retry_probe(self: object, marker: str) -> str:  # noqa: ARG001
     raise TransientTaskError(marker)
 
 
-__all__ = ["TransientTaskError", "always_fails", "ping", "retry_probe"]
+__all__ = [
+    "TransientTaskError",
+    "always_fails",
+    "count_visible_connectors",
+    "ingest_connector_spec",
+    "ping",
+    "retry_probe",
+]
