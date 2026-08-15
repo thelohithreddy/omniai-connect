@@ -359,6 +359,24 @@ async def test_an_unknown_kid_is_rejected_after_one_refresh(
     assert jwks_endpoint.calls == 1
 
 
+async def test_a_non_string_kid_is_a_clean_401_never_a_crash(
+    authority: SigningAuthority, jwks_endpoint: FakeJWKSEndpoint
+) -> None:
+    """A crafted header whose `kid` is not a string is a uniform 401 — never a 500.
+
+    The header is attacker-controlled JSON, so `kid` can be any type, including an unhashable
+    list/dict that would raise `TypeError` if it reached the cache's `kid in self._keys` lookup.
+    Two independent layers prevent that: PyJWT's `get_unverified_header` rejects a non-string
+    `kid` as malformed, and the verifier's own `isinstance(kid, str)` guard would too. This pins
+    the observable guarantee — a crafted-type `kid` is a clean `UnauthorizedError`, never a
+    leaked exception — so neither layer can be dropped without a test noticing the 500 risk.
+    `expect_rejection` accepts only `UnauthorizedError`.
+    """
+    for bad_kid in (123, ["not", "a", "string"], {"nested": "object"}):
+        token = rewrite_segment(authority.sign(), 0, {"kid": bad_kid})
+        await expect_rejection(token, jwks_endpoint.cache())
+
+
 async def test_attacker_supplied_jku_and_x5u_are_ignored(
     authority: SigningAuthority, jwks_endpoint: FakeJWKSEndpoint
 ) -> None:

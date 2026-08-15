@@ -45,7 +45,9 @@ table and role matrix, `api_tokens` issue/revoke endpoints, `/health/ready`.
 **M1.3+** — OpenAPI ingestion with api_key auth, Execution Runtime v1, audit log, minimal
 dashboard slice. docs/ROADMAP.md remains authoritative for M1 scope.
 
-_M1.3-A/B/C/D/E/F complete on feature branches (member endpoints, human JWT verification, X-Workspace-Id selection, Better Auth web integration, human authorization integration, workspace invitations). main remains 236dc48; none merged._
+_M1.3-A/B/C/D/E/F/G complete on feature branches (member endpoints, human JWT verification, X-Workspace-Id selection, Better Auth web integration, human authorization integration, workspace invitations, session security hardening). main remains 236dc48; none merged._
+
+_M1.3-G (session security hardening, ADR-0018) locked the human session/JWT revocation boundary with tests, hardened the duplicate-`Authorization` header (fail-closed), and recorded the deferred, topology-/product-dependent decisions (deployment origin topology & CORS, immediate JWT revocation, rate limiting, security headers, session-lifetime cap, account-lifecycle) rather than inventing them. No migration; one production-code change._
 
 ## Architecture decisions
 

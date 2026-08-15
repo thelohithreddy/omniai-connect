@@ -13,6 +13,29 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Human session security hardening (M1.3-G, ADR-0018).** Lifecycle hardening *around* the
+  released human-auth architecture (Better Auth → EdDSA JWT/JWKS → `X-Workspace-Id` → membership
+  → role → RBAC → RLS) — not a redesign. Discovery (7-agent map + a live-stack probe) confirmed
+  the core is sound; this locks the settled behavior with tests and closes one asymmetry.
+  - **Duplicate `Authorization` header is now rejected, fail-closed** (`extract_bearer_token`).
+    A smuggled second `Bearer` can no longer be silently resolved to the first — the identical
+    rule ADR-0016 §3 already applies to `X-Workspace-Id`. This is the only production-code change.
+  - **The session/JWT revocation boundary is now a tested invariant (ADR-0018):** logout deletes
+    the Better Auth session and clears cookies so **no new JWT can be minted**, but an
+    already-issued JWT stays valid on the API until its **900 s (15 min)** `exp` — the API holds
+    no session state (there is no stateful JWT revocation; the short TTL is the mitigation, Member
+    removal is the immediate lever, and clearing `identity.jwks` is the break-glass lever).
+  - **New regression/E2E tests** (real Better Auth) pin: the revocation boundary, the 900 s
+    lifetime, logout→no-new-JWT, session-token rotation (fixation), the API being
+    `Bearer`-only (a session cookie never authenticates it), and a non-string `kid` being a clean
+    401 (never a 500).
+  - **Adversarial G-series mutation audit (G01–G70): 0 meaningful survivors** (11 constructible
+    mutations killed; 3 inert redundant-defense mutations classified honestly).
+  - **Documented, not invented:** SECURITY.md §4.8 + ADR-0018 record the session model and every
+    deferred, topology-/product-dependent decision (deployment origin topology & CORS,
+    immediate revocation, rate limiting → Cloudflare WAF, security headers, session-lifetime cap,
+    password reset, account disable/delete, social OAuth). No migration; no schema change.
+
 - **Human workspace invitations (M1.3-F, ADR-0017).** A `members:manage` owner/admin invites
   a person to a Workspace by email; that person accepts with a verified Better Auth identity
   and becomes a Member. The invitation is a temporary membership-establishment mechanism — the

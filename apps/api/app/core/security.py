@@ -128,10 +128,23 @@ def generate_invitation_token() -> str:
 
 
 def extract_bearer_token(request: Request) -> str:
-    header = request.headers.get("Authorization")
-    if not header:
+    """The one presented Bearer credential, or a 401.
+
+    `Headers.get()` silently returns only the FIRST of repeated headers, so relying on it
+    would let `Authorization: Bearer <A>` + `Authorization: Bearer <B>` bind whichever the
+    framework or an upstream proxy happened to order first — the same "silently reconciled"
+    ambiguity ADR-0016 §3 forbids for `X-Workspace-Id`. A credential header is exactly as
+    security-critical, so it gets the identical treatment (mirrors `_read_selected_workspace`):
+    take the full list and reject anything that is not exactly one value. Ambiguity denies,
+    fail-closed. (A single comma-folded `"Bearer A, Bearer B"` line survives the count check but
+    parses to one non-matching opaque credential, so it too fails resolution — never binds A.)
+    """
+    values = request.headers.getlist("Authorization")
+    if not values:
         raise UnauthorizedError("Missing Authorization header.")
-    scheme, _, credential = header.partition(" ")
+    if len(values) > 1:
+        raise UnauthorizedError("A single Authorization header is required.")
+    scheme, _, credential = values[0].partition(" ")
     if scheme.lower() != "bearer" or not credential.strip():
         raise UnauthorizedError("Authorization header must be 'Bearer <token>'.")
     return credential.strip()

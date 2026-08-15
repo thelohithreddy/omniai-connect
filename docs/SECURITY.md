@@ -383,6 +383,44 @@ RBAC → RLS) is unchanged.
   class as the JWKS fetch (§6 permits first-party calls). The Resend key, the raw token, and
   the invite URL never appear in logs.
 
+### 4.8 Human session and JWT lifecycle (ADR-0018)
+
+The human plane is Better Auth (session + cookie) in the web tier and a short-lived EdDSA JWT
+at the API; the two are distinct credentials with distinct lifetimes. M1.3-G pins the boundary
+between them.
+
+- **The API is `Authorization: Bearer`-only.** It never reads the Better Auth session cookie,
+  so a stolen cookie is inert against the API and the machine/human planes cannot be confused.
+  A cookie presented alone is a `401` (missing credential); a cookie value smuggled into the
+  Bearer slot is neither an `omc_` token nor a JWT and fails the uniform human `401`.
+- **A duplicate `Authorization` header is refused, fail-closed.** Two credential headers are
+  never silently resolved to the first — the same rule §4.2 / ADR-0016 §3 apply to
+  `X-Workspace-Id`. Ambiguity denies.
+- **JWT lifetime is 900 s (15 min).** The verifier enforces `exp` (plus issuer/audience/EdDSA);
+  nothing extends it.
+- **Logout revokes the session, not outstanding JWTs.** Sign-out deletes the Better Auth
+  session row and clears the session cookies, so **no new JWT can be minted** afterward — but an
+  **already-issued JWT stays valid on the API until its `exp`** (≤ 15 min). This is the
+  deliberate, documented consequence of a stateless verifier that holds no session state and
+  cannot read the `identity` schema (ADR-0014): there is **no immediate JWT revocation**. The
+  short TTL bounds the replay window. This boundary is claimed here *only because it is
+  empirically tested*, not assumed.
+- **Immediate lockout is Member removal.** Removing the membership denies the caller on their
+  very next request (the role is read from the row every time, §4.2). That is the fast lever;
+  JWT expiry is the slow one.
+- **Break-glass (all sessions at once).** To invalidate *every* outstanding JWT before its exp,
+  an operator removes the signing key from `identity.jwks`; propagation is bounded by the 300 s
+  JWKS cache TTL. Rotating `BETTER_AUTH_SECRET` alone breaks *signing*, not verification, so it
+  is **not** a revocation lever. This is an operator action, not an application feature.
+- **Session fixation is resisted:** no cookie is set before authentication and each login mints
+  a fresh session token.
+- **CORS/CSRF posture.** The API configures no CORS (it is server-to-server; a Bearer API has no
+  cookie for a foreign origin to abuse, and browsers cannot cross-origin-read it). Better Auth's
+  own Origin check defends its cookie-authenticated endpoints. Both depend on a deployment origin
+  topology that is **not yet decided** — see ADR-0018 for that and the other deferred lifecycle
+  decisions (immediate revocation, rate limiting, security headers, session-lifetime cap,
+  password reset, account disable/delete, social OAuth). None are silently defaulted.
+
 ## 5. Secrets handling rules
 
 1. Secrets live in `.env` files (local) and platform secret stores (Railway/Vercel) —

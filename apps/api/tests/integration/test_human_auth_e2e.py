@@ -182,6 +182,95 @@ async def test_provider_logout_does_not_invalidate_an_outstanding_jwt(
     )
 
 
+def _session_cookie(response: httpx.Response) -> str:
+    """The `better-auth.session_token=<value>` pair from a real Set-Cookie response."""
+    for header in response.headers.get_list("set-cookie"):
+        if header.startswith("better-auth.session_token="):
+            return header.split(";", 1)[0]
+    raise AssertionError("no session_token cookie was set")
+
+
+async def test_the_issued_jwt_lifetime_is_the_documented_bounded_window() -> None:
+    """The real provider issues a 900 s (15 min) JWT — the exact window the revocation
+    boundary depends on (ADR-0015, SECURITY.md ≤900s). Pinned against the live provider so a
+    Better Auth default change that widened the replay window forces the docs to change too.
+    """
+    import base64
+    import json
+
+    token, _sub = await real_human("ttl")
+    payload_raw = token.split(".")[1]
+    payload = json.loads(base64.urlsafe_b64decode(payload_raw + "=" * (-len(payload_raw) % 4)))
+    assert payload["exp"] - payload["iat"] == 900
+
+
+async def test_logout_kills_the_session_so_no_new_jwt_can_be_minted() -> None:
+    """The other half of the revocation boundary: sign-out deletes the session, so the old
+    cookie can no longer mint a *fresh* JWT (401). Together with
+    `test_provider_logout_does_not_invalidate_an_outstanding_jwt` this fully bounds the model:
+    already-issued JWTs live to exp; no new ones are obtainable after logout.
+    """
+    email = f"e2e-nonew-{uuid.uuid4().hex[:10]}@example.test"
+    password = f"pw-{uuid.uuid4()}"
+    async with httpx.AsyncClient(base_url=PROVIDER_BASE, timeout=10.0) as provider:
+        signup = await provider.post(
+            "/api/auth/sign-up/email",
+            json={"email": email, "password": password, "name": "NoNew"},
+            headers={"origin": settings.better_auth_url},
+        )
+        assert signup.status_code == 200
+        cookie = _session_cookie(signup)
+
+        # The live cookie mints a JWT...
+        assert (
+            await provider.get("/api/auth/token", headers={"cookie": cookie})
+        ).status_code == 200
+
+        signout = await provider.post(
+            "/api/auth/sign-out",
+            json={},
+            headers={"cookie": cookie, "origin": settings.better_auth_url},
+        )
+        assert signout.status_code == 200
+
+        # ...and after logout the same cookie can no longer obtain one.
+        denied = await provider.get("/api/auth/token", headers={"cookie": cookie})
+        assert denied.status_code == 401
+
+
+async def test_each_login_mints_a_fresh_session_token() -> None:
+    """Session-fixation resistance: no session cookie exists before authentication, and each
+    authentication issues a *new* session token — an attacker-fixed pre-login value can never
+    become the authenticated session (owned by Better Auth; pinned here against the live one).
+    """
+    email = f"e2e-fixation-{uuid.uuid4().hex[:10]}@example.test"
+    password = f"pw-{uuid.uuid4()}"
+    async with httpx.AsyncClient(base_url=PROVIDER_BASE, timeout=10.0) as provider:
+        # No anonymous session cookie is set before login.
+        pre = await provider.get(
+            "/api/auth/get-session", headers={"origin": settings.better_auth_url}
+        )
+        assert not pre.headers.get_list("set-cookie"), "no cookie must be set pre-authentication"
+
+        signup = await provider.post(
+            "/api/auth/sign-up/email",
+            json={"email": email, "password": password, "name": "Fix"},
+            headers={"origin": settings.better_auth_url},
+        )
+        assert signup.status_code == 200
+        first = _session_cookie(signup)
+
+        signin = await provider.post(
+            "/api/auth/sign-in/email",
+            json={"email": email, "password": password},
+            headers={"origin": settings.better_auth_url},
+        )
+        assert signin.status_code == 200
+        second = _session_cookie(signin)
+
+    assert first != second, "re-authentication must rotate the session token (no fixation)"
+
+
 async def test_the_real_jwks_contains_no_private_material(
     client: AsyncClient,
 ) -> None:

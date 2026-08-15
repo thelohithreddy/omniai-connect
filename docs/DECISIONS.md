@@ -722,3 +722,78 @@ Alembic. The verifier gains an identity-returning path (`resolve_human_subject` 
 returns only `sub`; a sibling returns `sub + email + email_verified` used solely by
 acceptance). No frontend UI ships (the dashboard is unbuilt); the accept URL targets a web
 route the dashboard will implement.
+
+---
+
+## ADR-0018 — Human session security boundary and deferred lifecycle decisions
+
+**Status:** Accepted (2026-08-15) · **Context:** M1.3-G
+
+**Context:** M1.3-A…F released the human-auth architecture (Better Auth → EdDSA JWT/JWKS →
+`X-Workspace-Id` → membership → persisted role → RBAC → RLS) and workspace invitations.
+M1.3-G is *lifecycle hardening around that architecture*, not a redesign. Discovery (7-agent
+static map + a live-stack probe of the running Better Auth and API) confirmed the core is
+sound but that the **session/JWT revocation boundary was documented in prose (ADR-0015) yet
+unpinned by tests**, that the credential-header parsing was asymmetric with the ratified
+duplicate-header rule (ADR-0016 §3), and that a large set of lifecycle concerns are genuinely
+**undefined and depend on a production deployment topology that is not yet decided**. The
+founder ratified the scope below rather than have any undefined security semantic invented.
+
+**Decision:**
+
+1. **The revocation boundary is stateless and bounded, and is now a tested invariant.**
+   Sign-out deletes the Better Auth session row and clears the session cookies; an
+   **already-issued JWT remains a valid bearer credential on the API until its `exp`
+   (900 s / 15 min)**, because the API verifies signatures and pinned claims against JWKS and
+   deliberately holds **no session state** (it cannot even read the `identity` schema, ADR-0014).
+   There is **no stateful JWT revocation**. Empirically verified and pinned by tests:
+   `test_provider_logout_does_not_invalidate_an_outstanding_jwt` (JWT survives to exp),
+   `test_logout_kills_the_session_so_no_new_jwt_can_be_minted` (session dead → no new JWTs),
+   `test_the_issued_jwt_lifetime_is_the_documented_bounded_window` (== 900 s). The short TTL is
+   the mitigation; immediate per-workspace lockout is **Member removal** (next-request effect,
+   already tested). This ratifies ADR-0015's stated intent; it does **not** add a denylist.
+
+2. **Break-glass revocation lever.** The only way to invalidate *all* outstanding JWTs before
+   their exp is to remove the signing key from `identity.jwks` (rotating `BETTER_AUTH_SECRET`
+   alone breaks *signing*, not verification); propagation is bounded by the 300 s JWKS TTL.
+   This is an operator runbook step, documented in SECURITY.md, not an application feature.
+
+3. **A duplicate `Authorization` header is rejected, fail-closed.** `extract_bearer_token`
+   now reads the full header list and refuses anything that is not exactly one value — the
+   identical treatment ADR-0016 §3 already mandates for `X-Workspace-Id`, extended to the
+   credential header so a smuggled second `Bearer` can never be silently resolved to the
+   first. This applies an existing ratified invariant; it introduces no new security semantic.
+
+4. **The API is `Authorization: Bearer`-only.** It never reads the session cookie, so the
+   browser credential is inert against it and the machine/human planes cannot be confused
+   (reaffirming ADR-0002/0015; pinned by `test_a_session_cookie_alone_does_not_authenticate_the_api`).
+
+5. **Session fixation resistance is delegated to Better Auth and pinned.** No cookie is set
+   before authentication and each authentication mints a fresh session token
+   (`test_each_login_mints_a_fresh_session_token`).
+
+**Deferred by ratification (explicitly undecided — no invented defaults; each needs its own
+decision/ADR before it ships):**
+
+- **Deployment origin topology** — undecided. Until it is, the API stays server-to-server with
+  **no CORS** (fail-safe: browsers cannot cross-origin-read a Bearer API), and no browser-direct
+  cross-origin call is supported. This one decision gates CORS, Better Auth `trustedOrigins`,
+  cookie `SameSite`/`Domain`, and security-header ownership.
+- **Immediate JWT revocation (denylist / session-introspection)** — not built; the bounded
+  15-min replay is accepted (decision 1). Revisit if the GA threat model requires sub-exp lockout.
+- **Rate limiting / abuse controls** — deferred to the Cloudflare WAF (SECURITY.md §1.2) plus
+  Better Auth's production limiter; a shared-store (Redis) limiter is tracked as tech debt. No
+  parallel in-app mechanism is introduced (per the M1.3-G scope).
+- **Security response headers (HSTS/CSP/X-Frame-Options/etc.)** — ownership (edge vs app)
+  undecided; HSTS is an edge/TLS concern and CSP needs the (unbuilt) dashboard.
+- **Session lifetime policy** — the Better Auth default (7-day rolling) stands; an absolute cap
+  / idle timeout is a future UX+security decision.
+- **Account-lifecycle features** — self-serve password reset, account disable/delete, social
+  OAuth (PRD FR-CP-1, a later milestone), and a concurrent-session cap / "sign out everywhere"
+  are unbuilt and out of this module.
+
+**Consequences:** No migration and no schema change (`alembic check` clean). One production-code
+change (`extract_bearer_token`, decision 3). New tests lock the boundary, the duplicate-header
+rule, the cookie-is-not-a-credential rule, session rotation, and the non-string-`kid` no-crash
+property. This ADR is the single reference for "what the human session security model actually
+guarantees" and for the deferred decisions; SECURITY.md §4.8 mirrors it operationally.
