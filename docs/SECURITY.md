@@ -277,10 +277,12 @@ a machine credential. Three properties hold at that endpoint:
   creation schema forbids unknown fields, so an attempt to supply `created_by_member_id`,
   `scopes`, or a chosen `token` is a `400 validation_error` rather than a silent no-op.
 - **A token cannot mint another token.** Machine identity resolves to no membership
-  (ADR-0002), so a leaked credential cannot issue a successor that would survive revoking
-  the original. This is a deliberate consequence of the two identity planes, not an
-  oversight: until human authentication lands (M1.2-G), the only way to issue a token is
-  the bootstrap script.
+  (ADR-0002), so a leaked credential is denied `api_tokens:manage` and cannot issue a
+  successor that would survive revoking the original. This is a deliberate consequence of
+  the two identity planes. Since M1.3-B/C, token issuance is available to **human** members
+  holding `api_tokens:manage` (owner/admin) — authenticated by JWT, scoped by
+  `X-Workspace-Id`, and recorded with the creating member's id — alongside the bootstrap
+  script that seeds a workspace's first token before any Member exists.
 
 Tokens are currently issued **unscoped** (`scopes = []`). A scope vocabulary is not yet
 defined (ADR-0010) — and `[]` is the deny-by-default

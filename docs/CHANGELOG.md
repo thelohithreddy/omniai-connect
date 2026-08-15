@@ -13,6 +13,25 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Human authorization integration & hardening (M1.3-E).** Proves the released
+  authorization chain (JWT → `X-Workspace-Id` → membership → persisted role → centralized
+  RBAC → RLS) end-to-end on **every** protected endpoint through the real human path — not
+  just `/v1/members` (M1.3-C) but the api-token endpoints, which shared the same
+  `require_permission` dependency yet were unreachable before M1.3-B/C (only machine tokens
+  existed, and machines resolve to no membership → always denied). No new authorization
+  mechanism: the point is that one already exists and is correct.
+  - Full (endpoint × role) matrix over real JWTs: `members:manage` and `api_tokens:manage`
+    admit owner/admin and refuse member/viewer/machine; `/v1/workspaces/me` is any member;
+    `GET /v1/workspaces` is any human. Plus machine/human separation, cross-tenant fail-
+    closed, request-spoofing (JWT/header/query/body-claimed authority all inert), token
+    provenance (`created_by_member_id` = the creator's real member row), and a real-provider
+    E2E. Enforcement-layer mutation audit (E-series) left zero meaningful survivors.
+  - Fixes stale documentation that predated human auth: `authorization.py`'s "the only
+    authentication path today issues `kind='api_token'` … deliberately not attached to any
+    endpoint" and SECURITY.md's "until human authentication lands (M1.2-G)" — both now false.
+  - No production code change beyond the doc corrections; the authorization architecture was
+    already complete. No new endpoints, permissions, roles, or migration.
+
 - **Human multi-workspace selection (M1.3-C).** A human who belongs to more than one
   Workspace now names their target with the `X-Workspace-Id` header (ADR-0016). It is a
   *selection*, verified against persisted membership, never authority: the JWT proves who,
