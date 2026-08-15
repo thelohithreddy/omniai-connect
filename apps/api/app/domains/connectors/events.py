@@ -21,14 +21,24 @@ CONNECTOR_INGESTION_REQUESTED = "connector.ingestion_requested"
 
 
 def connector_ingestion_requested(
-    workspace_id: uuid.UUID, connector_id: uuid.UUID, source_url: str
+    workspace_id: uuid.UUID,
+    connector_id: uuid.UUID,
+    *,
+    source_url: str = "",
+    upload_ref: str = "",
 ) -> Event:
-    """Buffered post-commit trigger to enqueue ingestion. `source_url` is user-provided, not
-    secret; the workspace is the trusted envelope value."""
+    """Buffered post-commit trigger to enqueue ingestion (M1.4-B1.1/B1.2). Exactly one of
+    `source_url` (URL ingestion) / `upload_ref` (a workspace-relative ObjectStore key the API
+    already staged) is non-empty; neither is secret, and the workspace is the trusted envelope
+    value."""
     return Event(
         event_type=CONNECTOR_INGESTION_REQUESTED,
         workspace_id=workspace_id,
-        payload={"connector_id": str(connector_id), "source_url": source_url},
+        payload={
+            "connector_id": str(connector_id),
+            "source_url": source_url,
+            "upload_ref": upload_ref,
+        },
     )
 
 

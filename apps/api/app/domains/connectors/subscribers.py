@@ -27,7 +27,8 @@ def _enqueue_ingestion(event: Event) -> None:
         args=[
             str(event.workspace_id),
             str(event.payload["connector_id"]),
-            str(event.payload["source_url"]),
+            str(event.payload.get("source_url") or ""),
+            str(event.payload.get("upload_ref") or ""),
         ],
         queue=INGESTION_QUEUE,
     )

@@ -39,23 +39,33 @@ def ping(nonce: str) -> dict[str, str]:
 
 @celery_app.task(name="workers.ingest_connector_spec")
 def ingest_connector_spec(
-    workspace_id: str, connector_id: str, source_url: str
+    workspace_id: str, connector_id: str, source_url: str = "", upload_ref: str = ""
 ) -> dict[str, object]:
-    """Ingest an OpenAPI spec for a connector (M1.4-B1.1). Runs the full pipeline under the worker
-    tenant context: fetch (B0.1) → normalize → dedup → store (B0.5) → persist connector_versions
-    → post-commit `connector.ingested` (B0.4).
+    """Ingest an OpenAPI spec for a connector (M1.4-B1.1/B1.2). Runs the full pipeline under the
+    worker tenant context: get bytes (guarded fetch of `source_url`, OR read the API-staged upload
+    at `upload_ref`) → normalize (remote $refs via the same guarded fetcher) → dedup → store
+    (B0.5) → persist connector_versions → post-commit `connector.ingested` (B0.4).
 
-    Tenant authority is the server-established `workspace_id` (from the enqueuer, validated by the
-    worker context) — never `source_url`, the spec, or a payload role. A hard `IngestionError`
-    moves the connector to `failed` in a fresh transaction (no partial version persists); the
-    payload carries no secret. Logs only non-secret ids (never the URL or spec body)."""
-    from app.domains.connectors.ingestion import IngestionError, ingest_from_url, mark_failed
+    Exactly one of `source_url` / `upload_ref` is non-empty. Tenant authority is the
+    server-established `workspace_id` (validated by the worker context) — never `source_url`,
+    `upload_ref`, the spec, or a payload role. A hard `IngestionError` moves the connector to
+    `failed` in a fresh transaction (no partial version persists); the payload carries no secret.
+    Logs only non-secret ids (never the URL, key, or spec body)."""
+    from app.domains.connectors.ingestion import (
+        IngestionError,
+        ingest_from_upload,
+        ingest_from_url,
+        mark_failed,
+    )
 
     async def _run() -> dict[str, object]:
         wid, cid = uuid.UUID(workspace_id), uuid.UUID(connector_id)
         try:
             async with worker_tenant_uow(workspace_id) as uow:
-                result = await ingest_from_url(uow, wid, cid, source_url)
+                if upload_ref:
+                    result = await ingest_from_upload(uow, wid, cid, upload_ref)
+                else:
+                    result = await ingest_from_url(uow, wid, cid, source_url)
             log.info("connector.ingested", connector_id=connector_id, status=result.status)
             return {"status": result.status, "version": result.version}
         except IngestionError as exc:

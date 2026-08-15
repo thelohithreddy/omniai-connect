@@ -13,6 +13,26 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Connector ingestion: file upload + remote `$ref` (M1.4-B1.2, ADR-0026).** Extends B1.1 with the
+  two remaining source/resolution capabilities. `POST /v1/connectors/{id}/versions` is now
+  `multipart/form-data` accepting **exactly one** of a `source_url` field or a `file` upload
+  (`connectors:manage`, async, 202 + `ingesting`). Uploads are hostile input: the multipart part
+  size is bounded **explicitly** (never the 1 MB framework default), the file is validated
+  (non-empty, ≤10 MB), unknown form fields are refused, and the **filename is discarded** (never the
+  storage key, the type, or a log line). The worker can't re-fetch an upload, so the API stages the
+  bytes to the tenant ObjectStore and the worker reads them back through the tenant-key boundary.
+  **Remote `$ref`s** are resolved through the **same one guarded fetcher** (B0.1) — the parser's
+  async resolver has no network of its own; it uses an injected fetch callback (§15). All B0.1 SSRF
+  rules hold (HTTPS-only prod, no creds/proxy, private/metadata/mapped-IPv6/NAT64 rejected, ≤5
+  re-validated redirects); non-http schemes are refused before the fetcher; bounds are depth ≤32,
+  ≤10 000 refs, aggregate ≤50 MB, per-doc ≤10 MB; cross-document cycles are broken; each URL is
+  fetched once per ingestion (dedup); a remote-ref failure is **fatal**. Because refs are inlined
+  before normalization, `spec_hash` depends only on resolved content (location-independent) — a
+  changed remote dep → new version. One dependency (`python-multipart`); no migration; immutability/
+  RLS/RBAC unchanged. Proven by 31 new tests (18 remote-ref + 8 upload endpoint + 5 real-MinIO
+  pipeline), a 12-mutation audit (11 killed, 1 inert), a live real-worker upload run, and full
+  regression **1028 passed** at warning and debug. Deferred to B1.3+: Swagger→3, OpenAPI 3.1,
+  diff/promotion, the `tools` table, the §17 remote-ref cache.
 - **Connector ingestion: OpenAPI 3.0 → canonical Tool Schema (M1.4-B1.1, ADR-0025).** The first
   real ingestion pipeline — `POST /v1/connectors/{id}/versions` (async, `connectors:manage`,
   returns 202 + `ingesting`) composes the foundation: guarded fetch (B0.1) → hostile-input parse +

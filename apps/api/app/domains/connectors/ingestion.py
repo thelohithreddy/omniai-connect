@@ -30,7 +30,12 @@ from sqlalchemy import func, select
 
 from app.core.db import UnitOfWork
 from app.core.net import SSRFError, fetch
-from app.core.object_store import ObjectStore, TenantObjectKey, get_object_store
+from app.core.object_store import (
+    ObjectNotFoundError,
+    ObjectStore,
+    TenantObjectKey,
+    get_object_store,
+)
 from app.domains.connectors import openapi
 from app.domains.connectors.events import connector_ingested, connector_ingestion_failed
 from app.domains.connectors.models import Connector, ConnectorVersion
@@ -120,9 +125,60 @@ async def ingest_from_url(
     except Exception as exc:  # network/timeout/size — never leak the raw error text
         raise IngestionError("fetch_failed", "could not fetch the specification") from exc
 
+    return await _persist(
+        uow, workspace_id, connector_id, connector, raw, source_url, object_store, fetcher
+    )
+
+
+async def ingest_from_upload(
+    uow: UnitOfWork,
+    workspace_id: uuid.UUID,
+    connector_id: uuid.UUID,
+    upload_ref: str,
+    *,
+    store: ObjectStore | None = None,
+    fetcher: Fetcher = fetch,
+) -> IngestionResult:
+    """Ingest a spec the API already staged to ObjectStore (M1.4-B1.2, upload path).
+
+    The worker cannot re-fetch an uploaded file, so the API validated and stored the raw bytes at
+    `upload_ref` (a workspace-relative key); the worker reads them back through the tenant
+    ObjectStore boundary — `TenantObjectKey.for_workspace(workspace_id, upload_ref)` confines the
+    read to *this*
+    tenant's prefix and rejects any traversal, so even a tampered ref cannot cross tenants. Remote
+    `$ref`s in the uploaded spec still resolve through the guarded fetcher (`fetcher`)."""
+    object_store = store or get_object_store()
+    connector = await _load_connector(uow, workspace_id, connector_id)
+    try:
+        key = TenantObjectKey.for_workspace(workspace_id, upload_ref)
+        raw = await object_store.get(key)
+    except ObjectNotFoundError as exc:
+        raise IngestionError("upload_missing", "the staged upload was not found") from exc
+    except IngestionError:
+        raise
+    except Exception as exc:  # storage/key error — never leak the key or provider detail
+        raise IngestionError("upload_read_failed", "could not read the staged upload") from exc
+    return await _persist(
+        uow, workspace_id, connector_id, connector, raw, None, object_store, fetcher
+    )
+
+
+async def _persist(
+    uow: UnitOfWork,
+    workspace_id: uuid.UUID,
+    connector_id: uuid.UUID,
+    connector: Connector,
+    raw: bytes,
+    source_url: str | None,
+    object_store: ObjectStore,
+    fetcher: Fetcher,
+) -> IngestionResult:
+    """Shared tail of both source paths: parse → normalize (remote refs via `fetcher`) → dedup →
+    store raw → persist an immutable version → advance the connector → buffer the event."""
     document = openapi.load_spec(raw)
     openapi.detect_version(document)
-    tools = openapi.normalize(document, connector.slug)
+    # Remote $refs are resolved through the SAME guarded fetcher as the root spec (B0.1, §15/§18).
+    tools = await openapi.normalize(document, connector.slug, fetch=fetcher)
     new_hash = openapi.spec_hash(tools)
 
     current = await _current_version(uow, workspace_id, connector)
@@ -155,7 +211,8 @@ async def ingest_from_url(
     base_url = openapi.base_url_from_servers(document)
     if base_url:
         connector.base_url = base_url[:2048]
-    connector.source_url = source_url[:2048]
+    if source_url is not None:
+        connector.source_url = source_url[:2048]
 
     # Buffered directly on this UoW; dispatches only after COMMIT (B0.4). Buffering on the held
     # UoW (not the ambient-sink `event_bus.publish`) keeps this correct regardless of caller
@@ -183,4 +240,10 @@ async def mark_failed(
     uow.buffer_event(connector_ingestion_failed(workspace_id, connector_id, reason_code))
 
 
-__all__ = ["IngestionError", "IngestionResult", "ingest_from_url", "mark_failed"]
+__all__ = [
+    "IngestionError",
+    "IngestionResult",
+    "ingest_from_upload",
+    "ingest_from_url",
+    "mark_failed",
+]

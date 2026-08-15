@@ -1220,3 +1220,70 @@ failure→failed, A×8/B×8 concurrency), 8 real-HTTP endpoint (202/RBAC/404/409
 workspace) — a 21-mutation B1.1 audit with **0 survivors**, and a live real-worker ingestion run.
 Deferred to B1.2+: file upload, remote `$ref`, Swagger 2 → OpenAPI 3, OpenAPI 3.1, `diff_summary`/
 promotion, the `tools` table, scheduled re-sync — none started.
+
+## ADR-0026 — Connector ingestion: file upload + remote `$ref` (M1.4-B1.2)
+
+**Status:** Accepted (2026-08-16) · **Context:** M1.4-B1.2, extending the released B1.1 OpenAPI 3.0
+URL ingestion with the two remaining source/resolution capabilities canon defines: **file upload**
+and **remote `$ref` resolution**. Both compose the existing pipeline (B0.1 fetcher, B0.5 ObjectStore,
+B0.2/B0.3 worker, B0.4 events, ADR-0025 parser) — no new SSRF boundary, storage abstraction, queue,
+event system, tenant mechanism, or authorization chain. The upload endpoint/wire contract and the
+413/415 question were canon-silent (§3); the founder ratified the contract below. No migration.
+
+**Decision:**
+
+1. **Remote `$ref` through the one guarded fetcher.** The parser's resolver (`openapi.py`) is now
+   async and resolves local **and** remote refs, but it still has **no network capability of its
+   own** — a remote ref is fetched only through an **injected `fetch` callback** (§15's
+   `ImportContext`), which the pipeline wires to the B0.1 guarded fetcher. So there remains exactly
+   one SSRF boundary: HTTPS-only (prod), no embedded credentials, no proxy, private/loopback/
+   link-local/metadata/IPv4-mapped/NAT64/6to4 rejected, ≤5 re-validated redirects, 10 MB/fetch,
+   30 s (ADR-0020). Non-http schemes (`file://`, …) are refused *before* the fetcher is called.
+   With `fetch=None` a remote ref is refused — the exact local-only behaviour B1.1 shipped.
+   Everything is bounded (§11): resolution depth ≤32, total refs ≤10 000, **aggregate remote bytes
+   ≤50 MB**, per-document ≤10 MB; cross-document cycles are detected by a `(url, fragment)` stack
+   and broken; each distinct remote URL is fetched at most once per ingestion (in-memory dedup, so
+   a fan-out of repeated refs is one fetch). Local refs inside a remote document resolve against
+   *that* document. A remote-ref failure (SSRF/timeout/malformed/missing) is **fatal** — a hard
+   `IngestionError` → connector `failed` — never a silent skip. Because refs are inlined before the
+   Tool set is built, `spec_hash` depends only on the resolved content, not the ref origin: the
+   same resolved content yields the same hash and dedupes; a changed remote dependency yields a new
+   version. The §17 Redis cross-ingestion cache (`ws:{workspace_id}:spec:{sha256(url)}`, TTL ≤1h)
+   is a documented perf optimisation, deferred — the in-memory per-ingestion dedup is the
+   correctness/DoS bound this slice needs.
+
+2. **File upload (ratified contract).** `POST /v1/connectors/{connector_id}/versions` becomes
+   `multipart/form-data` accepting **exactly one** of a `source_url` field (URL ingestion,
+   unchanged semantics) or a `file` upload; `connectors:manage`, still async, still 202 +
+   `ingesting`. Upload is hostile input: the multipart part size is bounded **explicitly**
+   (`request.form(max_part_size=10 MB+…, max_files=1, max_fields=3)` — never the 1 MB framework
+   default), the file is validated (non-empty, ≤10 MB), unknown form fields are refused (a client
+   cannot smuggle `workspace_id`/`status`), and the **filename is discarded** — never used for the
+   storage key (a fresh `uuid`), the content type (parsing is byte-based in the worker), or a log
+   line. The worker cannot re-fetch an upload (§18: fetch is worker-only egress), so the API
+   **stages** the bytes to the tenant ObjectStore at `ws/<ws>/connectors/<id>/uploads/<uuid>.json`
+   and the trigger carries that key; the worker reads it back through
+   `TenantObjectKey.for_workspace` (confined to *this* tenant's prefix, traversal-rejecting) and
+   runs the same pipeline, writing the canonical `raw_spec_ref` at `specs/v<n>.json`. Oversized/
+   unsupported/malformed uploads map to **400 `validation_error`** (the closed API taxonomy has no
+   413/415). A rejected request best-effort-deletes its staged object; the transient staging object
+   on the happy path is a bounded, documented orphan (consistent with B1.1's rollback-orphan
+   stance; an R2 lifecycle rule on the `uploads/` prefix is a future op concern).
+
+3. **One dependency added** (`python-multipart`, required by Starlette for multipart parsing;
+   parsing is bounded explicitly, not left to defaults). The `connector.ingested` /
+   `connector.ingestion_failed` payloads are unchanged and carry no URL, key, spec body, or secret.
+
+**Consequences:** No migration; `connector_versions` immutability (INSERT/SELECT-only grants) and
+RLS unchanged; no new SECURITY DEFINER / role / RBAC / auth. The B1.1 endpoint's request encoding
+changed from a JSON body to a multipart form field (its tests were updated); route, 202/ingesting
+semantics, RBAC, tenant isolation, and the pipeline are otherwise intact. Making the resolver async
+rippled a mechanical `await` through the parser and its 37 B1.1 tests (behaviour preserved: no
+fetch → remote refused). Proven by 31 new tests — 18 remote-ref (resolution, local-in-remote,
+nested/relative, dedup, cycle, count/depth/aggregate bounds, fatal failure, non-http-refused-before-
+fetch, no-fetch-refused, location-independent hash), 8 upload endpoint (multipart, exactly-one,
+empty/oversized/unknown-field, RBAC, filename-never-in-key), 5 real-Postgres+MinIO pipeline (upload
+persist/dedup/missing-staged, remote-ref through the pipeline) — a 12-mutation B1.2 audit (11 killed;
+1 inert redundant-guard survivor), a live real-worker upload run, and full regression **1028 passed**
+at warning and debug. Deferred to B1.3+: Swagger 2 → OpenAPI 3, OpenAPI 3.1, `diff_summary`/
+promotion, the `tools` table, the §17 remote-ref cache, scheduled re-sync — none started.

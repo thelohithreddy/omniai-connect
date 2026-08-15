@@ -35,6 +35,7 @@ dependencies = [
     # exclusively — never `load`/`unsafe_load` — so a hostile spec cannot construct Python
     # objects or execute code. Parsing is confined to app/domains/connectors/openapi.py.
     "pyyaml>=6.0",
+    "python-multipart>=0.0.9",
 ]
 
 [dependency-groups]

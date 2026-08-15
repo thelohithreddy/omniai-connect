@@ -1,15 +1,17 @@
-"""OpenAPI 3.0 → canonical Tool Schema (M1.4-B1.1, ADR-0025).
+"""OpenAPI 3.0 → canonical Tool Schema (M1.4-B1.1/B1.2, ADR-0025/0026).
 
 Deterministic, framework-free, and hostile-input-safe: the specification is untrusted. This
-module parses JSON or YAML, validates it is a supported OpenAPI 3.0 document, resolves **local**
-`$ref`s under bounded depth/count/cycle guards, and normalizes every `(path, method)` operation
-into the canonical Tool Schema of CONNECTOR_SPECIFICATION §2. It never fetches anything (URL and
-external-`$ref` egress belong to the guarded fetcher, B0.1 — external refs are a later slice), and
-it never executes specification content (no `eval`/`exec`, no YAML object construction).
+module parses JSON or YAML, validates it is a supported OpenAPI 3.0 document, resolves local **and
+remote** `$ref`s under bounded depth/count/size/cycle guards, and normalizes every `(path, method)`
+operation into the canonical Tool Schema of CONNECTOR_SPECIFICATION §2. It never executes
+specification content (no `eval`/`exec`, no YAML object construction) and has **no network
+capability of its own** — a remote `$ref` is fetched only through the injected guarded fetch
+callback (B0.1, §15/§18), so there is exactly one SSRF boundary.
 
-The output is deterministic — same bytes, same normalized set, same `spec_hash` — because ordering
-follows spec position and the hash is over canonical JSON (UTF-8, sorted keys, no insignificant
-whitespace) of the ordered Tool set (CONNECTOR_SPECIFICATION §3).
+The output is deterministic — same bytes (and same resolved remote content), same normalized set,
+same `spec_hash` — because ordering follows spec position, refs are inlined before the Tool set is
+built (so the hash depends on resolved content, not ref origin), and the hash is over canonical
+JSON (UTF-8, sorted keys, no insignificant whitespace) of the ordered Tool set (§3).
 """
 
 from __future__ import annotations
@@ -17,17 +19,26 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Awaitable, Callable
 from typing import Any
+from urllib.parse import urljoin
 
 import yaml
 
 # --- bounds (schema-bomb guards, CONNECTOR_SPECIFICATION §11/§18) ---
-MAX_RAW_BYTES = 10 * 1024 * 1024  # 10 MB raw (the fetcher also caps this)
+MAX_RAW_BYTES = 10 * 1024 * 1024  # 10 MB raw per document (the guarded fetcher also caps this)
 MAX_DEPTH = 64  # structural nesting: OpenAPI docs are shallow; deep nesting is an attack
 MAX_REF_DEPTH = 32  # $ref resolution depth (§11: "resolution depth ≤ 32")
 MAX_REFS = 10_000  # total $ref resolutions (§11: "total refs ≤ 10 000")
+MAX_REMOTE_BYTES = (
+    50 * 1024 * 1024
+)  # aggregate remote download budget (§11: "≤ 50 MB after $ref expansion")
 MAX_TOOLS = 5_000  # a spec with more operations than this is refused, not normalized slowly
 _TOOL_NAME_MAX = 64
+
+# A remote $ref is resolved by handing its URL to the guarded fetcher (B0.1, injected). openapi.py
+# itself has no network capability — see the `Fetcher` seam and _RefResolver (M1.4-B1.2, §15/§18).
+Fetcher = Callable[[str], Awaitable[bytes]]
 
 # HTTP methods that become Tools (endpoint.method enum, CONNECTOR_SPECIFICATION §2).
 _HTTP_METHODS = ("get", "put", "post", "delete", "patch", "head")
@@ -74,17 +85,16 @@ def _reject_non_finite(value: str) -> float:
     raise IngestionError("malformed_spec", "non-finite numbers are not permitted")
 
 
-def load_spec(raw: bytes) -> dict[str, Any]:
-    """Parse raw bytes into a document. JSON first (strict), then YAML via the hardened safe
-    loader. Fails closed on oversize, non-UTF-8, non-finite numbers, YAML aliases, a non-object
-    root, or excessive nesting."""
+def _safe_parse(raw: bytes) -> Any:
+    """Bytes → a bounded, safe Python structure: size-capped, UTF-8, JSON-first then the hardened
+    YAML loader (no aliases, no object construction), non-finite refused, nesting-depth guarded.
+    Shared by the root spec (`load_spec`) and every fetched remote `$ref` document."""
     if len(raw) > MAX_RAW_BYTES:
-        raise IngestionError("spec_too_large", "specification exceeds the size limit")
+        raise IngestionError("spec_too_large", "document exceeds the size limit")
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise IngestionError("malformed_spec", "specification is not valid UTF-8") from exc
-
+        raise IngestionError("malformed_spec", "document is not valid UTF-8") from exc
     document: Any
     try:
         document = json.loads(text, parse_constant=_reject_non_finite)
@@ -95,10 +105,16 @@ def load_spec(raw: bytes) -> dict[str, Any]:
             raise
         except yaml.YAMLError as exc:
             raise IngestionError("malformed_spec", "not valid JSON or YAML") from exc
+    _guard_depth(document)
+    return document
 
+
+def load_spec(raw: bytes) -> dict[str, Any]:
+    """Parse the root specification's raw bytes into a document object, or fail closed (oversize,
+    non-UTF-8, non-finite numbers, YAML aliases, a non-object root, or excessive nesting)."""
+    document = _safe_parse(raw)
     if not isinstance(document, dict):
         raise IngestionError("malformed_spec", "specification root must be an object")
-    _guard_depth(document)
     return document
 
 
@@ -133,43 +149,107 @@ def detect_version(document: dict[str, Any]) -> str:
 # --------------------------------------------------------------------------- $ref resolution
 
 
+def _navigate(document: Any, fragment: str) -> Any:
+    """Walk a JSON-pointer fragment (`/a/b/c`, or empty for the whole document) within one doc."""
+    target = document
+    for token in fragment.lstrip("/").split("/") if fragment.strip("/") else ():
+        token = token.replace("~1", "/").replace("~0", "~")  # JSON-pointer unescape
+        if not isinstance(target, dict) or token not in target:
+            raise IngestionError("invalid_reference", "reference does not resolve")
+        target = target[token]
+    return target
+
+
 class _RefResolver:
-    """Bounded resolver for **local** JSON-pointer `$ref`s (`#/...`). Remote refs (anything not
-    starting with `#/`) are refused — external-ref fetching is a later slice and must not bypass
-    the SSRF boundary. Depth, total count, and cycles are all bounded (§11)."""
+    """Bounded, cycle-safe resolver for local **and** remote `$ref`s (M1.4-B1.2).
 
-    def __init__(self, document: dict[str, Any]) -> None:
-        self._document = document
+    Local refs (`#/...`) resolve within the document that owns the node. Remote refs
+    (`https://host/doc#/frag`, or relative to a remote doc's URL) are fetched **only** through the
+    injected guarded fetch callback (B0.1, §15/§18) — this module has no network capability of its
+    own — parsed with the same hardened loader, and resolved within the fetched document. When
+    `fetch` is None (the local-only mode B1.1 shipped), a remote ref is refused.
+
+    Every dimension is bounded (§11): resolution depth ≤ `MAX_REF_DEPTH`, total resolutions ≤
+    `MAX_REFS`, aggregate remote bytes ≤ `MAX_REMOTE_BYTES`, per-document ≤ `MAX_RAW_BYTES` (also
+    the fetcher's cap); cycles across any documents are detected by a `(url, fragment)` stack and
+    broken with a permissive empty schema. Each distinct remote URL is fetched at most once per
+    ingestion (in-memory dedup), so a fan-out of repeated refs is one fetch, not N.
+    """
+
+    def __init__(self, document: dict[str, Any], fetch: Fetcher | None = None) -> None:
+        self._root = document
+        self._fetch = fetch
         self._count = 0
+        self._remote_bytes = 0
+        self._remote_docs: dict[str, Any] = {}
 
-    def resolve(self, node: Any, _stack: tuple[str, ...] = (), depth: int = 0) -> Any:
+    async def resolve(
+        self,
+        node: Any,
+        doc: Any,
+        url: str = "",
+        stack: tuple[tuple[str, str], ...] = (),
+        depth: int = 0,
+    ) -> Any:
         if depth > MAX_REF_DEPTH:
             raise IngestionError("invalid_reference", "reference resolution is too deep")
         if isinstance(node, dict):
             ref = node.get("$ref")
             if isinstance(ref, str):
-                return self._follow(ref, _stack, depth)
-            return {k: self.resolve(v, _stack, depth + 1) for k, v in node.items()}
+                return await self._follow(ref, doc, url, stack, depth)
+            return {k: await self.resolve(v, doc, url, stack, depth + 1) for k, v in node.items()}
         if isinstance(node, list):
-            return [self.resolve(v, _stack, depth + 1) for v in node]
+            return [await self.resolve(v, doc, url, stack, depth + 1) for v in node]
         return node
 
-    def _follow(self, ref: str, stack: tuple[str, ...], depth: int) -> Any:
-        if not ref.startswith("#/"):
-            raise IngestionError("invalid_reference", "external references are not supported")
-        if ref in stack:
-            # A cycle: break it with a permissive empty schema rather than looping forever.
-            return {}
+    async def _follow(
+        self, ref: str, doc: Any, url: str, stack: tuple[tuple[str, str], ...], depth: int
+    ) -> Any:
+        base, _, fragment = ref.partition("#")
+        if base == "":
+            target_doc, target_url = doc, url
+        else:
+            if self._fetch is None:
+                raise IngestionError("invalid_reference", "external references are not supported")
+            target_url = urljoin(url, base) if url else base
+            target_doc = await self._fetch_remote(target_url)
+        key = (target_url, fragment)
+        if key in stack:
+            return {}  # a cycle across any documents — break it, never loop
         self._count += 1
         if self._count > MAX_REFS:
             raise IngestionError("invalid_reference", "too many references")
-        target = self._document
-        for token in ref[2:].split("/"):
-            token = token.replace("~1", "/").replace("~0", "~")  # JSON-pointer unescape
-            if not isinstance(target, dict) or token not in target:
-                raise IngestionError("invalid_reference", "reference does not resolve")
-            target = target[token]
-        return self.resolve(target, (*stack, ref), depth + 1)
+        target = _navigate(target_doc, fragment)
+        return await self.resolve(target, target_doc, target_url, (*stack, key), depth + 1)
+
+    async def _fetch_remote(self, url: str) -> Any:
+        if self._fetch is None:  # unreachable via _follow (guarded there); narrows the type
+            raise IngestionError("invalid_reference", "external references are not supported")
+        if url in self._remote_docs:
+            return self._remote_docs[url]  # dedup: one fetch per distinct URL per ingestion
+        # Only http(s) reaches the guarded fetcher; file:/// and other schemes are refused here so
+        # they can never bypass the SSRF boundary. The fetcher (B0.1) enforces https/no-creds/no-
+        # proxy/IP-validation/redirect-revalidation/10 MB/30 s. Any failure is fatal and safe.
+        if not url.lower().startswith(("http://", "https://")):
+            raise IngestionError("invalid_reference", "unsupported reference scheme")
+        try:
+            raw = await self._fetch(url)
+        except IngestionError:
+            raise
+        except Exception as exc:  # SSRFError / timeout / connection — never leak the URL or detail
+            raise IngestionError(
+                "invalid_reference", "could not resolve a remote reference"
+            ) from exc
+        self._remote_bytes += len(raw)
+        if self._remote_bytes > MAX_REMOTE_BYTES:
+            raise IngestionError("invalid_reference", "remote references exceed the size budget")
+        document = _safe_parse(raw)
+        self._remote_docs[url] = document
+        return document
+
+    async def resolve_root(self, node: Any) -> Any:
+        """Resolve a node that belongs to the root document."""
+        return await self.resolve(node, self._root, "")
 
 
 # --------------------------------------------------------------------------- normalization
@@ -202,7 +282,7 @@ def _tool_name(connector_slug: str, op_slug: str, used: set[str]) -> str:
     return name
 
 
-def _merge_parameters(
+async def _merge_parameters(
     resolver: _RefResolver,
     params: list[Any],
     properties: dict[str, Any],
@@ -210,7 +290,7 @@ def _merge_parameters(
     binding: dict[str, Any],
 ) -> None:
     for raw in params:
-        param = resolver.resolve(raw)
+        param = await resolver.resolve_root(raw)
         if not isinstance(param, dict):
             continue
         name, location = param.get("name"), param.get("in")
@@ -225,7 +305,7 @@ def _merge_parameters(
         binding[name] = {"location": location}
 
 
-def _merge_request_body(
+async def _merge_request_body(
     resolver: _RefResolver,
     request_body: Any,
     properties: dict[str, Any],
@@ -234,7 +314,7 @@ def _merge_request_body(
 ) -> str:
     """Merge a JSON request body's properties as top-level arguments (bound to `body`). Returns
     the body_style. Non-JSON bodies are downgraded to `form` (CONNECTOR_SPECIFICATION §6)."""
-    body = resolver.resolve(request_body)
+    body = await resolver.resolve_root(request_body)
     if not isinstance(body, dict):
         return "none"
     content = body.get("content")
@@ -243,7 +323,7 @@ def _merge_request_body(
     if "application/json" not in content:
         return "form"
     raw_schema = content["application/json"].get("schema")
-    schema = resolver.resolve(raw_schema) if isinstance(raw_schema, dict) else {}
+    schema = await resolver.resolve_root(raw_schema) if isinstance(raw_schema, dict) else {}
     raw_required = schema.get("required")
     body_required: list[Any] = raw_required if isinstance(raw_required, list) else []
     raw_properties = schema.get("properties")
@@ -274,15 +354,22 @@ def _auth(operation: dict[str, Any], document: dict[str, Any]) -> dict[str, Any]
     return {"required": bool(security)}
 
 
-def normalize(document: dict[str, Any], connector_slug: str) -> list[dict[str, Any]]:
+async def normalize(
+    document: dict[str, Any], connector_slug: str, *, fetch: Fetcher | None = None
+) -> list[dict[str, Any]]:
     """Produce the ordered canonical Tool Schema set — one Tool per `(path, method)`, in spec
     position. Deterministic and bounded.
+
+    Remote `$ref`s are resolved through the injected guarded `fetch` (B0.1); with `fetch=None`
+    (the default) a remote ref is refused — the local-only behaviour B1.1 shipped. Because refs
+    (local and remote) are inlined *before* the Tool set is built, the output — and thus
+    `spec_hash` — depends only on the resolved content, not on where a ref was fetched from.
 
     The output is **version-independent**: it carries no `connector_version` or persisted `id`,
     so `spec_hash` over it is stable across re-syncs and dedupes no-op churn (§3). The pipeline
     injects `connector_version` into each Tool only when it persists `normalized_schema`.
     """
-    resolver = _RefResolver(document)
+    resolver = _RefResolver(document, fetch)
     paths = document.get("paths")
     if not isinstance(paths, dict):
         raise IngestionError("no_operations", "specification declares no paths")
@@ -304,10 +391,10 @@ def normalize(document: dict[str, Any], connector_slug: str) -> list[dict[str, A
             required: list[str] = []
             binding: dict[str, Any] = {}
             op_params = list(shared_params) + list(operation.get("parameters") or [])
-            _merge_parameters(resolver, op_params, properties, required, binding)
+            await _merge_parameters(resolver, op_params, properties, required, binding)
             body_style = "none"
             if "requestBody" in operation:
-                body_style = _merge_request_body(
+                body_style = await _merge_request_body(
                     resolver, operation["requestBody"], properties, required, binding
                 )
 

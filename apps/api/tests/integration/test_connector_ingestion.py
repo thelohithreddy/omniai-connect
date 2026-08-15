@@ -325,3 +325,142 @@ async def test_object_missing_after_a_fresh_key(
                 workspace_a.id, f"connectors/{uuid.uuid4()}/specs/v9.json"
             )
         )
+
+
+# ------------------------------------------------------------------ upload path (M1.4-B1.2)
+
+
+async def _stage_upload(ws: uuid.UUID, cid: uuid.UUID, body: bytes) -> str:
+    """Mimic the API: stage raw bytes under the tenant upload prefix, return the relative ref."""
+    ref = f"connectors/{cid}/uploads/{uuid.uuid4().hex}.json"
+    await get_object_store().put(TenantObjectKey.for_workspace(ws, ref), body)
+    return ref
+
+
+async def test_upload_ingestion_reads_staged_bytes_and_persists_a_version(
+    admin_engine: AsyncEngine, workspace_a: SeededWorkspace, captured_events: list[Event]
+) -> None:
+    from app.domains.connectors.ingestion import ingest_from_upload
+
+    cid = await _seed_connector(admin_engine, workspace_a.id)
+    ref = await _stage_upload(workspace_a.id, cid, SPEC_V1)
+    async with worker_tenant_uow(str(workspace_a.id)) as uow:
+        result = await ingest_from_upload(uow, workspace_a.id, cid, ref)
+    assert result.status == "ingested" and result.version == 1
+
+    async with admin_engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT raw_spec_ref, normalized_schema FROM connector_versions"
+                    " WHERE connector_id=:c"
+                ),
+                {"c": cid},
+            )
+        ).one()
+    # The canonical raw_spec_ref is the version key (not the staging ref); content normalized.
+    assert row.raw_spec_ref == f"ws/{workspace_a.id}/connectors/{cid}/specs/v1.json"
+    names = [t["name"] for t in row.normalized_schema]
+    assert names == ["demo_listcustomers", "demo_createcustomer"]
+    assert [e.event_type for e in captured_events] == ["connector.ingested"]
+
+
+async def test_a_malformed_upload_raises_without_persisting(
+    admin_engine: AsyncEngine, workspace_a: SeededWorkspace
+) -> None:
+    from app.domains.connectors.ingestion import ingest_from_upload
+    from app.domains.connectors.openapi import IngestionError
+
+    cid = await _seed_connector(admin_engine, workspace_a.id)
+    ref = await _stage_upload(workspace_a.id, cid, b"not a spec {")
+    with pytest.raises(IngestionError) as exc:
+        async with worker_tenant_uow(str(workspace_a.id)) as uow:
+            await ingest_from_upload(uow, workspace_a.id, cid, ref)
+    assert exc.value.reason_code == "malformed_spec"
+    async with admin_engine.connect() as conn:
+        count = await conn.scalar(
+            text("SELECT count(*) FROM connector_versions WHERE connector_id=:c"), {"c": cid}
+        )
+    assert count == 0
+
+
+async def test_a_missing_staged_upload_fails_closed(
+    admin_engine: AsyncEngine, workspace_a: SeededWorkspace
+) -> None:
+    from app.domains.connectors.ingestion import ingest_from_upload
+    from app.domains.connectors.openapi import IngestionError
+
+    cid = await _seed_connector(admin_engine, workspace_a.id)
+    with pytest.raises(IngestionError) as exc:
+        async with worker_tenant_uow(str(workspace_a.id)) as uow:
+            await ingest_from_upload(
+                uow, workspace_a.id, cid, f"connectors/{cid}/uploads/nope.json"
+            )
+    assert exc.value.reason_code == "upload_missing"
+
+
+async def test_the_same_uploaded_bytes_dedupe_to_no_new_version(
+    admin_engine: AsyncEngine, workspace_a: SeededWorkspace
+) -> None:
+    from app.domains.connectors.ingestion import ingest_from_upload
+
+    cid = await _seed_connector(admin_engine, workspace_a.id)
+    async with worker_tenant_uow(str(workspace_a.id)) as uow:
+        ref = await _stage_upload(workspace_a.id, cid, SPEC_V1)
+        await ingest_from_upload(uow, workspace_a.id, cid, ref)
+    async with worker_tenant_uow(str(workspace_a.id)) as uow:
+        ref2 = await _stage_upload(workspace_a.id, cid, SPEC_V1)
+        second = await ingest_from_upload(uow, workspace_a.id, cid, ref2)
+    assert second.status == "unchanged"
+
+
+# ----------------------------------------------------------- remote $ref through the pipeline
+
+
+async def test_a_remote_ref_is_resolved_through_the_pipeline_fetcher(
+    admin_engine: AsyncEngine, workspace_a: SeededWorkspace
+) -> None:
+    """The pipeline hands the SAME fetcher to normalize, so a remote $ref in a URL-ingested spec is
+    resolved (here via a multi-URL canned fetcher) and inlined into the persisted Tool set."""
+    from app.domains.connectors.ingestion import ingest_from_url
+
+    root = json.dumps(
+        {
+            "openapi": "3.0.0",
+            "servers": [{"url": "https://api.demo.com/v1"}],
+            "paths": {
+                "/x": {
+                    "get": {
+                        "operationId": "x",
+                        "parameters": [
+                            {
+                                "name": "q",
+                                "in": "query",
+                                "schema": {"$ref": "https://s.demo.com/c.json#/S"},
+                            }
+                        ],
+                    }
+                }
+            },
+        }
+    ).encode()
+    remote = json.dumps({"S": {"type": "string", "maxLength": 7}}).encode()
+    docs = {"https://api.demo.com/openapi.json": root, "https://s.demo.com/c.json": remote}
+
+    async def multi_fetch(url: str) -> bytes:
+        if url not in docs:
+            raise RuntimeError("blocked")
+        return docs[url]
+
+    cid = await _seed_connector(admin_engine, workspace_a.id)
+    async with worker_tenant_uow(str(workspace_a.id)) as uow:
+        result = await ingest_from_url(
+            uow, workspace_a.id, cid, "https://api.demo.com/openapi.json", fetcher=multi_fetch
+        )
+    assert result.status == "ingested"
+    async with admin_engine.connect() as conn:
+        schema = await conn.scalar(
+            text("SELECT normalized_schema FROM connector_versions WHERE connector_id=:c"),
+            {"c": cid},
+        )
+    assert schema[0]["input_schema"]["properties"]["q"] == {"type": "string", "maxLength": 7}

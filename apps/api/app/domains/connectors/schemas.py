@@ -94,26 +94,7 @@ class ConnectorList(BaseModel):
     has_more: bool
 
 
-class IngestVersionRequest(BaseModel):
-    """Trigger an OpenAPI ingestion for a Connector (M1.4-B1.1). `extra="forbid"` so a client
-    cannot smuggle a server-owned field (`workspace_id`, `connector_id`, `status`). Only the
-    source URL is accepted; the deep SSRF check is the guarded fetcher's at fetch time (B0.1)."""
+# The ingestion request is multipart/form-data (a `source_url` field OR a `file`, M1.4-B1.2), so
+# it is validated in the router, not as a Pydantic body model.
 
-    model_config = ConfigDict(extra="forbid")
-
-    source_url: str = Field(
-        min_length=1,
-        max_length=2048,
-        description="HTTPS URL of the OpenAPI 3.0 document to ingest.",
-    )
-
-    @field_validator("source_url")
-    @classmethod
-    def _https(cls, value: str) -> str:
-        stripped = value.strip()
-        if not stripped.lower().startswith("https://"):
-            raise ValueError("source_url must be an https URL")
-        return stripped
-
-
-__all__ = ["ConnectorCreate", "ConnectorList", "ConnectorRead", "IngestVersionRequest"]
+__all__ = ["ConnectorCreate", "ConnectorList", "ConnectorRead"]

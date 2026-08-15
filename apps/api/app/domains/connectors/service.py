@@ -162,26 +162,32 @@ class ConnectorService:
             raise NotFoundError("Connector not found.")
 
     async def request_ingestion(
-        self, uow: UnitOfWork, *, workspace_id: uuid.UUID, connector_id: uuid.UUID, source_url: str
+        self,
+        uow: UnitOfWork,
+        *,
+        workspace_id: uuid.UUID,
+        connector_id: uuid.UUID,
+        source_url: str = "",
+        upload_ref: str = "",
     ) -> Connector:
-        """Start asynchronous OpenAPI ingestion for a live Connector (M1.4-B1.1).
+        """Start asynchronous OpenAPI ingestion for a live Connector (M1.4-B1.1/B1.2).
 
-        Transitions the Connector to `ingesting` and buffers a post-commit trigger that enqueues
-        the Celery pipeline — so the worker never sees the Connector before the transition is
-        durable, and a rolled-back request enqueues nothing. `source_url`'s egress safety is the
-        guarded fetcher's concern (B0.1) at fetch time, not this trigger. `workspace_id` is the
-        request's trusted context, used only for the (worker-re-validated) task tenant — never to
-        form a tenant query (the repository's context still governs every read/write).
+        The source is either a `source_url` (URL ingestion) or an `upload_ref` — a
+        workspace-relative ObjectStore key the router already staged the uploaded bytes to (the
+        worker cannot re-fetch an upload, §18). Exactly one must be non-empty. Both are *where*, not
+        *who*: the connector's tenant is `workspace_id` from the request's trusted context.
 
-        The trigger is buffered directly on the request `uow` (the FastAPI dependency injects the
-        same UoW the repository uses), not via the ambient-sink `event_bus.publish` — a dependency
-        generator's contextvar does not propagate across FastAPI's DI boundary into the handler.
-        `uow.buffer_event` still enforces the workspace-match (the event's tenant must equal the
-        transaction's bound tenant, ADR-0022).
+        Transitions the Connector to `ingesting` and buffers a post-commit trigger that enqueues the
+        Celery pipeline — so the worker never sees the Connector before the transition is durable,
+        and a rolled-back request enqueues nothing. The trigger is buffered directly on the request
+        `uow` (not the ambient-sink `event_bus.publish`, whose contextvar does not cross FastAPI's
+        DI boundary); `uow.buffer_event` still enforces the workspace-match (ADR-0022).
 
         A Connector already `ingesting` is a 409 (its run is the concurrency lock); a foreign or
         deleted id is a uniform 404.
         """
+        if bool(source_url) == bool(upload_ref):
+            raise ValidationFailedError("Provide exactly one of a source URL or an uploaded file.")
         connector = await self._repository.get(connector_id)
         if connector is None:
             raise NotFoundError("Connector not found.")
@@ -189,7 +195,11 @@ class ConnectorService:
             raise ConflictError(
                 "Connector is already ingesting.", details={"status": connector.status}
             )
-        uow.buffer_event(connector_ingestion_requested(workspace_id, connector_id, source_url))
+        uow.buffer_event(
+            connector_ingestion_requested(
+                workspace_id, connector_id, source_url=source_url, upload_ref=upload_ref
+            )
+        )
         connector.status = "ingesting"
         return connector
 
