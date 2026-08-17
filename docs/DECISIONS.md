@@ -1427,3 +1427,62 @@ audit (0 meaningful survivors), migration up/down/up, and full regression at war
 **Deferred:** the usage-based gate refinement, an auto-promote-per-Connector setting, the
 `deprecated`/`archived` states, scheduled re-sync, and the §4 lint surface — all belonging to later
 modules.
+
+## ADR-0029 — Connections: a workspace's authenticated instance of a Connector (M1-Connections-v1)
+
+**Status:** Accepted (2026-08-17) · **Context:** M1-Connections-v1, the first slice of M1's
+execution plane (after the audit that reconstructed the remaining M1 scope). A **Connection** binds
+a Connector to a Workspace and carries the lifecycle and non-secret config that a Credential (next
+module), the Execution Runtime, and the Tool-Call audit will all reference (Bible §4,
+DATABASE_DESIGN §3, API_GUIDELINES §2). It holds **no secret**. One migration (`0010_connections`).
+
+**Decision:**
+
+1. **A structural, secret-free tenant entity.** `connections` (migration `0010`): `id, workspace_id,
+   connector_id, name, status (pending_auth|active|error|revoked, default pending_auth),
+   credential_id (nullable placeholder), config_overrides (jsonb), last_health_check_at, deleted_at,
+   timestamps`. RLS ENABLE+FORCE + `tenant_isolation`; a composite intra-tenant FK
+   `(workspace_id, connector_id) → connectors(workspace_id, id)` so a connection can only bind a
+   connector in the **same** workspace (a cross-tenant binding is unrepresentable); a
+   `UNIQUE(workspace_id, id)` target for the future credentials/tool_calls composite FKs; a **partial
+   unique** `(workspace_id, name) WHERE deleted_at IS NULL` so a revoked name frees up and the DB —
+   not an application check — is the arbiter under concurrency; grants **SELECT/INSERT/UPDATE, no
+   DELETE** (revoke is a soft delete). Layered router→service→repository, reusing the connectors
+   patterns exactly.
+
+2. **`credential_id` is a forward-compatible placeholder (P-43).** The `credentials` table does not
+   exist yet, so `credential_id` ships as a bare nullable UUID with **no FK** — exactly the pattern
+   `connectors.current_version_id` used before `connector_versions` landed. The Credentials module
+   adds the composite FK additively. No credential/encryption/KEK work is done here; credential
+   attachment (→ `active`) is a later module.
+
+3. **Authority is the existing chain; `config_overrides` is never authority.** Every endpoint is
+   gated by `require_permission(CONNECTIONS_MANAGE)` (owner/admin; the permission already existed).
+   The workspace is the authenticated context — `X-Workspace-Id` + membership for humans, the
+   **token's own workspace** for machines (a machine token cannot be redirected by `X-Workspace-Id`,
+   and holds no membership so it is denied `connections:manage`). `workspace_id`, `status`, and
+   `credential_id` are never request fields (`extra="forbid"` → 400); `status` is server-set to
+   `pending_auth`; PATCH mutates only `name`/`config_overrides`. `config_overrides` is stored
+   opaquely and **never read as tenant/role/status**; its only security contract is a `base_url`
+   override, which is **SSRF-linted by reusing `validate_base_url`** (never a second validator).
+   Revoke is a scoped soft delete (`status=revoked` + `deleted_at`), idempotent, and a foreign/absent
+   id is a uniform 404 (never a 403 oracle, P-17). Application `workspace_id` predicates are kept as
+   defense-in-depth over RLS (P-14).
+
+4. **Idempotency-Key (ratified minimal, canonical).** API_GUIDELINES §5 defines `Idempotency-Key`
+   for side-effecting creates, but no platform mechanism existed. A **minimal, connections-scoped**
+   Redis store was added (not a speculative platform subsystem): keyed per **workspace + endpoint +
+   key**, the first request reserves the key (`SET NX`, short TTL) and stores its response (24 h);
+   the same key + body replays it; the same key + a different body is a 409; a concurrent in-flight
+   key is a 409. The Redis layer is a UX optimization **on top of** the real guarantee — the partial
+   unique index means the DB never produces a duplicate connection even under a Redis/DB split. A
+   fresh short-lived client per call (`async with`) avoids binding a pool across event loops.
+
+**Consequences:** One migration (`0010_connections`; up/down/up verified, `alembic check` clean); no
+change to any prior table or migration. A thin `app/core/redis.py` accessor was added (Redis is
+already a stack service; readiness has its own probe). Proven by 18 unit + 12 real-Postgres+RLS
+integration + 19 real-HTTP API tests, a 21-mutation audit (0 meaningful survivors; the RLS-redundant
+predicate removals are inert defense-in-depth, verified by the catalog check), and full regression at
+warning and debug. **Deferred (out of scope):** Credentials/encryption/KEK, the Execution Runtime,
+`/v1/tool-calls`, `tool_calls`/audit, the Tools API + per-Tool enable/disable, connection health/
+test-call (M2), OAuth, and self-serve workspace creation.

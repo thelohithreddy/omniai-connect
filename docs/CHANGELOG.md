@@ -13,6 +13,27 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Connections v1 (M1-Connections-v1, ADR-0029).** The first slice of M1's execution plane: a
+  **Connection** — a workspace's authenticated instance of a Connector (Bible §4). New `connections`
+  table (migration `0010`, RLS ENABLE+FORCE + `tenant_isolation`, composite intra-tenant FK
+  `(workspace_id, connector_id) → connectors`, partial-unique `(workspace_id, name) WHERE deleted_at
+  IS NULL`, SELECT/INSERT/UPDATE grants — no DELETE) and a `connections` domain
+  (router→service→repository) exposing `/v1/connections` (POST/GET/GET{id}/PATCH/DELETE), gated by
+  `connections:manage` (owner/admin). A connection starts `pending_auth` and may bind only a **live
+  connector in the same workspace** (a foreign/deleted connector is a uniform 404). It holds **no
+  secret**: `credential_id` is a nullable placeholder (the composite FK is added by the future
+  Credentials module, P-43). `status`/`credential_id`/`workspace_id` are server-controlled (never
+  request fields — `extra="forbid"` → 400); PATCH mutates only `name`/`config_overrides`; a
+  `base_url` override is SSRF-linted by reusing `validate_base_url`; revoke is an idempotent soft
+  delete (`status=revoked` + `deleted_at`). `config_overrides` is stored opaquely and never read as
+  authority. Machine tokens (no membership) are denied `connections:manage`, and `X-Workspace-Id`
+  cannot redirect them. **Idempotency-Key** (API_GUIDELINES §5) is honored on create via a minimal,
+  connections-scoped Redis store (replay on same key+body, 409 on key reuse with a different body),
+  with the DB partial-unique as the ultimate dedup guarantee. Proven by 18 unit + 12
+  real-Postgres+RLS integration + 19 real-HTTP API tests, a 21-mutation audit (0 meaningful
+  survivors), migration up/down/up, and full regression at warning and debug. **Deferred:**
+  Credentials, the Execution Runtime, `/v1/tool-calls`, the audit log, the Tools API, and connection
+  health — all later modules.
 - **Connector diff, promotion gate & tools projection (M1.4-B1.4, ADR-0028).** The final ingestion
   slice, closing the Connector Engine v1 milestone. Adds the three deferred capabilities. **Diff:** a
   pure, deterministic `compute_diff` produces `{added, removed, changed, breaking}` Tool-by-Tool on

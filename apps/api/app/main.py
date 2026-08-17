@@ -23,6 +23,7 @@ from app.core.exceptions import DomainError
 from app.core.logging import configure_logging, get_logger
 from app.core.middleware import REQUEST_ID_HEADER, RequestContextMiddleware
 from app.core.readiness import check_readiness
+from app.domains.connections.router import connections_router
 from app.domains.connectors.router import connectors_router
 from app.domains.connectors.subscribers import register_connector_subscribers
 from app.domains.workspaces.router import api_tokens_router, invitations_router, members_router
@@ -47,6 +48,7 @@ app.include_router(api_tokens_router)
 app.include_router(members_router)
 app.include_router(invitations_router)
 app.include_router(connectors_router)
+app.include_router(connections_router)
 
 # Register domain event-bus subscribers at startup (BACKEND_SPEC §4): the connectors handler
 # enqueues the Celery ingestion task after a request commits (M1.4-B1.1).
