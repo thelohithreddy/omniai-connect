@@ -140,9 +140,6 @@ jobs:
       R2_SECRET_ACCESS_KEY: minioadmin
       R2_BUCKET: omniai-dev
       R2_REGION: auto
-      # Disposable CI-only credential master key (base64 of 32 bytes). Never decrypts production
-      # data; production supplies its own via the platform secret store (SECURITY §2.1).
-      CREDENTIAL_MASTER_KEY: sGnwe2+XJ43hHei5jRF+HsbYFVaj7gz5RQDriXxI4R4=
 
     steps:
       - uses: actions/checkout@v4
@@ -264,7 +261,12 @@ jobs:
             echo "MinIO failed to start"; docker logs minio; exit 1;
           }
 
-      - run: uv run pytest -q
+      # The credential vault needs a valid 32-byte master key. Generated per run (like
+      # BETTER_AUTH_SECRET above) so no secret literal ever enters the repository — it dies with the
+      # job and can never decrypt production data.
+      - run: |
+          export CREDENTIAL_MASTER_KEY="$(openssl rand -base64 32)"
+          uv run pytest -q
 
   security:
     name: Security — secret scan

@@ -81,9 +81,8 @@ services:
       R2_SECRET_ACCESS_KEY: minioadmin
       R2_BUCKET: omniai-dev
       R2_REGION: auto
-      # Disposable dev/CI credential master key (base64 of 32 bytes). NEVER a production key —
-      # production supplies its own via the platform secret store (SECURITY §2.1).
-      CREDENTIAL_MASTER_KEY: sGnwe2+XJ43hHei5jRF+HsbYFVaj7gz5RQDriXxI4R4=
+      # CREDENTIAL_MASTER_KEY comes from `.env` (env_file above) — generate a disposable dev key
+      # with `scripts/gen-key.sh`. Never committed: no secret literal enters the repository.
     ports:
       - "8000:8000"
     depends_on:
@@ -142,8 +141,6 @@ services:
       R2_SECRET_ACCESS_KEY: minioadmin
       R2_BUCKET: omniai-dev
       R2_REGION: auto
-      # Disposable dev/CI credential master key (base64 of 32 bytes). NEVER a production key.
-      CREDENTIAL_MASTER_KEY: sGnwe2+XJ43hHei5jRF+HsbYFVaj7gz5RQDriXxI4R4=
     command:
       ["celery", "-A", "app.workers.celery_app", "worker", "-Q", "ingestion",
        "--concurrency=2", "--loglevel=INFO", "--without-gossip", "--without-mingle"]
