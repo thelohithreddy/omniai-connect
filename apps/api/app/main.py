@@ -28,6 +28,7 @@ from app.domains.connectors.router import connectors_router
 from app.domains.connectors.subscribers import register_connector_subscribers
 from app.domains.credentials.router import credentials_router
 from app.domains.credentials.vault import validate_master_key_configured
+from app.domains.runtime.router import tool_calls_router
 from app.domains.workspaces.router import api_tokens_router, invitations_router, members_router
 from app.domains.workspaces.router import router as workspaces_router
 
@@ -52,6 +53,7 @@ app.include_router(invitations_router)
 app.include_router(connectors_router)
 app.include_router(connections_router)
 app.include_router(credentials_router)
+app.include_router(tool_calls_router)
 
 # Fail closed in production if the credential master key is missing/default/invalid (SECURITY §2):
 # the API refuses to boot rather than run the vault on a bad key. Local/CI use disposable keys.

@@ -1547,3 +1547,75 @@ real-HTTP API tests, a 25-mutation audit (0 meaningful survivors; the RLS/unique
 mutations are inert defense-in-depth), migration up/down/up, and full regression at warning and
 debug. **Deferred:** KMS, per-Workspace data keys, the rotation background job, OAuth/JWT/custom
 credential flows, the Execution Runtime (and its decrypt calls), `/v1/tool-calls`, and the audit log.
+
+## ADR-0031 — Execution Runtime v1: the single synchronous REST Tool Call path (M1-Execution-Runtime)
+
+**Status:** Accepted (2026-08-17) · **Context:** M1's critical path — turning the Connector +
+Connection + Credential foundations into live REST execution. AI_RUNTIME.md defines a 7-stage
+pipeline in a `runtime` domain and the internal `ToolCallRequest`/`ToolCallResult` contracts;
+API_GUIDELINES §1 fixes `/v1/tool-calls`; DATABASE_DESIGN §3 defines the `tool_calls` audit table;
+CONNECTOR_SPECIFICATION §8 fixes credential injection; SECURITY §2/§6 fixes decrypt + egress. This
+ADR ratifies the four decisions those specs left open and the M1↔M2 boundary. One migration
+(`0012_tool_calls`).
+
+**Decision:**
+
+1. **`POST /v1/tool-calls` (sync), `GET /v1/tool-calls/{id}` (audit read).** The invocation carries a
+   canonical `tool_name`, an optional `connection_id` (explicit, else the Connector's single active
+   Connection — ambiguity is a 400, never a guess), `arguments`, and `mode: "sync"` (async is M4).
+   The pipeline runs inline in the request path (no Celery); the synchronous hot path is deliberately
+   out of Celery (RISKS R-07, PRD FR-RT-1). Idempotency is the `Idempotency-Key` header (workspace-
+   scoped Redis, 24h) reusing the Connections pattern; unlike Connections there is no DB uniqueness
+   backstop, so the key is reserved **before** egress — a raced retry cannot double-execute.
+
+2. **`tool_calls` — append-only, partitioned audit (migration `0012`).** `id, workspace_id,
+   connection_id, tool_id, request_id, caller (jsonb), status (succeeded|failed|denied|timeout),
+   input_summary (jsonb), output_summary (jsonb), error_code, duration_ms, created_at`;
+   `PARTITION BY RANGE (created_at)` with composite PK `(id, created_at)` and a `DEFAULT` partition
+   (no migration assumes a specific month, §5). RLS ENABLE+FORCE + `tenant_isolation`; grants
+   **SELECT + INSERT only** — immutable, never updated or deleted in-band. `connection_id`/`tool_id`
+   are **plain UUID columns, not composite FKs** (ratified): an immutable audit row must outlive the
+   soft-deletion of its Tool or the removal of its Connection; DATABASE_DESIGN lists them as columns.
+   Stage 7 is not best-effort — "no audit row, no result": *every* audited outcome (success or any
+   failure) writes exactly one row and publishes `tool_call.completed`. Because the request
+   transaction rolls back on a raised exception, audited failures are **not raised** — the service
+   returns an `ExecutionOutcome` the router renders as the error envelope, so the row survives commit.
+
+3. **Credential decrypt + injection (ratified §1, §3).** Decryption is the runtime's private boundary
+   (`domains/runtime/secrets.py` is the *only* importer of `vault._unseal`, asserted by a test);
+   plaintext lives only in memory for the single outbound request, in a `CredentialSecret` whose
+   `repr` is redacted, never returned/logged/buffered/audited. Injection follows CONNECTOR_SPEC §8:
+   `bearer`→`Authorization: Bearer`, `basic`→base64 at inject, `api_key`→`connectors.auth_config
+   {key_name, location:header|query}`. **api_key is runtime-only in M1**: bearer/basic work
+   everywhere; api_key works where `auth_config` is populated (manual connectors), and an ingested
+   connector with empty `auth_config` fails closed with `connector_error`. The
+   `securitySchemes → auth_config` importer projection is **deferred connectors-domain work**.
+
+4. **One egress policy, one authz fork, per-call limits only (ratified §2, §4).** All outbound HTTP
+   goes through a new general `net.request` that reuses `app.core.net`'s *same* SSRF/allowlist/size/
+   timeout guard as the ingestion `fetch` — no second HTTP client. It adds a per-Connection host
+   **egress allowlist** (re-checked on every redirect hop, so an injected credential can never follow
+   a redirect to a foreign host) and truncates (not errors) at a 1 MiB per-call budget.
+   Authorization forks by plane (ADR-0002): **humans** need `Permission.TOOLS_EXECUTE` (VIEWER
+   denied); **machine tokens** are authorized by a valid, workspace-bound token (tokens are issued
+   unscoped pending a scope vocabulary, so an unscoped token carries full machine authority — per-
+   token scope-narrowing is deferred). An egress refusal is the new **`ssrf_blocked` (403)** code
+   added to the API_GUIDELINES §6.1 taxonomy (a policy denial, `status: denied`; the message never
+   carries the URL/address). **Rate limits, plan quotas, and the per-Connection circuit breaker are
+   M2/M3** (ROADMAP:59/73) — M1 ships only the per-call timeout + response-size + enabled/status/authz
+   policy stage.
+
+**Consequences:** One migration (`0012_tool_calls`; the codebase's first partitioned table — `env.py`
+gained partition-child exclusion for autogenerate; up/down/up verified, `alembic check` clean); no
+prior table/migration rewritten; no new runtime dependency (a focused argument validator instead of
+pulling `jsonschema`). `app.core.net` gained a general `request()` (the one egress policy) and
+`app.core.exceptions` gained `UpstreamTimeoutError` (504, already-canonical) and `EgressBlockedError`
+(the new `ssrf_blocked`, 403). Proven by 60 runtime unit + 18 real-Postgres+RLS+real-auth API tests,
+a 47-killed mutation audit (0 meaningful survivors; the 2 RLS-redundant and mutually-redundant
+credential-presence mutations are inert defense-in-depth), real-infrastructure egress verification
+(a live GitHub 401→502 mapping, a live httpbin 200 with the injected header on the real wire, and a
+live `169.254.169.254`→`ssrf_blocked` refusal), debug-level log inspection (0 plaintext/ciphertext),
+and full regression at warning and debug. **Deferred:** async/long-running Tool Calls (M4), MCP + AI/
+SDK exporters (M2/M4), OAuth/JWT/custom_headers injection + the `securitySchemes → auth_config`
+projection, rate limits/quotas/circuit breaker (M2/M3), `usage_events` billing metering (M3), the
+R2 pointer for truncated bodies, and destructive-operation confirmation.

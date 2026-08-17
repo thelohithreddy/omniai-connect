@@ -13,6 +13,31 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Execution Runtime v1 — the synchronous REST Tool Call path (M1-Execution-Runtime, ADR-0031).**
+  M1's critical path: a valid tenant request now executes a promoted REST Tool against its Connection
+  using its attached Credential. New `runtime` domain implementing the 7-stage pipeline (AI_RUNTIME §2)
+  — resolve Tool + Connection (RLS-scoped) → authorize (humans need `tools:execute`, a valid machine
+  token qualifies) → validate arguments against the Tool `input_schema` → decrypt the Credential
+  **in memory only** → construct the request from the canonical `endpoint` + inject auth per
+  CONNECTOR_SPEC §8 (`bearer`/`basic`/`api_key`) → guarded outbound call → normalize/truncate the
+  response → write the mandatory audit row + publish `tool_call.completed`. Endpoints
+  `POST /v1/tool-calls` (sync; `Idempotency-Key` replay) and `GET /v1/tool-calls/{id}`. New
+  `tool_calls` table (migration `0012`) — the codebase's first **partitioned** table
+  (`PARTITION BY RANGE (created_at)`, composite PK `(id, created_at)`, `DEFAULT` partition), RLS
+  ENABLE+FORCE + `tenant_isolation`, **SELECT+INSERT grants only** (append-only, immutable);
+  `connection_id`/`tool_id` are plain UUID columns so an audit row outlives its Tool/Connection. The
+  credential **decrypt boundary** lives in `runtime/secrets.py` — the only importer of the private
+  `vault._unseal` (asserted by a test); plaintext never returns/logs/persists. All egress reuses the
+  **one SSRF policy** via a new general `app.core.net.request` (arbitrary method/headers/body, a
+  per-Connection host allowlist re-checked per redirect hop, 1 MiB truncation) — no second HTTP
+  client. New `ssrf_blocked` (403) error code (API_GUIDELINES §6.1) for an egress refusal;
+  `upstream_timeout` (504) added. **Deferred:** async/long-running (M4), MCP/AI exporters,
+  OAuth/JWT/custom_headers + `securitySchemes → auth_config` projection, rate limits/quotas/circuit
+  breaker (M2/M3), `usage_events` metering (M3), destructive-op confirmation. Proven by 60 unit + 18
+  real-Postgres+RLS+real-auth API tests, a 47-killed mutation audit (0 meaningful survivors), and
+  real-infrastructure egress (live GitHub 401→502, live httpbin 200 with the injected header on the
+  wire, live `169.254.169.254`→`ssrf_blocked`); debug-level logs carry 0 plaintext.
+
 - **Credentials v1 — envelope-encrypted vault (M1-Credentials-v1, ADR-0030).** The radioactive slice
   of M1's execution plane: an encrypted secret bound 1:1 to a Connection. New `credentials` table
   (migration `0011`) storing only ciphertext material (`ciphertext, encrypted_dek, key_version,

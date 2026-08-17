@@ -1,10 +1,20 @@
-"""Guarded outbound HTTP egress — SSRF-safe fetching for the ingestion worker (M1.4-B0).
+"""Guarded outbound HTTP egress — the one SSRF-safe network policy for the whole platform.
 
-The Execution Runtime is the canonical "only egress" for *tenant* traffic (Bible §6.3,
-SECURITY.md §6). Connector-spec ingestion is a *second, worker-only* egress class
-(CONNECTOR_SPECIFICATION.md §18): it fetches an operator-supplied — and therefore
-attacker-influenced — URL before any Connection or Credential exists. This module is the one
-guarded fetcher that class uses. It exists and is proven *before* any importer consumes it.
+Two egress classes share this module's guard machinery, so there is exactly one place where the
+scheme/credential/DNS-rebinding/private-IP/redirect/size/timeout controls live (Bible §6.3,
+SECURITY.md §6):
+
+- **`fetch`** — connector-spec ingestion (M1.4-B0, CONNECTOR_SPECIFICATION.md §18): a GET of an
+  operator-supplied — therefore attacker-influenced — URL, before any Connection or Credential
+  exists. GET only, returns bytes, hard-fails on oversize.
+- **`request`** — the Execution Runtime's tenant egress (M1, AI_RUNTIME.md §2 stage 5): an arbitrary
+  method with injected credential headers + body against a Connection's allowlisted host, returning
+  status + headers + a size-capped (truncated, not failed) body for LLM-facing normalization.
+
+Both run the identical guard: `_validate_url` (https-only, no `user:pass@`), `resolve_and_validate`
+(every A/AAAA record checked), and the IP-pinning `GuardedTransport`. `request` also enforces
+a per-call host allowlist on every hop (the runtime's per-Connection egress boundary, §7). Neither
+honors an environment proxy. This module exists and is proven *before* any caller consumes it.
 
 Threat model and the properties this enforces (all fail-closed):
 
@@ -32,6 +42,8 @@ from __future__ import annotations
 
 import ipaddress
 import socket
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Protocol
 from urllib.parse import urlsplit
 
@@ -272,12 +284,103 @@ async def fetch(
     raise SSRFError("too-many-redirects")
 
 
+def _host_allowed(host: str, allowed_hosts: frozenset[str] | None) -> None:
+    """Raise `SSRFError` unless `host` is in the per-call allowlist. `None` means no allowlist
+    (ingestion's model); an *empty* set allows nothing (fail-closed). Comparison is case-folded."""
+    if allowed_hosts is None:
+        return
+    if host.lower() not in allowed_hosts:
+        raise SSRFError("host-not-allowlisted")
+
+
+@dataclass(frozen=True, slots=True)
+class GuardedResponse:
+    """The outcome of a guarded outbound request. `body` is decompressed and capped at `max_bytes`;
+    `truncated` is True when the upstream body was longer and got cut (never an error — the runtime
+    normalizes/truncates, unlike ingestion which hard-fails). Carries no request-side secrets."""
+
+    status_code: int
+    headers: httpx.Headers
+    body: bytes
+    truncated: bool
+
+
+async def request(
+    method: str,
+    url: str,
+    *,
+    headers: Mapping[str, str] | None = None,
+    content: bytes | None = None,
+    allowed_hosts: frozenset[str] | None = None,
+    max_bytes: int = MAX_RESPONSE_BYTES,
+    resolver: Resolver = _default_resolver,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> GuardedResponse:
+    """Issue one guarded outbound request under the full egress policy (AI_RUNTIME.md §2 stage 5).
+
+    Identical guard to `fetch` — https-only, no embedded credentials, resolve-and-validate every
+    record, IP-pinned connect, per-hop redirect re-validation, `trust_env=False`, bounded redirects,
+    connect/read/total timeouts — plus a per-call **host allowlist** enforced on the initial target
+    *and every redirect hop* (the runtime's per-Connection egress boundary, §7): a redirect that
+    leaves the allowlist is refused, which also means an injected credential header can never follow
+    a redirect to a foreign host. The response body is streamed and capped at `max_bytes` *after*
+    content-decoding; exceeding the cap truncates (with `truncated=True`), it does not raise.
+
+    Every egress-policy violation raises `SSRFError`; a slow/hung upstream raises an `httpx`
+    timeout.
+    Neither the exception nor the returned value ever carries the injected request headers or body.
+    """
+    timeout = httpx.Timeout(TOTAL_TIMEOUT, connect=CONNECT_TIMEOUT, read=READ_TIMEOUT)
+    current = url
+    previous_scheme: str | None = None
+    request_headers = dict(headers or {})
+    async with httpx.AsyncClient(
+        transport=transport or GuardedTransport(resolver),
+        timeout=timeout,
+        follow_redirects=False,
+        trust_env=False,
+    ) as client:
+        for _hop in range(MAX_REDIRECTS + 1):
+            host, port = _validate_url(current, previous_scheme=previous_scheme)
+            previous_scheme = "https"
+            _host_allowed(host, allowed_hosts)
+            # Fast, clean-erroring pre-check; the guarded backend re-resolves + validates + pins at
+            # connect, so a rebinding answer that flips after this line is still refused.
+            resolve_and_validate(host, port, resolver)
+            async with client.stream(
+                method, current, headers=request_headers, content=content
+            ) as response:
+                if response.is_redirect:
+                    location = response.headers.get("location")
+                    if not location:
+                        raise SSRFError("redirect-without-location")
+                    current = str(response.url.join(location))
+                    continue
+                body = bytearray()
+                truncated = False
+                async for chunk in response.aiter_bytes():
+                    body.extend(chunk)
+                    if len(body) > max_bytes:
+                        del body[max_bytes:]  # keep exactly the budget; drop the overflow
+                        truncated = True
+                        break
+                return GuardedResponse(
+                    status_code=response.status_code,
+                    headers=response.headers,
+                    body=bytes(body),
+                    truncated=truncated,
+                )
+    raise SSRFError("too-many-redirects")
+
+
 __all__ = [
     "MAX_REDIRECTS",
     "MAX_RESPONSE_BYTES",
+    "GuardedResponse",
     "GuardedTransport",
     "SSRFError",
     "fetch",
+    "request",
     "resolve_and_validate",
     "validate_public_ip",
 ]
