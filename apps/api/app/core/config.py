@@ -57,6 +57,15 @@ class Settings(BaseSettings):
 
     # --- Cache / Queue ---
     redis_url: str = "redis://localhost:6379/0"
+    # The Celery broker (ADR-0007, ADR-0021). Kept an *explicit* setting rather than silently
+    # reusing `redis_url` so a deployment can put the broker on its own Redis / logical DB
+    # without disturbing the app cache. Empty → falls back to `redis_url` (the least-invasive
+    # local default; the same canonical Redis, no second server).
+    celery_broker_url: str = ""
+
+    @property
+    def resolved_celery_broker_url(self) -> str:
+        return self.celery_broker_url or self.redis_url
 
     # --- Auth (Better Auth — provider in apps/web per ADR-0002/0014; verified here per
     # ADR-0015) ---
@@ -101,11 +110,18 @@ class Settings(BaseSettings):
     sentry_dsn: str = ""
     posthog_api_key: SecretStr = SecretStr("")
 
-    # --- Object storage ---
+    # --- Object storage (S3-compatible: Cloudflare R2 in prod, MinIO in local/CI — M1.4-B0.5) ---
     r2_account_id: str = ""
     r2_access_key_id: str = ""
     r2_secret_access_key: SecretStr = SecretStr("")
     r2_bucket: str = ""
+    # The S3 endpoint. In production this is the R2 account endpoint (https://<acct>.r2
+    # .cloudflarestorage.com); local/CI point it at MinIO (http://minio:9000). Empty = storage
+    # is unconfigured, which app.core.object_store treats as a fail-closed error (never a silent
+    # MinIO fallback in production). Canon names no endpoint var, so B0.5 introduces it (ADR-0024).
+    r2_endpoint: str = ""
+    # R2 ignores the region and documents "auto"; MinIO accepts any value. Not secret.
+    r2_region: str = "auto"
 
     @property
     def is_production(self) -> bool:

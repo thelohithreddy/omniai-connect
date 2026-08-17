@@ -855,3 +855,852 @@ its permission, and its boundary; it does not reopen ADR-0003/0004/0009.
 **Consequences:** One additive, reversible migration (0007); `identity` untouched. One new
 permission (7 total). No new identity, tenant-authority, or authorization mechanism. The
 connectors-enforcement mutation audit (A01–A08) left zero survivors.
+
+---
+
+## ADR-0020 — Guarded egress fetcher for connector-spec ingestion (M1.4-B0)
+
+**Status:** Accepted (2026-08-15) · **Context:** M1.4-B0 (ingestion infrastructure + security
+foundation)
+
+**Context:** Bible §6.3 / SECURITY.md §6 make the Execution Runtime the *only* egress for
+**tenant** traffic, concentrating SSRF defense in one place. Connector-spec ingestion
+(CONNECTOR_SPECIFICATION.md §18) introduces a **second, distinct egress class**: a Celery
+worker fetches an operator-supplied — therefore attacker-influenced — spec URL (and its
+external `$ref`s) *before any Connection or Credential exists*, so the runtime's
+per-Connection egress allowlist cannot govern it. This is the one reconciliation the M1.4-B
+discovery flagged. The founder ratified the infra-first (Option A) path; this ADR records the
+guarded fetcher that is built and proven **ahead of** any importer consuming it.
+
+**Decision:**
+
+1. **Ingestion spec-fetch is egress-class, worker-only, and owned by one guarded fetcher**
+   (`app/core/net.py`). Importers never perform egress themselves; they will receive the
+   fetched bytes. This is the *second* sanctioned egress alongside the runtime, not a
+   loophole in "runtime is the only egress" — it is a separate class with its own, equally
+   strict, guard.
+
+2. **DNS is validated and the validated IP is the one dialed (TOCTOU-closed).** A custom
+   `httpcore` network backend resolves the host, validates **every** returned A/AAAA record,
+   and connects to a *validated* IP; TLS still verifies the original hostname. A naive
+   `resolve → validate → get(host)` re-resolves at connect time and is a rebinding TOCTOU —
+   this is not that.
+
+3. **The blocklist covers the forms Python 3.11's stdlib misses.** Loopback, unspecified,
+   link-local (incl. 169.254.169.254 metadata), private, multicast, and reserved are rejected
+   across IPv4 and IPv6, and **IPv4-mapped (`::ffff:`), NAT64 (`64:ff9b::/96`), and 6to4
+   (`2002::/16`)** IPv6 forms are unwrapped to their embedded IPv4 and re-checked —
+   `ipaddress.is_private` does not unwrap NAT64/6to4.
+
+4. **`https` only; no embedded credentials; `trust_env=False`.** An `http` URL (incl. an
+   `https→http` redirect downgrade) is refused; a `user:pass@host` URL is refused; the client
+   never honors an `HTTP(S)_PROXY` (a proxy would do its own DNS/connect and bypass the guard).
+
+5. **Redirects are bounded (≤5) and re-validated per hop** (scheme + credentials + the backend
+   re-resolves/re-validates the new host).
+
+6. **Response size is capped on decompressed bytes (10 MB) with a streaming early-abort**, and
+   connect/read/total timeouts (5s/15s/30s) bound a hostile server. Every failure is
+   fail-closed (`SSRFError` or timeout), never a partial/oversized body.
+
+**Consequences:** No migration, no new dependency (httpx/httpcore already present). No importer,
+normalization, `connector_versions`, or `tools` — those remain deferred. Proven by a 44-case
+adversarial matrix (IP validation incl. NAT64/6to4/mapped, rebinding fail-closed, scheme/creds,
+proxy isolation, redirect re-validation/downgrade/bounds, decompressed size cap). The remaining
+M1.4-B0 foundations (Celery worker service + tenant-context, internal event bus, R2 client +
+tenant-key isolation, local/CI object store) are separate slices under the same infra-first plan.
+
+---
+
+## ADR-0021 — Celery worker execution foundation (M1.4-B0.2)
+
+**Status:** Accepted (2026-08-15) · **Context:** M1.4-B0.2 (Celery + worker execution
+foundation), the second slice of the ingestion infrastructure. Implements the Celery substrate
+ADR-0007 mandated; deliberately does NOT implement ingestion, tenant-context binding (B0.3), the
+event bus (B0.4), or R2 (B0.5).
+
+**Decision:**
+
+1. **A dedicated Celery app** (`app/workers/celery_app.py`) with every security-sensitive
+   setting explicit — Celery's defaults are not trusted:
+   - **JSON only.** `task_serializer`/`result_serializer` = json, `accept_content` = ['json'].
+     Pickle is remote code execution on the broker and can never be accepted.
+   - **No result backend.** Correctness never depends on a persisted return value.
+   - **One declared queue, `ingestion`, no auto-creation** (`task_create_missing_queues=False`)
+     — a task cannot conjure or route itself to an arbitrary queue.
+   - **At-least-once, late ack** (`task_acks_late` + `task_reject_on_worker_lost`): a crashed
+     worker's job is redelivered, not lost — so tasks must be idempotent (owned from B0.3).
+   - **Bounded execution:** hard/soft time limits (300/270s) and `worker_prefetch_multiplier=1`
+     (one long job per slot, no hoarding).
+   - **Never eager in production** (`task_always_eager=False`; eager is a test-only override).
+   - **Retry foundation:** bounded (`max_retries=5`), exponential (`retry_backoff`, cap 60s),
+     jittered — applied per task, not globally (a global would retry non-idempotent work).
+
+2. **Redis broker via an explicit `CELERY_BROKER_URL`** (falls back to `redis_url` — the same
+   canonical Redis, no second server). A dedicated logical DB for the broker is left to that
+   setting in production. No result backend, so no persistent-result Redis dependency.
+
+3. **The worker is not an HTTP surface and holds no authority.** It runs `celery worker`
+   (not uvicorn), exposes no port, consumes only `ingestion`, and — critically — its
+   environment is hand-scoped (NOT `env_file: .env`): it never inherits `BETTER_AUTH_SECRET`,
+   `R2_*`, Stripe/Resend, or any frontend/API secret. Demo tasks (`ping`, `retry_probe`,
+   `always_fails`) exist only to prove registration/routing/serialization/execution/retry —
+   they touch no connector, DB, R2, or event bus, and no task payload is ever trusted for
+   identity, role, or permission. **Binding a WorkspaceContext / GUC to a task is B0.3.**
+
+4. **Deployment:** one image, a different command. The worker reuses the API image and runs the
+   `celery worker` command (local compose service; the same prod image on Railway).
+
+**Consequences:** No migration; no new dependency (celery/kombu already present). Broker-loss is
+fail-closed (bounded reconnect retries, no crash-loop; verified). Proven by 15 config/security
+tests, a real broker+worker execution+bounded-retry test (`start_worker`, not eager), and a
+12-mutation B0.2 audit with zero survivors. The tenant-context, event-bus, and R2 foundations
+remain separate slices.
+
+## ADR-0022 — Worker tenant execution boundary (M1.4-B0.3)
+
+**Status:** Accepted (2026-08-15) · **Context:** M1.4-B0.3, the third ingestion-infrastructure
+slice. B0.2 (ADR-0021) established the Celery substrate and deliberately deferred tenant binding;
+this ADR is that binding. A background task has no HTTP request, no JWT, and no membership lookup,
+yet it still touches tenant tables — so it needs a way to establish *which* tenant it acts for
+that does **not** reintroduce the payload as an authority. The governing invariant (SECURITY.md,
+ADR-0004 RLS, ADR-0014 identity severance): **a worker task payload must never become
+authorization** — a `workspace_id` selects **WHERE** (the tenant), never **WHO / ROLE /
+PERMISSION / AUTHORITY**.
+
+**Decision:**
+
+1. **One boundary, reusing the request-path machinery** (`app/workers/context.py`,
+   `worker_tenant_uow`). It reuses the *existing* `UnitOfWork` and `bind_workspace`
+   (`SET LOCAL app.workspace_id` via `set_config(..., true)`) — **no second GUC, no second
+   transaction system, no new migration, no new SECURITY DEFINER function, no new DB role**. The
+   persisted database + RLS remain the sole authority; the worker runs as `omniai_app`
+   (non-superuser, **non-BYPASSRLS**), exactly like the request path.
+
+2. **Fail-closed context validation.** `validate_workspace_id` accepts *only* one canonical UUID
+   string — `None`, `""`, whitespace, a non-string, or a malformed value raises
+   `WorkerContextError` **before any DB access**. There is **no** default / first-workspace /
+   system tenant to fall back to; a task without a valid tenant never opens a transaction. The
+   error never carries the offending value into a message a caller might log.
+
+3. **A load-bearing order:** *validate → BEGIN → SET LOCAL → read the binding back → yield*.
+   Nothing tenant-scoped runs before the GUC is bound; a binding that does not read back is a
+   fail-closed error, never a silent unbound execution. The transaction's end clears the GUC —
+   **COMMIT** on success (a task's tenant writes persist), **ROLLBACK** on exception (nothing
+   leaks). Because binding is transaction-local (`SET LOCAL`, not `SET`/session-global), it
+   **cannot survive to the next task** on a reused pooled connection, and a rollback/retry cannot
+   carry the previous tenant forward.
+
+4. **The one worker-specific detail: a `NullPool` engine.** A prefork worker runs each task on a
+   *fresh* event loop (`asyncio.run`), and an asyncpg connection is bound to the loop that opened
+   it — so a pooled connection cannot cross tasks. `NullPool` opens a fresh connection per checkout
+   on the current loop: fork-safe and loop-safe. Transaction-local binding still guarantees
+   isolation independently of pooling.
+
+5. **The payload is a selector, never an authority.** The boundary reads *only* `workspace_id`.
+   There is no code path that reads a `role`, `permission`, `member_id`, or `kind` from a task
+   payload; supplying them confers nothing. Identity/role decisions stay where ADR-0014 put them.
+
+**Consequences:** No migration; no new dependency; no new SECURITY DEFINER function; no new DB
+role; RLS ENABLE+FORCE and `omniai_app`'s non-superuser/non-BYPASSRLS status are unchanged
+(catalog-verified). Proven by 18 real-Postgres worker-context tests (fail-closed validation;
+RLS isolation A/B; RLS-*independent* binding-correctness; `SET LOCAL` non-leak across a reused
+connection via a `pool_size=1` engine; rollback cleanup; commit-on-success; A×8/B×8 concurrency),
+a **real Redis → worker → RLS** tenant task (`start_worker`, not eager), a deployed-compose-worker
+end-to-end run, and a B0.3 mutation audit (6 constructible mutations killed; the lone survivor is
+inert redundant defense-in-depth — the fail-closed read-back verify, kept as cheap insurance).
+The event bus (B0.4) and R2 (B0.5) remain separate slices; the ingestion pipeline itself is M1.4-B1.
+
+## ADR-0023 — Internal event bus: in-process, post-commit, buffered on the UoW (M1.4-B0.4)
+
+**Status:** Accepted (2026-08-15) · **Context:** M1.4-B0.4, the fourth ingestion-infrastructure
+slice. BACKEND_SPEC §4 (governed by ADR-0001) specifies an internal event bus that is
+"in-process now, broker later (Redis Streams is the planned swap)"; this ADR builds the contract
+and the in-process transport only. It publishes no domain event (`connector.ingested` and friends
+are M1.4-B1), adds no table, and is deliberately **not** an authorization mechanism, a tenant
+selector, a second transaction system, a job queue, or a durable-delivery guarantee.
+
+**Decision:**
+
+1. **A frozen Pydantic `Event` envelope** (`app/core/events.py`) carrying `event_id` (a
+   server-generated UUIDv7 from `core/ids.py`), `event_type`, `version`, `workspace_id`,
+   `occurred_at`, and a JSON-safe `payload` — the canon fields (BACKEND_SPEC §4) plus an explicit
+   `version`. Immutability and validation are structural, not conventional:
+   - `frozen=True` makes the envelope an immutable fact; `extra="forbid"` is a **security
+     control** — a caller cannot smuggle a `role`, `member_id`, `token`, or any authority field
+     into the envelope. The envelope carries WHERE (`workspace_id`) and WHAT (`event_type` +
+     `payload`); WHO, when a domain needs it, rides in the typed payload as a non-authoritative
+     reference, never as authority (canon lists no actor field; ADR-0022).
+   - `event_type` must be a dotted namespace (`connector.ingested`); `version >= 1` (explicit,
+     starting at 1; same type + higher version = contract evolution — the smallest mechanism, an
+     integer, no schema registry, compatibility owned by the subscriber); `occurred_at` must be
+     timezone-aware and is normalised to UTC (a naive wall-clock is refused); `payload` is typed
+     `JsonValue`, so an ORM entity, a connection, or any arbitrary Python object is rejected. No
+     payload **byte** bound is imposed: in B0.4 an event is authored only by trusted server code
+     (there is no untrusted → payload path), so a size cap is not a security-critical bound to
+     derive; a future module that accepts untrusted event input owns that limit.
+
+2. **`bus.publish(event)` takes no transaction handle** — deliberately, so the future broker swap
+   is invisible ("callers never notice the swap", BACKEND_SPEC §4). In-process, the ambient
+   transaction is found through a **task-scoped `ContextVar`** (the same mechanism `core/logging.py`
+   uses for `request_id`/`workspace_id`; it follows `await` and never bleeds between concurrent
+   requests). `publish` buffers the event on that transaction's `UnitOfWork`; when the bus becomes
+   a broker, the same call enqueues to Redis Streams instead.
+
+3. **Handlers run after COMMIT, buffered on the UoW** (BACKEND_SPEC §4). The `UnitOfWork`
+   (`core/db.py`) gains the buffer and dispatches it *after* its `session.begin()` block commits;
+   an exception (handler error or a failed commit) propagates out of the block and skips dispatch,
+   so **a rolled-back transaction emits nothing**. The bus never opens, commits, or rolls back a
+   transaction — the UoW owns the lifecycle. Wired into both origins: the request path (`get_uow`)
+   and the worker path (`worker_tenant_uow`).
+
+4. **Tenant-match is fail-closed.** `UnitOfWork.buffer_event` refuses an event whose `workspace_id`
+   is not the transaction's bound tenant (and refuses to publish before a workspace is bound) —
+   event metadata can never become a tenant selector (ADR-0022), defence in depth over RLS.
+
+5. **Explicit registration; type-scoped, isolated, bounded dispatch.** `subscribe(event_type,
+   handler)` registers at startup (no filesystem scan, no import side effects); dispatch delivers
+   only to a type's handlers, runs sync or async handlers, **isolates** a handler failure (logged
+   with the non-secret envelope identifiers — never the payload — and never failing the
+   already-committed publisher), and bounds nested re-dispatch with a depth guard.
+
+6. **Explicit, honest semantics.** In-process delivery is **best-effort at-most-once** (a crash
+   between COMMIT and dispatch loses the event); **at-least-once is a property of the *future*
+   broker**, so handlers must be idempotent and this module claims **no exactly-once** guarantee
+   and adds no dedup table. The bus is **not Celery** — heavy work is a Celery task a handler
+   enqueues (ADR-0007), never the bus; customer-facing events use `webhooks_outbox`, not this bus.
+
+**Consequences:** No migration; no new table; no new dependency (Pydantic already present); no new
+SECURITY DEFINER function; no new DB privilege; RLS ENABLE+FORCE and `omniai_app`'s
+non-superuser/non-BYPASSRLS status unchanged (catalog-verified). Proven by 54 tests — 48 unit
+(envelope validation, immutability, JSON-safe payload, forbidden authority fields, type-scoped
+dispatch, handler isolation, bounded reentrancy, fail-closed publish, secret-safe logging, and the
+UoW buffer/tenant-match/drain) and 6 real-Postgres integration (buffered-until-commit,
+rollback-emits-nothing, fail-closed tenant-match, A/B isolation, A×8/B×8/C×8 concurrency, and the
+request-path emission) — plus a B0.4 mutation audit of 23 constructible mutations, **all killed, 0
+survivors**, and a live in-process publish→commit→dispatch run. R2 (B0.5) remains a separate slice;
+the ingestion pipeline that first publishes `connector.ingested` is M1.4-B1.
+
+## ADR-0024 — Object storage: one S3-compatible boundary, tenant-isolated by object key (M1.4-B0.5)
+
+**Status:** Accepted (2026-08-15) · **Context:** M1.4-B0.5, the fifth ingestion-infrastructure
+slice. Canon (SYSTEM_ARCHITECTURE, CONNECTOR_ENGINE) stores spec files, export artifacts, and
+oversized/binary runtime payloads in Cloudflare R2, referenced by a server-constructed object key
+(`raw_spec_ref`). This ADR builds only the storage client and its **tenant-key isolation** — the
+named B0.5 deliverable — and nothing else: no importer, no `raw_spec_ref` persistence (that column
+lands with ingestion in B1), no DB row, no public route, no presigned URLs.
+
+**Decision:**
+
+1. **One `ObjectStore` abstraction over the S3 API** (`app/core/object_store.py`). Production is
+   Cloudflare R2; local/CI is MinIO; the two differ only by `R2_ENDPOINT`. `aioboto3` (async, so
+   the storage path is non-blocking like the rest of the worker/request path) is the only S3 SDK
+   and is **confined to this module** — no application code imports boto3/botocore, and the untyped
+   SDK surface never escapes the module's fully-typed public API. The store exposes exactly
+   `put`/`get`/`head`/`delete` (+ a dev/CI-only `ensure_bucket`); no list, no versioning, no
+   presigned URLs, no multipart — none are canon in B0.5.
+
+2. **A single bucket is infrastructure; tenant isolation is the object key.** Every key is
+   `ws/<workspace_id>/<relative_path>`, produced only by `TenantObjectKey.for_workspace` from a
+   **trusted** workspace UUID (a resolved `WorkspaceContext` or worker tenant context — never a
+   request body, payload, JWT claim, or task field) and an **explicit allowlist grammar** (not
+   pathlib): each `/`-separated segment must match `[A-Za-z0-9._-]+` and never be `.`/`..`. That
+   grammar rejects traversal, backslashes, encoded traversal (`%2e` has `%`), null bytes, control
+   characters, whitespace, unicode, absolute/UNC paths, and empty segments — by construction, so a
+   hostile path is refused before any provider call. `ObjectStore` operations take a
+   `TenantObjectKey`, never a raw string, so a caller cannot present an unvalidated or cross-tenant
+   key; even a relative path shaped like `ws/<B>/x` nests under the caller's own prefix and can
+   never address tenant B. The provider is never the authorization system, and R2/MinIO
+   credentials are never tenant credentials.
+
+3. **Config is validated and fails closed.** `resolve_object_store_config` requires
+   endpoint/bucket/access-key/secret and, in production, an `https://` endpoint — there is **no
+   silent MinIO fallback in production**. Errors name the missing setting, never its value; the
+   secret is a pydantic `SecretStr` unwrapped only at the SDK call, so a stray repr/log cannot leak
+   it. New settings `R2_ENDPOINT`/`R2_REGION` were added (canon named neither).
+
+4. **Errors are translated to a safe hierarchy** (`ObjectKeyError`/`ObjectNotFoundError`/
+   `StorageConfigError`/`StorageProviderError`): a 404/NoSuchKey becomes not-found; anything else
+   surfaces only the operation and the S3 error *code* — never the raw SDK string (which can embed
+   the endpoint/bucket/signed request), never a credential. Storage retries are botocore's bounded
+   `standard` mode (idempotent ops only); the store is never a second scheduler — Celery owns task
+   retries (ADR-0021).
+
+5. **Client lifecycle.** A client is opened per operation via `async with`, which both guarantees
+   sockets are closed (no leak) and is loop-safe for the prefork ingestion worker (fresh
+   `asyncio.run` loop per task, ADR-0022) — the same reasoning as B0.3's per-task DB connection.
+   Ingestion is not a hot path; a lifespan-shared client is a future optimisation.
+
+6. **Credential scoping.** Storage credentials reach only the services that need them: the API and
+   the ingestion **worker** (which writes fetched specs to R2, CONNECTOR_SPECIFICATION §18). In
+   compose these are dev-only MinIO credentials; MinIO itself receives no R2 secret. (The `web`
+   service inherits the empty `R2_*` placeholders from the shared dev `.env` via its pre-existing
+   broad `env_file`; those values are empty, Next.js does not read them, and production web on
+   Vercel carries no R2 secret — tightening `web`'s env is a separate hardening task, out of the
+   B0.5 storage-boundary scope.)
+
+**Consequences:** One new dependency (`aioboto3`, pure-Python; mypy-scoped like celery/kombu). No
+migration; no table; no SECURITY DEFINER; no new RLS policy or DB privilege (RLS/catalog unchanged,
+migration head still 0007). No public bucket, no anonymous access, no presigned URLs, no public
+file route (all deferred/absent). Proven by 72 tests — an adversarial `TenantObjectKey` grammar
+matrix (traversal/encoding/absolute/UNC/null/control/prefix-collision), fail-closed config
+resolution (TLS-in-prod, no secret leak), and **real-MinIO** integration (PUT/GET/HEAD/DELETE,
+missing-object, cross-tenant isolation, A×8/B×8/C×8 concurrency, per-op client lifecycle,
+unreachable-endpoint and wrong-credential failure without leakage) — plus a B0.5 mutation audit of
+17 constructible mutations (16 killed; the lone survivor is inert, botocore selecting path-style for
+a bare-host MinIO endpoint regardless), and a live cross-tenant isolation run. The importer that
+first writes `raw_spec_ref` is M1.4-B1.
+
+## ADR-0025 — Connector ingestion: OpenAPI 3.0 → canonical Tool Schema (M1.4-B1.1)
+
+**Status:** Accepted (2026-08-16) · **Context:** M1.4-B1, the first real connector-ingestion
+pipeline (ROADMAP §M1, ADR-0003). B1 as canonically specified is an epic (OpenAPI 3.0 **and** 3.1,
+Swagger 2 → OpenAPI 3 conversion, remote `$ref` resolution, `diff_summary`/promotion, the `tools`
+denormalization table, scheduled re-sync), and its endpoint + event-payload contracts are not
+written in canon (§3 forbids inventing them). The founder ratified a bounded **first slice, B1.1**,
+and the two undefined contracts below. This ADR records B1.1; the rest are explicit follow-on
+slices (B1.2 upload + remote `$ref`; B1.3 Swagger→3; B1.4 diff/promotion + `tools`).
+
+**Decision (B1.1 scope):**
+
+1. **`connector_versions` (migration 0008).** The immutable ingested snapshot (DATABASE_DESIGN §5):
+   `version` (monotonic int per connector), `spec_hash`, `raw_spec_ref` (R2 key), `normalized_schema`
+   (jsonb Tool Schema set), `diff_summary` (jsonb, NULL until B1.4). RLS `ENABLE`+`FORCE` +
+   `tenant_isolation`; grants are **INSERT/SELECT only** (immutability enforced at the privilege
+   level — no UPDATE/DELETE). Composite intra-tenant FKs both ways (`(workspace_id, connector_id) →
+   connectors`, and the previously-deferred `connectors.current_version_id → connector_versions`,
+   P-43, `use_alter` for the cycle). No `tools` table (B1.4).
+
+2. **A hostile-input OpenAPI 3.0 parser + deterministic normalizer** (`domains/connectors/
+   openapi.py`), framework-free and with **no network capability** (it imports no HTTP library and
+   the `$ref` resolver is synchronous). Safety: JSON or YAML via a hardened `SafeLoader` that
+   refuses anchors/aliases (billion-laughs) and all `!!python/...` construction (no code execution);
+   bounded raw size (10 MB), structural depth (64), `$ref` depth (32) and count (10 000); non-finite
+   numbers refused; **local `$ref` only** (remote refs refused — and unfetchable regardless);
+   cycles broken. Normalization maps one Tool per `(path, method)` to the canonical Tool Schema
+   (CONNECTOR_SPECIFICATION §2): `name = {connector_slug}_{operation_slug}` (operationId → generated,
+   deterministic `_N` suffixes), params+requestBody merged into `input_schema` with `endpoint.binding`,
+   `security → auth`, `servers → base_url`, safety `annotations`. `spec_hash` = SHA-256 over the
+   canonical JSON (sorted keys, no whitespace) of the ordered set — **version-independent**, so it
+   dedupes no-op re-syncs (§3).
+
+3. **The pipeline composes the proven foundation** (`domains/connectors/ingestion.py`): guarded
+   fetch (B0.1, the only egress) → normalize → dedup → store raw (B0.5, key
+   `ws/<workspace_id>/connectors/<id>/specs/v<n>.json`) → persist `connector_versions` + advance
+   `connectors.current_version_id` and status `ingesting → active` → post-commit `connector.ingested`
+   (B0.4), all under the worker tenant context (B0.3). Same `spec_hash` as the current version →
+   no-op (no empty version); different → append version N+1. A hard `IngestionError` (safe
+   `reason_code`, never a stack trace/URL/secret) rolls back and, in a fresh transaction, moves the
+   connector to `failed` with a `connector.ingestion_failed` event. Ordering is honest: the spec is
+   fetched before the transaction; the object is written before COMMIT (an orphan on rollback is
+   documented, keyed by the not-yet-consumed version number so a retry overwrites it); no
+   distributed transaction is claimed.
+
+4. **Async endpoint** `POST /v1/connectors/{connector_id}/versions` (the ratified contract), gated
+   by the existing `connectors:manage` (owner/admin) — no new authorization. It transitions the
+   connector to `ingesting` and **buffers a post-commit trigger** that enqueues the Celery task, so
+   the worker never reads the connector before the transition is durable and a rolled-back request
+   enqueues nothing. Returns 202 with the connector in `ingesting`; the terminal state is the
+   worker's. The `workspace_id` is the authenticated context — `source_url` names *where* to fetch,
+   never *which tenant*.
+
+5. **Ratified contracts (were undefined in canon).** `connector.ingested` payload =
+   `{connector_id, connector_version, spec_hash}` (+ envelope); `connector.ingestion_failed` =
+   `{connector_id, reason_code}` — no secrets, no raw spec. Endpoint as in (4).
+
+**Consequences:** One migration (0008, reversible, one head); one dependency (`pyyaml`, `safe_load`
+only, confined to `openapi.py`); no new SECURITY DEFINER, no new DB role, no new RBAC/auth, RLS/
+catalog otherwise unchanged. `event_bus.publish`'s ambient-sink contextvar does not cross FastAPI's
+DI boundary, so the request path buffers via the held `uow.buffer_event` (the worker path is
+unaffected); the test `get_uow` override was made faithful to production (it now dispatches
+post-commit). Proven by 55 tests — 37 parser/normalizer unit (adversarial: size/depth/alias/
+non-finite/remote-cyclic-missing-ref bombs; determinism; mapping), 10 real-Postgres+MinIO pipeline
+(persist/activate, dedup no-op, version append, tenant isolation under RLS, storage-key isolation,
+failure→failed, A×8/B×8 concurrency), 8 real-HTTP endpoint (202/RBAC/404/409/400, no smuggled
+workspace) — a 21-mutation B1.1 audit with **0 survivors**, and a live real-worker ingestion run.
+Deferred to B1.2+: file upload, remote `$ref`, Swagger 2 → OpenAPI 3, OpenAPI 3.1, `diff_summary`/
+promotion, the `tools` table, scheduled re-sync — none started.
+
+## ADR-0026 — Connector ingestion: file upload + remote `$ref` (M1.4-B1.2)
+
+**Status:** Accepted (2026-08-16) · **Context:** M1.4-B1.2, extending the released B1.1 OpenAPI 3.0
+URL ingestion with the two remaining source/resolution capabilities canon defines: **file upload**
+and **remote `$ref` resolution**. Both compose the existing pipeline (B0.1 fetcher, B0.5 ObjectStore,
+B0.2/B0.3 worker, B0.4 events, ADR-0025 parser) — no new SSRF boundary, storage abstraction, queue,
+event system, tenant mechanism, or authorization chain. The upload endpoint/wire contract and the
+413/415 question were canon-silent (§3); the founder ratified the contract below. No migration.
+
+**Decision:**
+
+1. **Remote `$ref` through the one guarded fetcher.** The parser's resolver (`openapi.py`) is now
+   async and resolves local **and** remote refs, but it still has **no network capability of its
+   own** — a remote ref is fetched only through an **injected `fetch` callback** (§15's
+   `ImportContext`), which the pipeline wires to the B0.1 guarded fetcher. So there remains exactly
+   one SSRF boundary: HTTPS-only (prod), no embedded credentials, no proxy, private/loopback/
+   link-local/metadata/IPv4-mapped/NAT64/6to4 rejected, ≤5 re-validated redirects, 10 MB/fetch,
+   30 s (ADR-0020). Non-http schemes (`file://`, …) are refused *before* the fetcher is called.
+   With `fetch=None` a remote ref is refused — the exact local-only behaviour B1.1 shipped.
+   Everything is bounded (§11): resolution depth ≤32, total refs ≤10 000, **aggregate remote bytes
+   ≤50 MB**, per-document ≤10 MB; cross-document cycles are detected by a `(url, fragment)` stack
+   and broken; each distinct remote URL is fetched at most once per ingestion (in-memory dedup, so
+   a fan-out of repeated refs is one fetch). Local refs inside a remote document resolve against
+   *that* document. A remote-ref failure (SSRF/timeout/malformed/missing) is **fatal** — a hard
+   `IngestionError` → connector `failed` — never a silent skip. Because refs are inlined before the
+   Tool set is built, `spec_hash` depends only on the resolved content, not the ref origin: the
+   same resolved content yields the same hash and dedupes; a changed remote dependency yields a new
+   version. The §17 Redis cross-ingestion cache (`ws:{workspace_id}:spec:{sha256(url)}`, TTL ≤1h)
+   is a documented perf optimisation, deferred — the in-memory per-ingestion dedup is the
+   correctness/DoS bound this slice needs.
+
+2. **File upload (ratified contract).** `POST /v1/connectors/{connector_id}/versions` becomes
+   `multipart/form-data` accepting **exactly one** of a `source_url` field (URL ingestion,
+   unchanged semantics) or a `file` upload; `connectors:manage`, still async, still 202 +
+   `ingesting`. Upload is hostile input: the multipart part size is bounded **explicitly**
+   (`request.form(max_part_size=10 MB+…, max_files=1, max_fields=3)` — never the 1 MB framework
+   default), the file is validated (non-empty, ≤10 MB), unknown form fields are refused (a client
+   cannot smuggle `workspace_id`/`status`), and the **filename is discarded** — never used for the
+   storage key (a fresh `uuid`), the content type (parsing is byte-based in the worker), or a log
+   line. The worker cannot re-fetch an upload (§18: fetch is worker-only egress), so the API
+   **stages** the bytes to the tenant ObjectStore at `ws/<ws>/connectors/<id>/uploads/<uuid>.json`
+   and the trigger carries that key; the worker reads it back through
+   `TenantObjectKey.for_workspace` (confined to *this* tenant's prefix, traversal-rejecting) and
+   runs the same pipeline, writing the canonical `raw_spec_ref` at `specs/v<n>.json`. Oversized/
+   unsupported/malformed uploads map to **400 `validation_error`** (the closed API taxonomy has no
+   413/415). A rejected request best-effort-deletes its staged object; the transient staging object
+   on the happy path is a bounded, documented orphan (consistent with B1.1's rollback-orphan
+   stance; an R2 lifecycle rule on the `uploads/` prefix is a future op concern).
+
+3. **One dependency added** (`python-multipart`, required by Starlette for multipart parsing;
+   parsing is bounded explicitly, not left to defaults). The `connector.ingested` /
+   `connector.ingestion_failed` payloads are unchanged and carry no URL, key, spec body, or secret.
+
+**Consequences:** No migration; `connector_versions` immutability (INSERT/SELECT-only grants) and
+RLS unchanged; no new SECURITY DEFINER / role / RBAC / auth. The B1.1 endpoint's request encoding
+changed from a JSON body to a multipart form field (its tests were updated); route, 202/ingesting
+semantics, RBAC, tenant isolation, and the pipeline are otherwise intact. Making the resolver async
+rippled a mechanical `await` through the parser and its 37 B1.1 tests (behaviour preserved: no
+fetch → remote refused). Proven by 31 new tests — 18 remote-ref (resolution, local-in-remote,
+nested/relative, dedup, cycle, count/depth/aggregate bounds, fatal failure, non-http-refused-before-
+fetch, no-fetch-refused, location-independent hash), 8 upload endpoint (multipart, exactly-one,
+empty/oversized/unknown-field, RBAC, filename-never-in-key), 5 real-Postgres+MinIO pipeline (upload
+persist/dedup/missing-staged, remote-ref through the pipeline) — a 12-mutation B1.2 audit (11 killed;
+1 inert redundant-guard survivor), a live real-worker upload run, and full regression **1028 passed**
+at warning and debug. Deferred to B1.3+: Swagger 2 → OpenAPI 3, OpenAPI 3.1, `diff_summary`/
+promotion, the `tools` table, the §17 remote-ref cache, scheduled re-sync — none started.
+
+## ADR-0027 — Connector ingestion: Swagger 2 → OpenAPI 3 conversion (M1.4-B1.3)
+
+**Status:** Accepted (2026-08-16) · **Context:** M1.4-B1.3, the last ingestion-format slice of the
+Connector Engine v1. Canon is explicit (CONNECTOR_ENGINE §3.2, CONNECTOR_SPECIFICATION §6): a
+Swagger 2.0 document is *converted to OpenAPI 3 as a single upfront step, then the OpenAPI 3
+importer runs — no separate normalization logic to maintain*. `source_type` already admits
+`swagger2` (ADR-0019). Two points were canon-silent; the founder ratified both (below). No migration.
+
+**Decision:**
+
+1. **A pure, network-free converter (`swagger.py`).** Conversion is a deterministic structural
+   transform: a parsed Swagger 2.0 dict in, an equivalent OpenAPI 3.0.3 dict out. It performs **no
+   I/O of any kind** — no network, DB, ObjectStore, or request/auth/tenant state — so it is
+   independently testable and adds **no** new SSRF boundary, parser, `$ref` resolver, storage, queue,
+   event system, tenant mechanism, or authorization chain. It is invoked by one new entry,
+   `openapi.to_openapi3(document)`, which the pipeline calls *once* between `load_spec` and
+   `normalize`: an OpenAPI 3.0.x document passes through; a Swagger 2.0 document is converted; the
+   result is re-validated by the **same** OpenAPI-3 gate (`detect_version`) so a bad conversion can
+   never reach the importer. **No new dependency** — a library would introduce a second parser and
+   heavy transitive deps; the hand-written converter matches the framework-free `openapi.py`.
+
+2. **Mapping (CONNECTOR_SPECIFICATION §6).** `definitions → components.schemas`; `parameters →
+   components.parameters` (non-body) / `components.requestBodies` (reusable body); `responses →
+   components.responses`; `securityDefinitions → components.securitySchemes` (basic → http/basic,
+   apiKey unchanged, oauth2 flow → the OpenAPI-3 `flows` object); a **body parameter → requestBody**
+   (content per `consumes`, default `application/json`); **formData → a form requestBody**
+   (`multipart/form-data` when a `file` field is present, else `application/x-www-form-urlencoded`;
+   `type: file → {type: string, format: binary}`); a non-body parameter's inline schema is lifted
+   under `schema` and `collectionFormat → style/explode`; `discriminator` string → object. Only
+   **local** `#/definitions|parameters|responses/*` refs are rewritten to `#/components/*`; **remote
+   refs are left untouched** — a Swagger remote `$ref` keeps its `#/definitions/…` fragment and
+   resolves, as-is, through B1.2's one resolver (which navigates a JSON-pointer fragment literally in
+   whatever document it fetched). Only the root document is converted; there is nothing
+   Swagger-specific to fetch.
+
+3. **`host`/`schemes`/`basePath` → `servers` metadata only, never a fetch target (ratified strict
+   detection).** These become the connector's `base_url` candidate exactly as OpenAPI `servers` do
+   (https ordered first); because the converter performs no I/O and ingestion fetches only its own
+   `source_url`, a Swagger `host` can **never** become an ingestion SSRF vector. Detection is strict:
+   conversion happens **iff** top-level `swagger == "2.0"` (exact string; numeric `2.0`, `"1.0"`,
+   etc. → `unsupported_format`); a document declaring **both** `swagger` and `openapi` is refused as
+   **ambiguous** (an attacker must not steer parser selection); Swagger is never inferred from
+   incidental fields (`host`, `definitions`). The **original Swagger bytes remain the canonical
+   `raw_spec_ref`** — the converted document is a transient intermediate. `spec_hash` is unchanged
+   (over the normalized Tool set): a Swagger document and its native OpenAPI-3 equivalent normalize
+   to the **same** Tool set → the **same** hash → cross-format dedup; idempotency and versioning are
+   B1.1/B1.2's, untouched. The error taxonomy is **reused** — no new reason code. Conversion is
+   bounded (recursion depth-guarded on top of `load_spec`'s size/depth caps; O(size), no new
+   unbounded path).
+
+4. **Deferred (ratified).** Canon says conversion warnings should "surface as lint findings", but
+   the lint-findings surface is part of the §4 stage-4 lint stage that B1.1/B1.2 never built (no
+   column, no event field). Adding one would cross the DB/event-contract firewall, so the **warnings
+   surface is deferred** with the rest of the lint stage; conversion itself is faithful and
+   deterministic. `x-nullable → nullable` and richer collectionFormat/header fidelity are likewise
+   deferred niceties (inert for the current normalizer).
+
+**Consequences:** No migration; `connector_versions` immutability and RLS unchanged; no new SECURITY
+DEFINER / role / RBAC / auth; the API surface (router/service/events/subscribers) is **untouched** —
+conversion is entirely worker-side, so a Swagger file/URL flows through the existing multipart
+endpoint and the worker converts. `detect_version` remains the OpenAPI-3 gate (converted docs never
+carry `swagger`; a raw `swagger` reaching it is refused as defence in depth). Proven by 40 converter
+unit tests (detection, every top-level/parameter/body/formData/schema/response mapping, ref
+rewriting, deep-nesting rejection, no-network, determinism, and a Swagger-vs-native equal-hash
+proof) + 3 real-Postgres+MinIO pipeline tests (convert-and-ingest with the original bytes retained,
+cross-format dedup to one version, a Swagger remote `$ref` through the guarded fetcher), a
+30-mutation B1.3 audit (0 meaningful survivors), a live real-worker Swagger ingestion, and full
+regression at warning and debug. Deferred to B1.4: `diff_summary`, promotion gating, the `tools`
+denormalization table; also OpenAPI 3.1, the §17 remote-ref cache, scheduled re-sync — none started.
+
+## ADR-0028 — Connector diff, promotion gate, and tools projection (M1.4-B1.4)
+
+**Status:** Accepted (2026-08-16) · **Context:** M1.4-B1.4, the final ingestion slice, closing the
+Connector Engine v1 milestone. It lands the three capabilities B1.1–B1.3 deferred: version diffing,
+promotion gating, and the `tools` denormalization table (CONNECTOR_SPECIFICATION §3/§4/§185,
+CONNECTOR_ENGINE §3/§7, DATABASE_DESIGN §3). Two points were canon-silent because they depend on the
+future **Connections** module; the founder ratified both (below). One new migration (`0009_tools`).
+
+**Decision:**
+
+1. **Deterministic diff (`diff.py`, pure).** `compute_diff(old_tools, new_tools) →
+   {added, removed, changed, breaking}`, computed Tool-by-Tool on **source identity** — the
+   canonical tool name, which encodes operationId/method+path with stable disambiguation (§5), so a
+   re-described operation is a `changed` entry and a renamed operationId is a remove + add. A
+   `changed` entry lists the content fields that moved (excluding version-specific / identity
+   fields) and flags the `input_schema` change **breaking** per §185: *a required argument added, an
+   argument removed, or an existing argument's type narrowed*. `breaking` (the gate input) is any
+   removed tool OR any breaking change; additive edits (new tool, new optional argument, description/
+   annotation/enum changes) are not breaking. Output is deterministic and content-only — no
+   timestamps, ids, URLs, workspace ids, or secrets — persisted as `connector_versions.diff_summary`.
+
+2. **Promotion gate (ratified).** Ingestion computes the diff against the current version. A **first
+   version or a non-breaking (additive) diff auto-promotes** inside the ingestion transaction
+   (§381). A **breaking diff is persisted with its `diff_summary` but NOT auto-promoted**: the
+   connector keeps serving its current version (status returns to `active`), no tools are projected,
+   and **no `connector.ingested` fires** (the live set is unchanged). An owner/admin then promotes
+   explicitly via `POST /v1/connectors/{connector_id}/versions/{version}/promote`
+   (`connectors:manage`, synchronous, idempotent, 200). Canon gates on breaking changes *"used by
+   active Connections"*, but **Connections are a future module** — so the founder ratified the
+   conservative reading: gate **all** breaking diffs (false caution is cheaper, §6/§13); the
+   usage-based *narrowing* of the gate is deferred to the Connections module. Authorization is the
+   existing chain only (JWT → X-Workspace-Id → membership → `connectors:manage` → connector
+   ownership → RLS); no Connection / spec / version field ever influences authority.
+
+3. **`tools` projection (`promotion.py`, migration `0009`).** `tools` is a **projection** of the
+   *active* version's Tool set — `connector_versions.normalized_schema` stays authoritative (§3).
+   Promotion **swaps the active set** and never mutates schema in place: the current live rows are
+   soft-deleted (`deleted_at`), the new version's rows inserted (`connector_version_id` = the
+   promoted version), and each Tool's `enabled` override re-applied on identity (name). The live set
+   is `deleted_at IS NULL`; a removed Tool has no new row and stays soft-deleted — deprecated,
+   retained for audit, failing `tool_not_found` (§13). The projection + pointer advance + event are
+   one transaction shared by both callers (worker auto-promote and the explicit endpoint), so there
+   is exactly one implementation. `tools` columns per DATABASE_DESIGN §3 (`name, description,
+   input_schema, output_hints NULL, annotations` (carrying tags), `enabled` default true,
+   `deleted_at`); RLS ENABLE+FORCE + `tenant_isolation`; two composite intra-tenant FKs (connector
+   AND version in the same workspace); **SELECT/INSERT/UPDATE grants — no DELETE** (deprecation is a
+   soft delete); partial unique `(connector_version_id, name) WHERE deleted_at IS NULL` so
+   re-promotion never collides with history.
+
+4. **Event (ratified) + idempotency + concurrency.** On activation/promotion, **reuse
+   `connector.ingested`** (canon §343 — "promotion publishes connector.ingested"); no new event type
+   is invented, and its payload is unchanged (connector id, version, spec_hash — no secrets). The
+   auto-promote path dedupes on `spec_hash` (a no-op re-sync creates no version, no tools, no event);
+   Celery redelivery re-runs to the same hash. Explicit promotion is idempotent (promoting the
+   current version is a no-op) and concurrency-safe: the connector row is locked `FOR UPDATE`, so
+   concurrent promotions (and a promotion racing the worker) serialize — the winner projects, the
+   loser no-ops — with the partial-unique index as the correctness backstop against duplicate rows.
+
+**Consequences:** One migration (`0009_tools`; up/down/up verified, `alembic check` clean); no
+change to `connectors` / `connector_versions`, no historical migration rewritten. The event contract
+is unchanged. The B1.1–B1.3 auto-promote-always behaviour changes only for **breaking** re-syncs
+(now held pending) — one existing test that used a removal was split into an additive-auto-promote
+test and a breaking-pending test. Proven by 19 diff unit tests + 11 real-Postgres+MinIO integration
+tests (auto-promote, breaking-pending, tools projection, override persistence, explicit promotion,
+concurrency) + 6 promote-endpoint API tests (RBAC, 404, 409, idempotency, swap), a 26-mutation B1.4
+audit (0 meaningful survivors), migration up/down/up, and full regression at warning and debug.
+**Deferred:** the usage-based gate refinement, an auto-promote-per-Connector setting, the
+`deprecated`/`archived` states, scheduled re-sync, and the §4 lint surface — all belonging to later
+modules.
+
+## ADR-0029 — Connections: a workspace's authenticated instance of a Connector (M1-Connections-v1)
+
+**Status:** Accepted (2026-08-17) · **Context:** M1-Connections-v1, the first slice of M1's
+execution plane (after the audit that reconstructed the remaining M1 scope). A **Connection** binds
+a Connector to a Workspace and carries the lifecycle and non-secret config that a Credential (next
+module), the Execution Runtime, and the Tool-Call audit will all reference (Bible §4,
+DATABASE_DESIGN §3, API_GUIDELINES §2). It holds **no secret**. One migration (`0010_connections`).
+
+**Decision:**
+
+1. **A structural, secret-free tenant entity.** `connections` (migration `0010`): `id, workspace_id,
+   connector_id, name, status (pending_auth|active|error|revoked, default pending_auth),
+   credential_id (nullable placeholder), config_overrides (jsonb), last_health_check_at, deleted_at,
+   timestamps`. RLS ENABLE+FORCE + `tenant_isolation`; a composite intra-tenant FK
+   `(workspace_id, connector_id) → connectors(workspace_id, id)` so a connection can only bind a
+   connector in the **same** workspace (a cross-tenant binding is unrepresentable); a
+   `UNIQUE(workspace_id, id)` target for the future credentials/tool_calls composite FKs; a **partial
+   unique** `(workspace_id, name) WHERE deleted_at IS NULL` so a revoked name frees up and the DB —
+   not an application check — is the arbiter under concurrency; grants **SELECT/INSERT/UPDATE, no
+   DELETE** (revoke is a soft delete). Layered router→service→repository, reusing the connectors
+   patterns exactly.
+
+2. **`credential_id` is a forward-compatible placeholder (P-43).** The `credentials` table does not
+   exist yet, so `credential_id` ships as a bare nullable UUID with **no FK** — exactly the pattern
+   `connectors.current_version_id` used before `connector_versions` landed. The Credentials module
+   adds the composite FK additively. No credential/encryption/KEK work is done here; credential
+   attachment (→ `active`) is a later module.
+
+3. **Authority is the existing chain; `config_overrides` is never authority.** Every endpoint is
+   gated by `require_permission(CONNECTIONS_MANAGE)` (owner/admin; the permission already existed).
+   The workspace is the authenticated context — `X-Workspace-Id` + membership for humans, the
+   **token's own workspace** for machines (a machine token cannot be redirected by `X-Workspace-Id`,
+   and holds no membership so it is denied `connections:manage`). `workspace_id`, `status`, and
+   `credential_id` are never request fields (`extra="forbid"` → 400); `status` is server-set to
+   `pending_auth`; PATCH mutates only `name`/`config_overrides`. `config_overrides` is stored
+   opaquely and **never read as tenant/role/status**; its only security contract is a `base_url`
+   override, which is **SSRF-linted by reusing `validate_base_url`** (never a second validator).
+   Revoke is a scoped soft delete (`status=revoked` + `deleted_at`), idempotent, and a foreign/absent
+   id is a uniform 404 (never a 403 oracle, P-17). Application `workspace_id` predicates are kept as
+   defense-in-depth over RLS (P-14).
+
+4. **Idempotency-Key (ratified minimal, canonical).** API_GUIDELINES §5 defines `Idempotency-Key`
+   for side-effecting creates, but no platform mechanism existed. A **minimal, connections-scoped**
+   Redis store was added (not a speculative platform subsystem): keyed per **workspace + endpoint +
+   key**, the first request reserves the key (`SET NX`, short TTL) and stores its response (24 h);
+   the same key + body replays it; the same key + a different body is a 409; a concurrent in-flight
+   key is a 409. The Redis layer is a UX optimization **on top of** the real guarantee — the partial
+   unique index means the DB never produces a duplicate connection even under a Redis/DB split. A
+   fresh short-lived client per call (`async with`) avoids binding a pool across event loops.
+
+**Consequences:** One migration (`0010_connections`; up/down/up verified, `alembic check` clean); no
+change to any prior table or migration. A thin `app/core/redis.py` accessor was added (Redis is
+already a stack service; readiness has its own probe). Proven by 18 unit + 12 real-Postgres+RLS
+integration + 19 real-HTTP API tests, a 21-mutation audit (0 meaningful survivors; the RLS-redundant
+predicate removals are inert defense-in-depth, verified by the catalog check), and full regression at
+warning and debug. **Deferred (out of scope):** Credentials/encryption/KEK, the Execution Runtime,
+`/v1/tool-calls`, `tool_calls`/audit, the Tools API + per-Tool enable/disable, connection health/
+test-call (M2), OAuth, and self-serve workspace creation.
+
+## ADR-0030 — Credential vault: envelope encryption with an env-provisioned master KEK (M1-Credentials-v1)
+
+**Status:** Accepted (2026-08-17) · **Context:** M1-Credentials-v1, the radioactive slice of M1's
+execution plane. SECURITY.md §2.1 already fixes the key architecture (a pre-implementation decision
+gate confirmed it); this ADR ratifies it and the M1↔M2 boundary. A Credential is the encrypted
+secret bound 1:1 to a Connection (Bible §4, DATABASE_DESIGN §3). One migration (`0011_credentials`).
+
+**Decision:**
+
+1. **Envelope encryption, env-provisioned KEK (SECURITY §2.1).** AES-256-GCM (`cryptography` only,
+   never hand-rolled), in a vault module that is the **only** code touching plaintext. Per
+   Credential: a fresh CSPRNG **256-bit DEK** encrypts the secret; the DEK is **wrapped by the master
+   KEK**; fresh random nonces; the GCM tag is verified on every decrypt (fail-closed). The KEK never
+   encrypts a payload directly. The **master KEK** is the env-provisioned `CREDENTIAL_MASTER_KEY`
+   (already a `SecretStr` in config) — **base64 of exactly 32 bytes**, loaded and validated per
+   operation and **fail-closed** on missing / default `change-me` / bad-base64 / wrong-length (never
+   a fallback, never a regenerated key); production additionally validates it at startup and refuses
+   to boot on a bad key. Local/CI use disposable non-production keys (compose + CI env). **KMS is
+   M2+** Team/Enterprise hardening — because only wrapped DEKs depend on the KEK, that migration
+   re-wraps DEKs behind a stable interface with no schema change.
+
+2. **GCM AAD = workspace_id ‖ connection_id (ratified hardening).** The two UUIDs as raw 16-byte
+   values, concatenated (fixed length, unambiguous, no secret), bound as associated data on **both**
+   the payload encryption and the DEK wrap. A ciphertext transplanted to another workspace or
+   connection fails authentication — defense-in-depth over RLS against cross-tenant ciphertext copy.
+   `key_version = 1` in M1 (single active KEK); the column exists for the M2 rotation runbook (no
+   multi-version keyring / background re-wrap here).
+
+3. **`credentials` table (migration `0011`).** `id, workspace_id, connection_id, credential_type,
+   ciphertext, encrypted_dek, key_version, nonce, expires_at, rotated_at, timestamps`
+   (DATABASE_DESIGN §3). The CHECK admits all six canonical types for forward compatibility; **M1
+   application flows support only `api_key`/`bearer`/`basic`** (schemas restrict it — no OAuth / JWT
+   / custom-headers). RLS ENABLE+FORCE + `tenant_isolation`; a composite intra-tenant FK
+   `(workspace_id, connection_id) → connections`; `UNIQUE(connection_id)` (1:1) and
+   `UNIQUE(workspace_id, id)`; grants **SELECT/INSERT/UPDATE/DELETE** — the one table with DELETE,
+   because **revocation hard-deletes the row** (no soft delete). This migration additively wires the
+   pointer FK `connections.(workspace_id, credential_id) → credentials(workspace_id, id)` that
+   Connections v1 left open (P-43) — with **NO ACTION** (a composite `SET NULL` would also null the
+   NOT NULL `workspace_id`), so the service clears the pointer before deleting the credential.
+
+4. **API, lifecycle, and decrypt boundary (ratified).** The Credential is a **1:1 sub-resource** —
+   API_GUIDELINES §2 lists no top-level `/v1/credentials`, so it lives at
+   `/v1/connections/{connection_id}/credential` (POST attach, GET metadata, PUT rotate, DELETE
+   revoke), gated by `connections:manage`. **Responses are metadata only** — never ciphertext, DEK,
+   nonce, or plaintext; the secret enters once (`SecretStr`) and is never returned, logged, or
+   persisted in plaintext. **Attach transitions the Connection `pending_auth → active`** (honoring
+   §3's "credential_id non-null only when not pending_auth"; the §382 health-check is a runtime
+   refinement); rotate re-seals with a **fresh DEK + nonce** and stamps `rotated_at`; revoke
+   hard-deletes and returns the Connection to `pending_auth`. **Decryption (`_unseal`) is private to
+   the vault** — the future Execution Runtime is the only legitimate caller; no router / service /
+   repository / worker path decrypts in M1 (SECURITY §2.2).
+
+**Consequences:** One migration (`0011_credentials`; up/down/up verified, `alembic check` clean); no
+prior table/migration rewritten; the `cryptography` dependency was already present (no new dep). A
+thin `app/core/redis.py`-style vault module is scoped to the domain; a disposable KEK was added to
+compose + CI (never production). Proven by 18 vault unit + 9 real-Postgres+RLS integration + 15
+real-HTTP API tests, a 25-mutation audit (0 meaningful survivors; the RLS/unique-index-redundant
+mutations are inert defense-in-depth), migration up/down/up, and full regression at warning and
+debug. **Deferred:** KMS, per-Workspace data keys, the rotation background job, OAuth/JWT/custom
+credential flows, the Execution Runtime (and its decrypt calls), `/v1/tool-calls`, and the audit log.
+
+## ADR-0031 — Execution Runtime v1: the single synchronous REST Tool Call path (M1-Execution-Runtime)
+
+**Status:** Accepted (2026-08-17) · **Context:** M1's critical path — turning the Connector +
+Connection + Credential foundations into live REST execution. AI_RUNTIME.md defines a 7-stage
+pipeline in a `runtime` domain and the internal `ToolCallRequest`/`ToolCallResult` contracts;
+API_GUIDELINES §1 fixes `/v1/tool-calls`; DATABASE_DESIGN §3 defines the `tool_calls` audit table;
+CONNECTOR_SPECIFICATION §8 fixes credential injection; SECURITY §2/§6 fixes decrypt + egress. This
+ADR ratifies the four decisions those specs left open and the M1↔M2 boundary. One migration
+(`0012_tool_calls`).
+
+**Decision:**
+
+1. **`POST /v1/tool-calls` (sync), `GET /v1/tool-calls/{id}` (audit read).** The invocation carries a
+   canonical `tool_name`, an optional `connection_id` (explicit, else the Connector's single active
+   Connection — ambiguity is a 400, never a guess), `arguments`, and `mode: "sync"` (async is M4).
+   The pipeline runs inline in the request path (no Celery); the synchronous hot path is deliberately
+   out of Celery (RISKS R-07, PRD FR-RT-1). Idempotency is the `Idempotency-Key` header (workspace-
+   scoped Redis, 24h) reusing the Connections pattern; unlike Connections there is no DB uniqueness
+   backstop, so the key is reserved **before** egress — a raced retry cannot double-execute.
+
+2. **`tool_calls` — append-only, partitioned audit (migration `0012`).** `id, workspace_id,
+   connection_id, tool_id, request_id, caller (jsonb), status (succeeded|failed|denied|timeout),
+   input_summary (jsonb), output_summary (jsonb), error_code, duration_ms, created_at`;
+   `PARTITION BY RANGE (created_at)` with composite PK `(id, created_at)` and a `DEFAULT` partition
+   (no migration assumes a specific month, §5). RLS ENABLE+FORCE + `tenant_isolation`; grants
+   **SELECT + INSERT only** — immutable, never updated or deleted in-band. `connection_id`/`tool_id`
+   are **plain UUID columns, not composite FKs** (ratified): an immutable audit row must outlive the
+   soft-deletion of its Tool or the removal of its Connection; DATABASE_DESIGN lists them as columns.
+   Stage 7 is not best-effort — "no audit row, no result": *every* audited outcome (success or any
+   failure) writes exactly one row and publishes `tool_call.completed`. Because the request
+   transaction rolls back on a raised exception, audited failures are **not raised** — the service
+   returns an `ExecutionOutcome` the router renders as the error envelope, so the row survives commit.
+
+3. **Credential decrypt + injection (ratified §1, §3).** Decryption is the runtime's private boundary
+   (`domains/runtime/secrets.py` is the *only* importer of `vault._unseal`, asserted by a test);
+   plaintext lives only in memory for the single outbound request, in a `CredentialSecret` whose
+   `repr` is redacted, never returned/logged/buffered/audited. Injection follows CONNECTOR_SPEC §8:
+   `bearer`→`Authorization: Bearer`, `basic`→base64 at inject, `api_key`→`connectors.auth_config
+   {key_name, location:header|query}`. **api_key is runtime-only in M1**: bearer/basic work
+   everywhere; api_key works where `auth_config` is populated (manual connectors), and an ingested
+   connector with empty `auth_config` fails closed with `connector_error`. The
+   `securitySchemes → auth_config` importer projection is **deferred connectors-domain work**.
+
+4. **One egress policy, one authz fork, per-call limits only (ratified §2, §4).** All outbound HTTP
+   goes through a new general `net.request` that reuses `app.core.net`'s *same* SSRF/allowlist/size/
+   timeout guard as the ingestion `fetch` — no second HTTP client. It adds a per-Connection host
+   **egress allowlist** (re-checked on every redirect hop, so an injected credential can never follow
+   a redirect to a foreign host) and truncates (not errors) at a 1 MiB per-call budget.
+   Authorization forks by plane (ADR-0002): **humans** need `Permission.TOOLS_EXECUTE` (VIEWER
+   denied); **machine tokens** are authorized by a valid, workspace-bound token (tokens are issued
+   unscoped pending a scope vocabulary, so an unscoped token carries full machine authority — per-
+   token scope-narrowing is deferred). An egress refusal is the new **`ssrf_blocked` (403)** code
+   added to the API_GUIDELINES §6.1 taxonomy (a policy denial, `status: denied`; the message never
+   carries the URL/address). **Rate limits, plan quotas, and the per-Connection circuit breaker are
+   M2/M3** (ROADMAP:59/73) — M1 ships only the per-call timeout + response-size + enabled/status/authz
+   policy stage.
+
+**Consequences:** One migration (`0012_tool_calls`; the codebase's first partitioned table — `env.py`
+gained partition-child exclusion for autogenerate; up/down/up verified, `alembic check` clean); no
+prior table/migration rewritten; no new runtime dependency (a focused argument validator instead of
+pulling `jsonschema`). `app.core.net` gained a general `request()` (the one egress policy) and
+`app.core.exceptions` gained `UpstreamTimeoutError` (504, already-canonical) and `EgressBlockedError`
+(the new `ssrf_blocked`, 403). Proven by 60 runtime unit + 18 real-Postgres+RLS+real-auth API tests,
+a 47-killed mutation audit (0 meaningful survivors; the 2 RLS-redundant and mutually-redundant
+credential-presence mutations are inert defense-in-depth), real-infrastructure egress verification
+(a live GitHub 401→502 mapping, a live httpbin 200 with the injected header on the real wire, and a
+live `169.254.169.254`→`ssrf_blocked` refusal), debug-level log inspection (0 plaintext/ciphertext),
+and full regression at warning and debug. **Deferred:** async/long-running Tool Calls (M4), MCP + AI/
+SDK exporters (M2/M4), OAuth/JWT/custom_headers injection + the `securitySchemes → auth_config`
+projection, rate limits/quotas/circuit breaker (M2/M3), `usage_events` billing metering (M3), the
+R2 pointer for truncated bodies, and destructive-operation confirmation.
+
+## ADR-0032 — Tools administration v1: enable/disable lifecycle; description editing deferred (M1-Tools-v1)
+
+**Status:** Accepted (2026-08-17) · **Context:** M1's Tools Administration surface — authorized users
+inspecting and controlling already-normalized Tools. The Connector Engine produces Tools (ADR-0003/
+0028) and the Execution Runtime (ADR-0031) executes the enabled ones; this slice sits between them and
+owns the *administrative* lifecycle. FR-CE-4 (P0) names "per-Tool enable/disable **and description
+editing**". No migration is required — the `tools.enabled` column, its `UPDATE` grant, and the
+Runtime's `enabled` exclusion already exist. No new ADR-level architecture; this records two
+non-obvious scope/authorization decisions.
+
+**Decision:**
+
+1. **Read/write authorization split, straight from the canonical matrix (SECURITY §4.1).** *Reading*
+   Tools is `tools:execute` — the capability is literally "Execute Tool Calls, *view Tools* and own
+   logs" (OWNER/ADMIN/MEMBER). *Enabling/disabling* a Tool is Connector configuration (FR-CE-4, "on a
+   Connector") → `connectors:manage` (OWNER/ADMIN). VIEWER holds nothing → denied. The admin surface
+   is the **human control plane** (ADR-0002): `require_permission` resolves membership, so a machine
+   token — which has none — is denied on `/v1/tools` and administers nothing; machine identities
+   execute via the Runtime, they do not administer. No new permission was invented (the fixed 7 hold).
+
+2. **M1 ships enable/disable only; per-Tool description editing is deferred (founder-ratified).**
+   `GET /v1/tools` (list, cursor-paginated, optional `?connector_id=`), `GET /v1/tools/{id}`, and
+   `PATCH /v1/tools/{id}` `{enabled}` — the last is a single atomic conditional `UPDATE ... RETURNING`
+   (race-safe, idempotent, never a read-modify-write). `enabled` is the only mutable field
+   (`extra="forbid"` rejects any attempt to rewrite name/description/schema/connector identity, which
+   originate from ingestion/promotion). **Description editing (also FR-CE-4) is deferred** because
+   CONNECTOR_ENGINE §6 requires per-Tool overrides to "survive re-sync", but promotion (ADR-0028)
+   currently re-applies *only* the `enabled` override by Tool identity — a description edit would be
+   silently reset on the next re-ingest+promote. Shipping it correctly requires extending the
+   connectors/promotion override-persistence (carry description overrides forward by identity), a
+   distinct connectors-domain change out of this slice's scope. The seam is recorded as deferred M1
+   work. The live set is `deleted_at IS NULL` throughout, so a deprecated Tool is a uniform 404 and
+   cannot be listed, fetched, or re-enabled (no resurrection), and a disabled Tool cannot execute
+   (the Runtime already excludes it) — proven end-to-end.
+
+**Consequences:** No migration, no new event (MCP tool-list-cache invalidation on toggle is M2; there
+is no M1 consumer), no new dependency. New `tools` domain (schemas/repository/service/router) wired at
+`/v1/tools`. Proven by 5 schema unit + 21 real-Postgres+RLS+real-JWT API tests, a 12-killed mutation
+audit (0 meaningful survivors; 4 inert — 3 RLS-redundant workspace predicates and 1 UPDATE-predicate
+redundant with the `get()` re-fetch + transaction rollback), the Runtime cross-surface invariant
+(enable → executes, disable → 404), and full regression at warning + debug. **Deferred M1 work:**
+per-Tool description editing (needs promotion override-persistence) and the Audit-log viewer surface.
+
+## ADR-0033 — Audit Log Viewer v1: the read-only `audit:read` view over the tool_calls ledger (M1-Audit-v1)
+
+**Status:** Accepted (2026-08-18) · **Context:** the final M1 product surface (PRD FR-CP-3 / UJ-5) —
+an authorized, tenant-isolated, read-only view of the Tool Call audit ledger the Execution Runtime
+already writes (`tool_calls`, ADR-0031). No new table, no new event, no migration: the ledger, its
+RLS, its append-only SELECT+INSERT grant, and the log-UI indexes (`ix_tool_calls_workspace_id_
+created_at`, `ix_tool_calls_workspace_id_connection_id_created_at`) already exist. This records two
+decisions the specs left open.
+
+**Decision:**
+
+1. **`GET /v1/tool-calls` — the full-log viewer, gated by `audit:read` (founder-ratified).** The
+   canonical resource is `/v1/tool-calls` (API_GUIDELINES §1); the runtime already owns its `POST`
+   (invoke) and `GET /{id}` (fetch a result), so the viewer adds only the **list**. The matrix
+   distinguishes `audit:read` = "View full audit log — every member's activity, not just one's own"
+   (OWNER/ADMIN) from `tools:execute` = "view **own logs**" (MEMBER). The M1 viewer is the FR-CP-3/
+   UJ-5 **full-log** dashboard → `audit:read`; MEMBER, VIEWER, and machine tokens (no membership) are
+   denied. The member "own logs" browse (a caller-scoped view under `tools:execute`) is **deferred**
+   — it needs its own caller-identity-scoping decision. This keeps the endpoint's privilege exactly
+   what the named viewer requires, no broader.
+
+2. **A dedicated read-only `audit` domain; metadata-only; canonical UJ-5.3 filters.** A new
+   `app/domains/audit/` (router/service/repository/schemas) reads `runtime.models.ToolCall` — it does
+   not duplicate the ledger, create a second audit system, or touch the runtime pipeline, and issues
+   **only SELECTs** (the app role holds no UPDATE/DELETE grant on `tool_calls`, and no mutation verb
+   is registered — PATCH/PUT/DELETE are 405). Cursor pagination (§3) keyset on `(created_at, id)` DESC
+   — deterministic (UUIDv7 tie-break), index-backed, bounded (LIMIT ≤ 100). Filters are exactly the
+   UJ-5.3 set: `connection_id`, `tool_id`, `status` (validated against the closed enum), `interface`
+   (`caller->>'interface'`), and `created_after`/`created_before`. The response is an **explicit
+   `ToolCallLogRead` schema** (never raw-ORM), exposing only redacted audit metadata (Tool/Connection
+   ids, `caller` identity, status, `error_code`, `duration_ms`, `request_id`, `created_at`, and the
+   already-redacted `input_summary`/`output_summary`) — `workspace_id` and every ciphertext column
+   are structurally absent, so a future `tool_calls` column cannot silently leak through this surface.
+
+**Consequences:** No migration, no new event, no runtime change, no new dependency. The list shares
+`/v1/tool-calls` with the runtime router (distinct method/path — no conflict). Proven by 2 schema unit
++ 14 real-Postgres+RLS+real-JWT API tests, a 13-killed mutation audit (0 meaningful survivors; 1 inert
+RLS-redundant predicate), cross-tenant isolation, read-only-405, metadata-only (no secret/`workspace_
+id`) assertions, and full regression at warning + debug. **Deferred M1 work:** the member "own logs"
+(`tools:execute`) caller-scoped view; CSV export + the log-explorer UI (frontend, FRONTEND_SPEC). This
+is the **final M1 product surface** — M1 is now feature-complete pending the final forensic audit.

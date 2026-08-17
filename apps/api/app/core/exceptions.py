@@ -72,3 +72,21 @@ class UpstreamAPIError(DomainError):
 
     code = "connector_error"
     http_status = 502
+
+
+class UpstreamTimeoutError(DomainError):
+    """The upstream API exceeded the runtime timeout (default 30s, Architecture §7)."""
+
+    code = "upstream_timeout"
+    http_status = 504
+
+
+class EgressBlockedError(DomainError):
+    """The runtime refused an outbound request on egress policy — a target that resolves to a
+    private/link-local address, an off-allowlist redirect, or a rebinding answer (SECURITY.md §6,
+    AI_RUNTIME.md §7). A policy *denial*, distinct from an upstream failure: it is our layer saying
+    no. Surfaced as the `ssrf_blocked` code (API_GUIDELINES.md §6.1); the message never carries the
+    raw URL or resolved address."""
+
+    code = "ssrf_blocked"
+    http_status = 403

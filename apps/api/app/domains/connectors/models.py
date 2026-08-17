@@ -12,11 +12,27 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import CheckConstraint, DateTime, Index, String, text
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKeyConstraint,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+    text,
+)
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
+# These tables carry composite FKs to `workspaces`; importing the model registers that table in
+# the shared MetaData so the FK resolves at mapper-configure time even in a process (the Celery
+# worker) that imports the connectors ORM without going through `app.main`. Import-only.
+from app.domains.workspaces import models as _workspaces_models  # noqa: F401
 from app.shared.models import Base, TimestampMixin, UUIDPrimaryKeyMixin, WorkspaceScopedMixin
 
 # Canonical domains from DATABASE_DESIGN.md §3 (the schema authority).
@@ -76,7 +92,122 @@ class Connector(UUIDPrimaryKeyMixin, WorkspaceScopedMixin, TimestampMixin, Base)
             unique=True,
             postgresql_where=text("deleted_at IS NULL"),
         ),
+        # Composite-FK target for connector_versions (workspace_id, connector_id) — a version can
+        # only reference a connector in the same workspace (DATABASE_DESIGN.md §1, M1.4-B1.1).
+        UniqueConstraint("workspace_id", "id", name="uq_connectors_workspace_id_id"),
+        # The current-version pointer, now an additive composite intra-tenant FK (P-43). `use_alter`
+        # because connectors ↔ connector_versions reference each other — the FK is added after both
+        # tables exist (migration 0008). SET NULL: a dropped version clears the pointer.
+        ForeignKeyConstraint(
+            ["workspace_id", "current_version_id"],
+            ["connector_versions.workspace_id", "connector_versions.id"],
+            name="fk_connectors_current_version_id",
+            ondelete="SET NULL",
+            use_alter=True,
+        ),
     )
 
 
-__all__ = ["CONNECTOR_STATUSES", "SOURCE_TYPES", "Connector"]
+class ConnectorVersion(UUIDPrimaryKeyMixin, WorkspaceScopedMixin, Base):
+    """An immutable snapshot of a Connector's ingested definition (DATABASE_DESIGN.md §5,
+    CONNECTOR_SPECIFICATION.md §3). Never updated or deleted — `created_at` only. Holds the
+    canonical Tool Schema set, the dedup hash, and the R2 reference to the original document."""
+
+    __tablename__ = "connector_versions"
+
+    connector_id: Mapped[UUID] = mapped_column(postgresql.UUID(as_uuid=True), nullable=False)
+    # Monotonic integer per connector.
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # SHA-256 hex over the canonical JSON of the ordered normalized Tool set (§3).
+    spec_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    # R2 object key of the original document (B0.5); NULL for non-fetched sources.
+    raw_spec_ref: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    # The canonical Tool Schema set (CONNECTOR_SPECIFICATION.md §2).
+    normalized_schema: Mapped[Any] = mapped_column(JSONB, nullable=False)
+    # added/removed/changed vs. the previous version — computed by a later slice; NULL now.
+    diff_summary: Mapped[Any | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "connector_id", "version", name="uq_connector_versions_connector_id_version"
+        ),
+        # Composite-FK target for connectors.current_version_id.
+        UniqueConstraint("workspace_id", "id", name="uq_connector_versions_workspace_id_id"),
+        # A version belongs to a connector in the same workspace (composite intra-tenant FK).
+        ForeignKeyConstraint(
+            ["workspace_id", "connector_id"],
+            ["connectors.workspace_id", "connectors.id"],
+            name="fk_connector_versions_connector_id",
+            ondelete="CASCADE",
+        ),
+    )
+
+
+class Tool(UUIDPrimaryKeyMixin, WorkspaceScopedMixin, TimestampMixin, Base):
+    """One callable operation of a Connector, denormalized from its `connector_version` for query
+    and export speed (DATABASE_DESIGN.md §3, CONNECTOR_SPECIFICATION.md §3). The version's
+    `normalized_schema` remains authoritative; this table is a **projection** of the active
+    (promoted) version's Tool set.
+
+    `connector_version_id` records which version defined the row (rows are never mutated in place —
+    §3). Promotion swaps the active set: the current live rows are soft-deleted and the new
+    version's rows inserted, with each Tool's `enabled` override re-applied on Tool identity. The
+    live set is `deleted_at IS NULL`; a removed Tool stays soft-deleted (retained for audit, fails
+    `tool_not_found`, §13). Carries no secrets — only the LLM-facing definition.
+    """
+
+    __tablename__ = "tools"
+
+    connector_id: Mapped[UUID] = mapped_column(postgresql.UUID(as_uuid=True), nullable=False)
+    connector_version_id: Mapped[UUID] = mapped_column(
+        postgresql.UUID(as_uuid=True), nullable=False
+    )
+    # Canonical tool name (CONNECTOR_ENGINE.md §5); unique among LIVE rows of a version.
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    # Merged JSON Schema of the operation's arguments (CONNECTOR_SPECIFICATION.md §2).
+    input_schema: Mapped[Any] = mapped_column(JSONB, nullable=False)
+    # Response shape guidance — not produced by the current importer; NULL until a later slice.
+    output_hints: Mapped[Any | None] = mapped_column(JSONB, nullable=True)
+    # Safety metadata + tags (and rate_hints when present) per DATABASE_DESIGN.md / §2.
+    annotations: Mapped[Any] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    # Per-Tool user override; survives promotion by re-application on Tool identity (§3).
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    # Soft delete = deprecation (§13): excluded from listings, retained for audit joins.
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        # At most one LIVE row per (version, name). Partial on `deleted_at IS NULL` so a
+        # re-promotion (which soft-deletes then re-inserts) never collides with history.
+        Index(
+            "uq_tools_connector_version_id_name",
+            "connector_version_id",
+            "name",
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
+        # The live-set lookup leads with workspace_id (P-44): a connector's live tools.
+        Index("ix_tools_workspace_id_connector_id", "workspace_id", "connector_id"),
+        # A tool belongs to a connector in the same workspace (composite intra-tenant FK).
+        ForeignKeyConstraint(
+            ["workspace_id", "connector_id"],
+            ["connectors.workspace_id", "connectors.id"],
+            name="fk_tools_connector_id",
+            ondelete="CASCADE",
+        ),
+        # A tool belongs to a version in the same workspace (composite intra-tenant FK).
+        ForeignKeyConstraint(
+            ["workspace_id", "connector_version_id"],
+            ["connector_versions.workspace_id", "connector_versions.id"],
+            name="fk_tools_connector_version_id",
+            ondelete="CASCADE",
+        ),
+    )
+
+
+__all__ = ["CONNECTOR_STATUSES", "SOURCE_TYPES", "Connector", "ConnectorVersion", "Tool"]

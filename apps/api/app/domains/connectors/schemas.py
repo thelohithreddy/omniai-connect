@@ -94,4 +94,7 @@ class ConnectorList(BaseModel):
     has_more: bool
 
 
+# The ingestion request is multipart/form-data (a `source_url` field OR a `file`, M1.4-B1.2), so
+# it is validated in the router, not as a Pydantic body model.
+
 __all__ = ["ConnectorCreate", "ConnectorList", "ConnectorRead"]

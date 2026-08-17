@@ -133,6 +133,13 @@ jobs:
       DATABASE_URL: postgresql+asyncpg://omniai_app:omniai_app@localhost:5432/omniai
       DATABASE_ADMIN_URL: postgresql+asyncpg://omniai:omniai@localhost:5432/omniai
       REDIS_URL: redis://localhost:6379/0
+      # Object storage → the MinIO container started below (M1.4-B0.5). Ephemeral CI-only
+      # credentials; APP_ENV=development lets the store accept the plaintext MinIO endpoint.
+      R2_ENDPOINT: http://localhost:9000
+      R2_ACCESS_KEY_ID: minioadmin
+      R2_SECRET_ACCESS_KEY: minioadmin
+      R2_BUCKET: omniai-dev
+      R2_REGION: auto
 
     steps:
       - uses: actions/checkout@v4
@@ -236,7 +243,30 @@ jobs:
           uv run alembic downgrade base
           uv run alembic upgrade head
 
-      - run: uv run pytest -q
+      # Object storage for the B0.5 integration tests (M1.4-B0.5). MinIO cannot be a GHA
+      # `services:` container — the minio image needs a `server /data` command that `services`
+      # cannot pass — so it runs as a background container with an explicit readiness wait. The
+      # test fixture creates the bucket via ensure_bucket(); the credentials are CI-only and die
+      # with the job. The tests fail (never silently skip) if this MinIO is unreachable.
+      - name: Start MinIO (S3-compatible object storage)
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:9000/minio/health/live && break
+            sleep 1
+          done
+          curl -sf http://localhost:9000/minio/health/live || {
+            echo "MinIO failed to start"; docker logs minio; exit 1;
+          }
+
+      # The credential vault needs a valid 32-byte master key. Generated per run (like
+      # BETTER_AUTH_SECRET above) so no secret literal ever enters the repository — it dies with the
+      # job and can never decrypt production data.
+      - run: |
+          export CREDENTIAL_MASTER_KEY="$(openssl rand -base64 32)"
+          uv run pytest -q
 
   security:
     name: Security — secret scan

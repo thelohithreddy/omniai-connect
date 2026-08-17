@@ -25,6 +25,17 @@ dependencies = [
     # PyJWT's API requires an explicit algorithms allowlist, which is the property
     # that makes algorithm-confusion unrepresentable rather than merely tested-for.
     "pyjwt[crypto]>=2.10",
+    # Async S3-compatible client for object storage (M1.4-B0.5): Cloudflare R2 in production,
+    # MinIO in local/CI — one S3 API, selected by endpoint. aioboto3 wraps aiobotocore so the
+    # storage path is non-blocking like the rest of the request/worker path (async-first, P-*);
+    # pure-Python, so no wheel/compiler risk in the slim image. Isolated behind app.core
+    # .object_store — no application code imports boto3/botocore directly (ADR-0024).
+    "aioboto3>=13.0",
+    # OpenAPI/Swagger specs are JSON or YAML (M1.4-B1). PyYAML's `safe_load` is used
+    # exclusively — never `load`/`unsafe_load` — so a hostile spec cannot construct Python
+    # objects or execute code. Parsing is confined to app/domains/connectors/openapi.py.
+    "pyyaml>=6.0",
+    "python-multipart>=0.0.9",
 ]
 
 [dependency-groups]
@@ -33,6 +44,7 @@ dev = [
     "pytest-asyncio>=0.25",
     "ruff>=0.8",
     "mypy>=1.14",
+    "types-pyyaml>=6.0",
 ]
 
 [tool.ruff]
@@ -47,6 +59,24 @@ ignore = ["S101"]  # allow assert in tests
 python_version = "3.11"
 strict = true
 plugins = ["pydantic.mypy"]
+
+# Celery's `@app.task` decorator is untyped in the library, which strict mode flags on every
+# task. The task bodies themselves are fully typed and checked; only the decorator is exempt.
+[[tool.mypy.overrides]]
+module = "app.workers.tasks"
+disallow_untyped_decorators = false
+
+# Celery and Kombu ship no type stubs / py.typed marker; our own code stays fully typed.
+[[tool.mypy.overrides]]
+module = ["celery.*", "kombu.*"]
+ignore_missing_imports = true
+
+# aioboto3/aiobotocore/botocore ship no usable py.typed for strict mode (botocore is
+# dynamically generated and returns dict[str, Any]). The untyped surface is confined to
+# app/core/object_store.py, whose own public API is fully typed; Any never escapes it.
+[[tool.mypy.overrides]]
+module = ["aioboto3.*", "aiobotocore.*", "botocore.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

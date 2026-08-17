@@ -17,7 +17,10 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 # Importing the domain models registers them on Base.metadata for autogenerate.
 # Without this import autogenerate sees an empty schema and cheerfully drops everything.
+import app.domains.connections.models  # noqa: F401
 import app.domains.connectors.models  # noqa: F401
+import app.domains.credentials.models  # noqa: F401
+import app.domains.runtime.models  # noqa: F401
 import app.domains.workspaces.models  # noqa: F401
 from alembic import context
 from app.core.config import settings
@@ -30,6 +33,34 @@ if config.config_file_name is not None:
 
 target_metadata = Base.metadata
 
+# Declarative-partition CHILD tables (e.g. `tool_calls_default`, the DEFAULT partition of
+# `tool_calls`) are created by their migration, not by any ORM model, and Postgres auto-names their
+# partition-local indexes. Autogenerate would otherwise see them as orphan tables/indexes to drop.
+# They are excluded from comparison; the partitioned PARENT (which the models declare) is compared
+# normally. Matches by suffix so future monthly partitions (`tool_calls_YYYY_MM`) are covered too.
+_PARTITION_PARENTS = ("tool_calls",)
+
+
+def _is_partition_child(name: str | None) -> bool:
+    return bool(name) and any(
+        name != parent and name.startswith(f"{parent}_") for parent in _PARTITION_PARENTS
+    )
+
+
+def _include_name(name: str | None, type_: str, parent_names: dict[str, str | None]) -> bool:
+    if type_ == "table":
+        return not _is_partition_child(name)
+    return True
+
+
+def _include_object(
+    obj: object, name: str | None, type_: str, reflected: bool, compare_to: object
+) -> bool:
+    # Skip indexes/constraints that hang off an excluded partition child table.
+    table = getattr(obj, "table", None)
+    child = table is not None and _is_partition_child(getattr(table, "name", None))
+    return not child
+
 
 def _configure(connection: Connection) -> None:
     context.configure(
@@ -41,6 +72,8 @@ def _configure(connection: Connection) -> None:
         # Everything lives in the default schema for now; naming conventions come from
         # Base.metadata so constraint names are deterministic across autogenerate runs.
         include_schemas=False,
+        include_name=_include_name,
+        include_object=_include_object,
     )
     with context.begin_transaction():
         context.run_migrations()

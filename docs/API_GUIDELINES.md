@@ -134,6 +134,7 @@ ever leaves the API:
 | `validation_error` | 400 / 409 / 422 | Malformed request, bad params, expired cursor, idempotency body mismatch. `details` includes field errors. |
 | `unauthorized` | 401 | Missing/invalid session token or API token. |
 | `forbidden` | 403 | Authenticated, but role lacks the capability (SECURITY.md §4.1). |
+| `ssrf_blocked` | 403 | The Execution Runtime refused an outbound Tool Call request on egress policy — a target resolving to a private/link-local address, an off-allowlist redirect, or a rebinding answer (AI_RUNTIME.md §7, SECURITY.md §6). A policy denial; the message never carries the target URL or resolved address. |
 | `not_found` | 404 | Resource absent — or outside the caller's Workspace. |
 | `rate_limited` | 429 | Rate limit or quota exceeded. `Retry-After` header set. |
 | `connector_error` | 502 | The upstream API returned an error the runtime couldn't normalize into a Tool result. |

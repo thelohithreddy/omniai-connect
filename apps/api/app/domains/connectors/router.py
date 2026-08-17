@@ -7,15 +7,19 @@ is constructed, so an unauthorized caller never reaches the logic.
 
 from __future__ import annotations
 
+import contextlib
 import uuid
 from typing import Annotated, Final
 
-from fastapi import APIRouter, Depends, Query, Request, Response, status
+from fastapi import APIRouter, Depends, Path, Query, Request, Response, status
+from starlette.datastructures import UploadFile
 
 from app.core.authorization import require_permission
 from app.core.authz import Permission
 from app.core.db import UnitOfWork, get_uow
 from app.core.exceptions import ValidationFailedError
+from app.core.ids import new_id
+from app.core.object_store import ObjectStoreError, TenantObjectKey, get_object_store
 from app.core.pagination import DEFAULT_LIMIT, MAX_LIMIT
 from app.core.security import WorkspaceContext
 from app.domains.connectors.repository import ConnectorRepository
@@ -23,6 +27,10 @@ from app.domains.connectors.schemas import ConnectorCreate, ConnectorList, Conne
 from app.domains.connectors.service import ConnectorService
 
 connectors_router = APIRouter(prefix="/v1/connectors", tags=["connectors"])
+
+# The canonical document cap (CONNECTOR_SPECIFICATION §11: "≤ 10 MB raw"). Applied to uploads by
+# bounding the multipart part size explicitly — never trusting the framework default (1 MB).
+_MAX_UPLOAD_BYTES: Final = 10 * 1024 * 1024
 
 #: Managing Connectors is `connectors:manage` (owner/admin). Built once at import time and
 #: reused — `require_permission` returns a fresh closure each call, so building it inline in
@@ -125,6 +133,132 @@ async def list_connectors(
         next_cursor=page.next_cursor,
         has_more=page.has_more,
     )
+
+
+@connectors_router.post(
+    "/{connector_id}/versions",
+    response_model=ConnectorRead,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Ingest an OpenAPI spec (async) — by URL or file upload",
+    responses={
+        202: {
+            "description": "Accepted; the Connector is now `ingesting`. The Celery pipeline gets "
+            "the bytes (guarded fetch of the URL, or the staged upload), normalizes, persists an "
+            "immutable version, and publishes `connector.ingested`. Poll for `active`/`failed`."
+        },
+        400: {
+            "description": "Not exactly one of `source_url`/`file`; a non-https URL; an empty, "
+            "oversized, or malformed upload."
+        },
+        401: {"description": "Missing or invalid credentials."},
+        403: {"description": "Caller does not hold `connectors:manage` in this Workspace."},
+        404: {"description": "No such live connector in this Workspace."},
+        409: {"description": "The Connector is already ingesting."},
+    },
+)
+async def ingest_connector_version(
+    connector_id: uuid.UUID,
+    request: Request,
+    service: Annotated[ConnectorService, Depends(get_connector_service)],
+    uow: Annotated[UnitOfWork, Depends(get_uow)],
+    ctx: AuthorizedConnectorAdmin,
+) -> ConnectorRead:
+    """Start asynchronous OpenAPI ingestion for a Connector (M1.4-B1.1/B1.2).
+
+    `multipart/form-data` with **exactly one** of a `source_url` field (URL ingestion) or a `file`
+    upload. The Connector transitions to `ingesting` and a post-commit trigger enqueues the Celery
+    pipeline. The workspace is the authenticated context — the URL/upload names only *where* the
+    spec is, never *which tenant* — so a client cannot ingest into another Workspace. Returns 202
+    with the Connector in `ingesting`; the terminal state is the worker's.
+
+    An uploaded file is validated (bounded size, non-empty) and staged to the tenant ObjectStore
+    here (the worker cannot re-fetch it, §18); the filename is discarded — never trusted for type,
+    path, or logging. The multipart part size is bounded explicitly (never the 1 MB framework
+    default) so an oversized upload fails at parse time.
+    """
+    try:
+        form = await request.form(max_part_size=_MAX_UPLOAD_BYTES + 4096, max_files=1, max_fields=3)
+    except Exception as exc:  # oversized part / malformed multipart
+        raise ValidationFailedError("Malformed or oversized multipart body.") from exc
+
+    unknown = set(form) - {"source_url", "file"}
+    if unknown:  # a client cannot smuggle a server-owned field (workspace_id, status, …)
+        raise ValidationFailedError("Unknown form fields.", details={"unknown": sorted(unknown)})
+
+    raw_url = form.get("source_url")
+    upload = form.get("file")
+    has_url = isinstance(raw_url, str) and bool(raw_url.strip())
+    has_file = isinstance(upload, UploadFile)
+    if has_url == has_file:  # both or neither
+        raise ValidationFailedError("Provide exactly one of a `source_url` field or a `file`.")
+
+    if has_file:
+        assert isinstance(upload, UploadFile)
+        data = await upload.read()
+        if not data:
+            raise ValidationFailedError("Uploaded file is empty.")
+        if len(data) > _MAX_UPLOAD_BYTES:
+            raise ValidationFailedError("Uploaded file exceeds the size limit.")
+        # Stage under the tenant prefix with a fresh uuid key — the client filename is never used
+        # for the key, the type, or a log line. The worker reads it back through the same boundary.
+        store = get_object_store()
+        upload_ref = f"connectors/{connector_id}/uploads/{new_id().hex}.json"
+        key = TenantObjectKey.for_workspace(ctx.workspace_id, upload_ref)
+        await store.put(key, data, content_type="application/json")
+        try:
+            connector = await service.request_ingestion(
+                uow, workspace_id=ctx.workspace_id, connector_id=connector_id, upload_ref=upload_ref
+            )
+        except Exception:
+            # A rejected request (404/409/…) must not leave the staged upload behind.
+            with contextlib.suppress(ObjectStoreError):
+                await store.delete(key)
+            raise
+    else:
+        assert isinstance(raw_url, str)
+        source_url = raw_url.strip()
+        if not source_url.lower().startswith("https://") or len(source_url) > 2048:
+            raise ValidationFailedError("source_url must be an https URL within the length limit.")
+        connector = await service.request_ingestion(
+            uow, workspace_id=ctx.workspace_id, connector_id=connector_id, source_url=source_url
+        )
+
+    return ConnectorRead.model_validate(connector)
+
+
+@connectors_router.post(
+    "/{connector_id}/versions/{version}/promote",
+    response_model=ConnectorRead,
+    summary="Promote a version to the Connector's active definition",
+    responses={
+        200: {
+            "description": "The version is now active: the tools projection was swapped to it and "
+            "`connector.ingested` published. Idempotent — promoting the current version is a no-op."
+        },
+        401: {"description": "Missing or invalid credentials."},
+        403: {"description": "Caller does not hold `connectors:manage` in this Workspace."},
+        404: {"description": "No such live connector, or no such version, in this Workspace."},
+        409: {"description": "The Connector is ingesting; promote after it settles."},
+    },
+)
+async def promote_connector_version(
+    connector_id: uuid.UUID,
+    service: Annotated[ConnectorService, Depends(get_connector_service)],
+    uow: Annotated[UnitOfWork, Depends(get_uow)],
+    version: Annotated[int, Path(ge=1, description="The monotonic version number to promote.")],
+) -> ConnectorRead:
+    """Promote a persisted version to the Connector's active definition (M1.4-B1.4).
+
+    A first or purely-additive version auto-promotes during ingestion; a **breaking** version
+    (a required argument added, an argument removed, or a type narrowed — CONNECTOR_SPECIFICATION
+    §185) is persisted un-promoted and activated here so the change is a deliberate act. The
+    Connector keeps serving its current version until this succeeds. The workspace is the
+    authenticated context and appears in no field, so a cross-workspace promotion is not a request
+    this API can express; a foreign/deleted connector or an unknown version is a uniform 404.
+    Idempotent and concurrency-safe (the connector row is locked for the transaction).
+    """
+    connector = await service.promote(uow, connector_id=connector_id, version=version)
+    return ConnectorRead.model_validate(connector)
 
 
 @connectors_router.get(
