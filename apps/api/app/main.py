@@ -26,6 +26,8 @@ from app.core.readiness import check_readiness
 from app.domains.connections.router import connections_router
 from app.domains.connectors.router import connectors_router
 from app.domains.connectors.subscribers import register_connector_subscribers
+from app.domains.credentials.router import credentials_router
+from app.domains.credentials.vault import validate_master_key_configured
 from app.domains.workspaces.router import api_tokens_router, invitations_router, members_router
 from app.domains.workspaces.router import router as workspaces_router
 
@@ -49,6 +51,12 @@ app.include_router(members_router)
 app.include_router(invitations_router)
 app.include_router(connectors_router)
 app.include_router(connections_router)
+app.include_router(credentials_router)
+
+# Fail closed in production if the credential master key is missing/default/invalid (SECURITY §2):
+# the API refuses to boot rather than run the vault on a bad key. Local/CI use disposable keys.
+if settings.is_production:
+    validate_master_key_configured()
 
 # Register domain event-bus subscribers at startup (BACKEND_SPEC §4): the connectors handler
 # enqueues the Celery ingestion task after a request commits (M1.4-B1.1).

@@ -13,6 +13,30 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Credentials v1 — envelope-encrypted vault (M1-Credentials-v1, ADR-0030).** The radioactive slice
+  of M1's execution plane: an encrypted secret bound 1:1 to a Connection. New `credentials` table
+  (migration `0011`) storing only ciphertext material (`ciphertext, encrypted_dek, key_version,
+  nonce`) — never plaintext — with RLS ENABLE+FORCE + `tenant_isolation`, a composite intra-tenant FK
+  to `connections`, `UNIQUE(connection_id)` (1:1), and SELECT/INSERT/UPDATE/**DELETE** grants (the one
+  table with DELETE — revocation hard-deletes the row). Migration `0011` also additively wires the
+  `connections.credential_id` pointer FK left open by Connections v1 (P-43, NO ACTION). A vault
+  primitive (`domains/credentials/vault.py`) does **AES-256-GCM envelope encryption** per
+  CONNECTOR/SECURITY canon: a fresh 256-bit **DEK per credential** encrypts the secret; the DEK is
+  **wrapped by the env-provisioned master KEK** (`CREDENTIAL_MASTER_KEY`, base64 of 32 bytes, loaded
+  fail-closed — default/short/bad-base64 rejected, production won't boot on a bad key); fresh nonces;
+  the GCM tag is verified on every decrypt; **AAD = workspace_id‖connection_id** binds each ciphertext
+  to its tenant + connection (a transplant fails authentication). `key_version=1` (M2 rotation
+  runbook uses the column; no keyring/re-wrap yet). Endpoints at
+  `/v1/connections/{connection_id}/credential` (POST attach / GET metadata / PUT rotate / DELETE
+  revoke), gated by `connections:manage`; M1 types **api_key/bearer/basic** only (no OAuth/JWT/
+  custom-headers). **Responses are metadata only** — the secret enters once (`SecretStr`) and is never
+  returned, logged, or stored in plaintext. Attaching moves the Connection `pending_auth → active`;
+  rotate re-seals with a fresh DEK/nonce; revoke hard-deletes and returns it to `pending_auth`.
+  Decryption is **private to the vault** (the future Execution Runtime is the only caller — no
+  router/service/repository/worker decrypts). **KMS is deferred to M2.** Proven by 18 vault unit + 9
+  real-Postgres+RLS integration + 15 real-HTTP API tests, a 25-mutation audit (0 meaningful
+  survivors), migration up/down/up, and full regression at warning and debug. A disposable dev/CI KEK
+  was added to compose + CI (never production).
 - **Connections v1 (M1-Connections-v1, ADR-0029).** The first slice of M1's execution plane: a
   **Connection** — a workspace's authenticated instance of a Connector (Bible §4). New `connections`
   table (migration `0010`, RLS ENABLE+FORCE + `tenant_isolation`, composite intra-tenant FK

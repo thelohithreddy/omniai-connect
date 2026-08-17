@@ -25,8 +25,11 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
-# These tables carry composite FKs to `workspaces` and `connectors`; importing the models registers
-# those tables in the shared MetaData so the FKs resolve at mapper-configure time. Import-only.
+# These tables carry composite FKs to `workspaces`/`connectors`, and the additive `credential_id`
+# FK to `credentials`; importing the models registers those tables in the shared MetaData so the FKs
+# resolve at mapper-configure time. `credentials` is a module-style import so the connections↔
+# credentials FK cycle loads cleanly (M1-Credentials-v1). Import-only.
+import app.domains.credentials.models  # noqa: F401
 from app.domains.connectors import models as _connectors_models  # noqa: F401
 from app.shared.models import Base, TimestampMixin, UUIDPrimaryKeyMixin, WorkspaceScopedMixin
 
@@ -80,6 +83,17 @@ class Connection(UUIDPrimaryKeyMixin, WorkspaceScopedMixin, TimestampMixin, Base
             ["connectors.workspace_id", "connectors.id"],
             name="fk_connections_connector_id",
             ondelete="CASCADE",
+        ),
+        # The additive credential pointer (M1-Credentials-v1, P-43): a connection references its
+        # Credential in the SAME workspace. `use_alter` because connections ↔ credentials reference
+        # each other — the FK is added after both tables exist (migration 0011). NO ACTION (no
+        # composite SET NULL, which would also null the NOT NULL workspace_id): the credentials
+        # service clears `credential_id` before deleting the credential row.
+        ForeignKeyConstraint(
+            ["workspace_id", "credential_id"],
+            ["credentials.workspace_id", "credentials.id"],
+            name="fk_connections_credential_id",
+            use_alter=True,
         ),
     )
 

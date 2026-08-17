@@ -1486,3 +1486,64 @@ predicate removals are inert defense-in-depth, verified by the catalog check), a
 warning and debug. **Deferred (out of scope):** Credentials/encryption/KEK, the Execution Runtime,
 `/v1/tool-calls`, `tool_calls`/audit, the Tools API + per-Tool enable/disable, connection health/
 test-call (M2), OAuth, and self-serve workspace creation.
+
+## ADR-0030 — Credential vault: envelope encryption with an env-provisioned master KEK (M1-Credentials-v1)
+
+**Status:** Accepted (2026-08-17) · **Context:** M1-Credentials-v1, the radioactive slice of M1's
+execution plane. SECURITY.md §2.1 already fixes the key architecture (a pre-implementation decision
+gate confirmed it); this ADR ratifies it and the M1↔M2 boundary. A Credential is the encrypted
+secret bound 1:1 to a Connection (Bible §4, DATABASE_DESIGN §3). One migration (`0011_credentials`).
+
+**Decision:**
+
+1. **Envelope encryption, env-provisioned KEK (SECURITY §2.1).** AES-256-GCM (`cryptography` only,
+   never hand-rolled), in a vault module that is the **only** code touching plaintext. Per
+   Credential: a fresh CSPRNG **256-bit DEK** encrypts the secret; the DEK is **wrapped by the master
+   KEK**; fresh random nonces; the GCM tag is verified on every decrypt (fail-closed). The KEK never
+   encrypts a payload directly. The **master KEK** is the env-provisioned `CREDENTIAL_MASTER_KEY`
+   (already a `SecretStr` in config) — **base64 of exactly 32 bytes**, loaded and validated per
+   operation and **fail-closed** on missing / default `change-me` / bad-base64 / wrong-length (never
+   a fallback, never a regenerated key); production additionally validates it at startup and refuses
+   to boot on a bad key. Local/CI use disposable non-production keys (compose + CI env). **KMS is
+   M2+** Team/Enterprise hardening — because only wrapped DEKs depend on the KEK, that migration
+   re-wraps DEKs behind a stable interface with no schema change.
+
+2. **GCM AAD = workspace_id ‖ connection_id (ratified hardening).** The two UUIDs as raw 16-byte
+   values, concatenated (fixed length, unambiguous, no secret), bound as associated data on **both**
+   the payload encryption and the DEK wrap. A ciphertext transplanted to another workspace or
+   connection fails authentication — defense-in-depth over RLS against cross-tenant ciphertext copy.
+   `key_version = 1` in M1 (single active KEK); the column exists for the M2 rotation runbook (no
+   multi-version keyring / background re-wrap here).
+
+3. **`credentials` table (migration `0011`).** `id, workspace_id, connection_id, credential_type,
+   ciphertext, encrypted_dek, key_version, nonce, expires_at, rotated_at, timestamps`
+   (DATABASE_DESIGN §3). The CHECK admits all six canonical types for forward compatibility; **M1
+   application flows support only `api_key`/`bearer`/`basic`** (schemas restrict it — no OAuth / JWT
+   / custom-headers). RLS ENABLE+FORCE + `tenant_isolation`; a composite intra-tenant FK
+   `(workspace_id, connection_id) → connections`; `UNIQUE(connection_id)` (1:1) and
+   `UNIQUE(workspace_id, id)`; grants **SELECT/INSERT/UPDATE/DELETE** — the one table with DELETE,
+   because **revocation hard-deletes the row** (no soft delete). This migration additively wires the
+   pointer FK `connections.(workspace_id, credential_id) → credentials(workspace_id, id)` that
+   Connections v1 left open (P-43) — with **NO ACTION** (a composite `SET NULL` would also null the
+   NOT NULL `workspace_id`), so the service clears the pointer before deleting the credential.
+
+4. **API, lifecycle, and decrypt boundary (ratified).** The Credential is a **1:1 sub-resource** —
+   API_GUIDELINES §2 lists no top-level `/v1/credentials`, so it lives at
+   `/v1/connections/{connection_id}/credential` (POST attach, GET metadata, PUT rotate, DELETE
+   revoke), gated by `connections:manage`. **Responses are metadata only** — never ciphertext, DEK,
+   nonce, or plaintext; the secret enters once (`SecretStr`) and is never returned, logged, or
+   persisted in plaintext. **Attach transitions the Connection `pending_auth → active`** (honoring
+   §3's "credential_id non-null only when not pending_auth"; the §382 health-check is a runtime
+   refinement); rotate re-seals with a **fresh DEK + nonce** and stamps `rotated_at`; revoke
+   hard-deletes and returns the Connection to `pending_auth`. **Decryption (`_unseal`) is private to
+   the vault** — the future Execution Runtime is the only legitimate caller; no router / service /
+   repository / worker path decrypts in M1 (SECURITY §2.2).
+
+**Consequences:** One migration (`0011_credentials`; up/down/up verified, `alembic check` clean); no
+prior table/migration rewritten; the `cryptography` dependency was already present (no new dep). A
+thin `app/core/redis.py`-style vault module is scoped to the domain; a disposable KEK was added to
+compose + CI (never production). Proven by 18 vault unit + 9 real-Postgres+RLS integration + 15
+real-HTTP API tests, a 25-mutation audit (0 meaningful survivors; the RLS/unique-index-redundant
+mutations are inert defense-in-depth), migration up/down/up, and full regression at warning and
+debug. **Deferred:** KMS, per-Workspace data keys, the rotation background job, OAuth/JWT/custom
+credential flows, the Execution Runtime (and its decrypt calls), `/v1/tool-calls`, and the audit log.
