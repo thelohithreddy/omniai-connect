@@ -1619,3 +1619,46 @@ and full regression at warning and debug. **Deferred:** async/long-running Tool 
 SDK exporters (M2/M4), OAuth/JWT/custom_headers injection + the `securitySchemes → auth_config`
 projection, rate limits/quotas/circuit breaker (M2/M3), `usage_events` billing metering (M3), the
 R2 pointer for truncated bodies, and destructive-operation confirmation.
+
+## ADR-0032 — Tools administration v1: enable/disable lifecycle; description editing deferred (M1-Tools-v1)
+
+**Status:** Accepted (2026-08-17) · **Context:** M1's Tools Administration surface — authorized users
+inspecting and controlling already-normalized Tools. The Connector Engine produces Tools (ADR-0003/
+0028) and the Execution Runtime (ADR-0031) executes the enabled ones; this slice sits between them and
+owns the *administrative* lifecycle. FR-CE-4 (P0) names "per-Tool enable/disable **and description
+editing**". No migration is required — the `tools.enabled` column, its `UPDATE` grant, and the
+Runtime's `enabled` exclusion already exist. No new ADR-level architecture; this records two
+non-obvious scope/authorization decisions.
+
+**Decision:**
+
+1. **Read/write authorization split, straight from the canonical matrix (SECURITY §4.1).** *Reading*
+   Tools is `tools:execute` — the capability is literally "Execute Tool Calls, *view Tools* and own
+   logs" (OWNER/ADMIN/MEMBER). *Enabling/disabling* a Tool is Connector configuration (FR-CE-4, "on a
+   Connector") → `connectors:manage` (OWNER/ADMIN). VIEWER holds nothing → denied. The admin surface
+   is the **human control plane** (ADR-0002): `require_permission` resolves membership, so a machine
+   token — which has none — is denied on `/v1/tools` and administers nothing; machine identities
+   execute via the Runtime, they do not administer. No new permission was invented (the fixed 7 hold).
+
+2. **M1 ships enable/disable only; per-Tool description editing is deferred (founder-ratified).**
+   `GET /v1/tools` (list, cursor-paginated, optional `?connector_id=`), `GET /v1/tools/{id}`, and
+   `PATCH /v1/tools/{id}` `{enabled}` — the last is a single atomic conditional `UPDATE ... RETURNING`
+   (race-safe, idempotent, never a read-modify-write). `enabled` is the only mutable field
+   (`extra="forbid"` rejects any attempt to rewrite name/description/schema/connector identity, which
+   originate from ingestion/promotion). **Description editing (also FR-CE-4) is deferred** because
+   CONNECTOR_ENGINE §6 requires per-Tool overrides to "survive re-sync", but promotion (ADR-0028)
+   currently re-applies *only* the `enabled` override by Tool identity — a description edit would be
+   silently reset on the next re-ingest+promote. Shipping it correctly requires extending the
+   connectors/promotion override-persistence (carry description overrides forward by identity), a
+   distinct connectors-domain change out of this slice's scope. The seam is recorded as deferred M1
+   work. The live set is `deleted_at IS NULL` throughout, so a deprecated Tool is a uniform 404 and
+   cannot be listed, fetched, or re-enabled (no resurrection), and a disabled Tool cannot execute
+   (the Runtime already excludes it) — proven end-to-end.
+
+**Consequences:** No migration, no new event (MCP tool-list-cache invalidation on toggle is M2; there
+is no M1 consumer), no new dependency. New `tools` domain (schemas/repository/service/router) wired at
+`/v1/tools`. Proven by 5 schema unit + 21 real-Postgres+RLS+real-JWT API tests, a 12-killed mutation
+audit (0 meaningful survivors; 4 inert — 3 RLS-redundant workspace predicates and 1 UPDATE-predicate
+redundant with the `get()` re-fetch + transaction rollback), the Runtime cross-surface invariant
+(enable → executes, disable → 404), and full regression at warning + debug. **Deferred M1 work:**
+per-Tool description editing (needs promotion override-persistence) and the Audit-log viewer surface.

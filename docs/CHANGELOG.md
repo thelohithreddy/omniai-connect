@@ -13,6 +13,22 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Tools administration API (M1-Tools-v1, ADR-0032).** The control-plane surface for the Tool
+  lifecycle: `GET /v1/tools` (list, cursor-paginated, optional `?connector_id=`),
+  `GET /v1/tools/{id}`, and `PATCH /v1/tools/{id}` `{enabled}` (enable/disable). New `tools` domain
+  (schemas/repository/service/router); **no migration** — it reuses the existing `tools.enabled`
+  column + `UPDATE` grant, and the Runtime already excludes disabled/deprecated Tools. Authorization
+  splits by the canonical matrix: **reading** is `tools:execute` (owner/admin/member — "view Tools");
+  **enable/disable** is `connectors:manage` (owner/admin); VIEWER and machine tokens are denied (the
+  admin surface is the human control plane, ADR-0002). Enable/disable is a single atomic conditional
+  `UPDATE` (race-safe, idempotent); `enabled` is the only mutable field (`extra="forbid"` rejects
+  rewriting name/description/schema/connector identity). Live set is `deleted_at IS NULL` — a
+  deprecated Tool is a uniform 404 (no resurrection), a disabled Tool cannot execute. **Deferred:**
+  per-Tool description editing (also FR-CE-4 — needs promotion override-persistence, since promotion
+  currently carries only the `enabled` override forward) and the Audit-log viewer. Proven by 5 unit +
+  21 real-Postgres+RLS+real-JWT API tests, a 12-killed mutation audit (0 meaningful survivors), and
+  the Runtime cross-surface invariant (enable → executes; disable → 404).
+
 - **Execution Runtime v1 — the synchronous REST Tool Call path (M1-Execution-Runtime, ADR-0031).**
   M1's critical path: a valid tenant request now executes a promoted REST Tool against its Connection
   using its attached Credential. New `runtime` domain implementing the 7-stage pipeline (AI_RUNTIME §2)
