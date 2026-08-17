@@ -1662,3 +1662,45 @@ audit (0 meaningful survivors; 4 inert — 3 RLS-redundant workspace predicates 
 redundant with the `get()` re-fetch + transaction rollback), the Runtime cross-surface invariant
 (enable → executes, disable → 404), and full regression at warning + debug. **Deferred M1 work:**
 per-Tool description editing (needs promotion override-persistence) and the Audit-log viewer surface.
+
+## ADR-0033 — Audit Log Viewer v1: the read-only `audit:read` view over the tool_calls ledger (M1-Audit-v1)
+
+**Status:** Accepted (2026-08-18) · **Context:** the final M1 product surface (PRD FR-CP-3 / UJ-5) —
+an authorized, tenant-isolated, read-only view of the Tool Call audit ledger the Execution Runtime
+already writes (`tool_calls`, ADR-0031). No new table, no new event, no migration: the ledger, its
+RLS, its append-only SELECT+INSERT grant, and the log-UI indexes (`ix_tool_calls_workspace_id_
+created_at`, `ix_tool_calls_workspace_id_connection_id_created_at`) already exist. This records two
+decisions the specs left open.
+
+**Decision:**
+
+1. **`GET /v1/tool-calls` — the full-log viewer, gated by `audit:read` (founder-ratified).** The
+   canonical resource is `/v1/tool-calls` (API_GUIDELINES §1); the runtime already owns its `POST`
+   (invoke) and `GET /{id}` (fetch a result), so the viewer adds only the **list**. The matrix
+   distinguishes `audit:read` = "View full audit log — every member's activity, not just one's own"
+   (OWNER/ADMIN) from `tools:execute` = "view **own logs**" (MEMBER). The M1 viewer is the FR-CP-3/
+   UJ-5 **full-log** dashboard → `audit:read`; MEMBER, VIEWER, and machine tokens (no membership) are
+   denied. The member "own logs" browse (a caller-scoped view under `tools:execute`) is **deferred**
+   — it needs its own caller-identity-scoping decision. This keeps the endpoint's privilege exactly
+   what the named viewer requires, no broader.
+
+2. **A dedicated read-only `audit` domain; metadata-only; canonical UJ-5.3 filters.** A new
+   `app/domains/audit/` (router/service/repository/schemas) reads `runtime.models.ToolCall` — it does
+   not duplicate the ledger, create a second audit system, or touch the runtime pipeline, and issues
+   **only SELECTs** (the app role holds no UPDATE/DELETE grant on `tool_calls`, and no mutation verb
+   is registered — PATCH/PUT/DELETE are 405). Cursor pagination (§3) keyset on `(created_at, id)` DESC
+   — deterministic (UUIDv7 tie-break), index-backed, bounded (LIMIT ≤ 100). Filters are exactly the
+   UJ-5.3 set: `connection_id`, `tool_id`, `status` (validated against the closed enum), `interface`
+   (`caller->>'interface'`), and `created_after`/`created_before`. The response is an **explicit
+   `ToolCallLogRead` schema** (never raw-ORM), exposing only redacted audit metadata (Tool/Connection
+   ids, `caller` identity, status, `error_code`, `duration_ms`, `request_id`, `created_at`, and the
+   already-redacted `input_summary`/`output_summary`) — `workspace_id` and every ciphertext column
+   are structurally absent, so a future `tool_calls` column cannot silently leak through this surface.
+
+**Consequences:** No migration, no new event, no runtime change, no new dependency. The list shares
+`/v1/tool-calls` with the runtime router (distinct method/path — no conflict). Proven by 2 schema unit
++ 14 real-Postgres+RLS+real-JWT API tests, a 13-killed mutation audit (0 meaningful survivors; 1 inert
+RLS-redundant predicate), cross-tenant isolation, read-only-405, metadata-only (no secret/`workspace_
+id`) assertions, and full regression at warning + debug. **Deferred M1 work:** the member "own logs"
+(`tools:execute`) caller-scoped view; CSV export + the log-explorer UI (frontend, FRONTEND_SPEC). This
+is the **final M1 product surface** — M1 is now feature-complete pending the final forensic audit.

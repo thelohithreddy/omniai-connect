@@ -23,6 +23,7 @@ from app.core.exceptions import DomainError
 from app.core.logging import configure_logging, get_logger
 from app.core.middleware import REQUEST_ID_HEADER, RequestContextMiddleware
 from app.core.readiness import check_readiness
+from app.domains.audit.router import audit_router
 from app.domains.connections.router import connections_router
 from app.domains.connectors.router import connectors_router
 from app.domains.connectors.subscribers import register_connector_subscribers
@@ -56,6 +57,7 @@ app.include_router(connections_router)
 app.include_router(credentials_router)
 app.include_router(tool_calls_router)
 app.include_router(tools_router)
+app.include_router(audit_router)
 
 # Fail closed in production if the credential master key is missing/default/invalid (SECURITY §2):
 # the API refuses to boot rather than run the vault on a bad key. Local/CI use disposable keys.

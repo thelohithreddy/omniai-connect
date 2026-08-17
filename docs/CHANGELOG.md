@@ -13,6 +13,22 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Audit Log Viewer (M1-Audit-v1, ADR-0033).** The final M1 product surface: a read-only,
+  tenant-isolated view of the Tool Call audit ledger. New `GET /v1/tool-calls` (list) — the runtime
+  already owns `POST` (invoke) and `GET /{id}` (fetch a result), so only the list is new. New
+  read-only `audit` domain (schemas/repository/service/router) reading the existing `tool_calls`
+  table — **no migration, no new table, no new event**; it issues only SELECTs (no mutation verb is
+  registered: PATCH/PUT/DELETE → 405). Gated by `audit:read` (OWNER/ADMIN — "view full audit log");
+  MEMBER, VIEWER, and machine tokens are denied. Cursor pagination (keyset on `(created_at, id)` DESC,
+  deterministic UUIDv7 tie-break, index-backed, LIMIT ≤ 100); canonical UJ-5.3 filters
+  (`connection_id`, `tool_id`, `status`, `interface`, `created_after`/`created_before`; unknown param
+  or bad status → 400). Responses are an explicit `ToolCallLogRead` schema (never raw ORM) exposing
+  only redacted audit metadata — `workspace_id` and every ciphertext column are structurally absent.
+  **Deferred:** the member "own logs" (`tools:execute`) caller-scoped view; CSV export + the
+  log-explorer UI (frontend). Proven by 2 unit + 14 real-Postgres+RLS+real-JWT API tests, a 13-killed
+  mutation audit (0 meaningful survivors), cross-tenant isolation, and read-only-405 + metadata-only
+  assertions. **This completes the M1 product surfaces.**
+
 - **Tools administration API (M1-Tools-v1, ADR-0032).** The control-plane surface for the Tool
   lifecycle: `GET /v1/tools` (list, cursor-paginated, optional `?connector_id=`),
   `GET /v1/tools/{id}`, and `PATCH /v1/tools/{id}` `{enabled}` (enable/disable). New `tools` domain
