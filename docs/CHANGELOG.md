@@ -13,6 +13,21 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **MCP tools/call (M2.3, ADR-0036).** The execution bridge: `tools/call` on the M2.2 endpoint
+  translates into the *existing* Execution Runtime (`ToolCallCreate` → `RuntimeService.execute` →
+  MCP tool result) — one execution path, no new engine. The Runtime remains the sole authority
+  for authorization, Connection resolution, argument validation, credential decrypt-at-use,
+  SSRF/egress, timeout, and audit; the MCP adapter performs no HTTP, touches no credential, adds
+  no second audit row. Re-authorized at execution time, so a **stale discovery cache can never
+  authorize a disabled/revoked Tool**; cross-tenant execution is impossible even given another
+  workspace's Tool name; a `workspace_id` in `arguments` is inert data, never authority. Error
+  split: unresolvable Tool / ambiguous Connection → JSON-RPC error (uniform "Unknown tool.");
+  audited failures (upstream, timeout, `ssrf_blocked`, credential, bad arguments) → tool result
+  with `isError: true` and the stable code, no target/secret/details ever leaked. No automatic
+  retries (one attempt — calls may be destructive). Audit rows from MCP are tagged
+  `caller.interface="mcp"` (new server-set `RuntimeService(interface=...)`, default `"rest"`).
+  No migration, no new dependency.
+
 - **MCP tools/list (M2.2, ADR-0035).** The first MCP surface: `POST /mcp/v1/{workspace_slug}`
   (sessionless Streamable HTTP JSON-RPC; the `mcp.omniaiconnect.com` edge maps its `/v1/*`
   here). Founder-ratified protocol pin — allowlist `{2025-06-18, 2025-11-25}`, advertising

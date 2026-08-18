@@ -43,6 +43,7 @@ from app.domains.tools.repository import ToolRepository
 from app.domains.workspaces.models import Workspace
 from app.interfaces.mcp import protocol
 from app.interfaces.mcp.cache import read_tools_cache, write_tools_cache
+from app.interfaces.mcp.execution import execute_tool_call
 
 log = get_logger(__name__)
 
@@ -154,6 +155,12 @@ async def mcp_endpoint(
             )
         tools = await _discover_tools(uow, ctx)
         return _jsonrpc(protocol.result_response(msg_id, {"tools": tools}))
+
+    if method == "tools/call":
+        # M2.3 (ADR-0036): translation into the one canonical execution path — the Runtime
+        # re-resolves and re-authorizes the Tool at call time (the discovery cache is never
+        # execution authority), decrypts at use, enforces egress policy, and writes the audit.
+        return _jsonrpc(await execute_tool_call(uow, ctx, msg_id, params))
 
     return _jsonrpc(protocol.error_response(msg_id, protocol.METHOD_NOT_FOUND, "Method not found."))
 

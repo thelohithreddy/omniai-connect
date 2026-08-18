@@ -69,6 +69,14 @@ transports that support them, so long-lived clients refresh without reconnecting
 The adapter performs **no** argument validation, no retries, no credential work —
 those are runtime stages. A `tools/call` handler is ~20 lines by design.
 
+*Implemented M2.3 (ADR-0036): `interfaces/mcp/execution.py` maps params → the existing
+`RuntimeService.execute` → MCP tool result. The Runtime re-authorizes at execution time, so a
+stale `tools/list` cache never authorizes a disabled/revoked Tool. Audited failures (upstream,
+timeout, `ssrf_blocked`, credential, bad arguments) map to `isError: true` results; an
+unresolvable Tool or ambiguous Connection is a JSON-RPC error. Exactly one execution attempt (no
+retries). Audit rows are tagged `caller.interface="mcp"`. `confirmation_required` and async/
+`pending` streaming remain deferred (no such Runtime status exists yet).*
+
 ## 5. Transports
 
 - **Streamable HTTP** is the primary transport — it is what remote clients (ChatGPT,

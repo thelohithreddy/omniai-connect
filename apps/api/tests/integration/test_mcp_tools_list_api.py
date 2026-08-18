@@ -137,12 +137,13 @@ async def test_initialize_ping_and_unknown_method(
     )
     assert ping.status_code == 200 and ping.json()["result"] == {}
 
-    call = await client.post(
+    # An unimplemented method (resources are out of scope for this server) → method-not-found.
+    unknown = await client.post(
         _url(workspace_a.slug),
         headers=_headers(workspace_a),
-        json={"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {}},
+        json={"jsonrpc": "2.0", "id": 3, "method": "resources/list", "params": {}},
     )
-    assert call.json()["error"]["code"] == -32601  # M2.3, not yet a method
+    assert unknown.json()["error"]["code"] == -32601
 
 
 async def test_unsupported_version_negotiates_down_and_header_is_enforced(

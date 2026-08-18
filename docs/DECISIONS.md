@@ -1812,3 +1812,53 @@ real-Postgres+RLS+Redis+real-auth integration tests and a 17-mutation audit (15 
 inert RLS-redundant tenant predicates, 0 meaningful survivors). **Deferred:** `tools/call` +
 result translation (M2.3); `listChanged` emission; FastMCP re-evaluation; per-token scope
 narrowing of listings (blocked on the scope vocabulary); `2026-07-28` adoption.
+
+## ADR-0036 — MCP tools/call: the execution bridge over the canonical Runtime (M2.3)
+
+**Status:** Accepted (2026-08-18) · **Context:** the second and highest-risk MCP surface — remote
+AI clients invoking real Tools is a confused-deputy boundary. Canon fixes the shape: MCP is a
+thin adapter over the Execution Runtime (MCP_RUNTIME §1/§4), and the Runtime is already the sole
+authority for authorization, Connection resolution, argument validation, credential
+decrypt-at-use, SSRF/egress, timeout, and audit (ADR-0031). M2.3 adds only translation; it
+introduces no execution, credential, SSRF, or audit mechanism, no new dependency, no migration.
+
+**Decision:**
+
+1. **One execution path.** `interfaces/mcp/execution.py` maps `tools/call` params →
+   `ToolCallCreate` → the existing `RuntimeService.execute` → `ExecutionOutcome` → MCP tool
+   result. The adapter performs no HTTP, imports no vault/crypto/net internals (proven by a
+   structural grep in the mutation audit), validates nothing beyond protocol shape, and adds no
+   second audit row. The workspace is the authenticated `ctx` alone — `tools/call` params carry
+   only `name` + `arguments`; a `workspace_id`/`connection_id` placed inside `arguments` is inert
+   tool data (tested), never tenant authority.
+
+2. **The Runtime re-authorizes at execution time; the discovery cache is never execution
+   authority.** A Tool listed by a stale `tools/list` cache but since disabled/deprecated or
+   whose Connection went inactive/revoked is refused by the Runtime's resolve stage — the
+   mandatory stale-cache test drives exactly this (list → disable without evicting → call →
+   refused, no egress). Cross-tenant execution is impossible even when A knows B's exact Tool
+   name: the Runtime resolves within A's RLS-bound tenant and finds nothing (uniform "Unknown
+   tool.", no egress, no row in B).
+
+3. **Error split (MCP_RUNTIME §4).** Failures the Runtime *raises* (pre-audit: unresolvable Tool
+   → uniform phrase, never an oracle; ambiguous Connection) become JSON-RPC errors. Failures the
+   Runtime *returns* (audited outcomes: bad arguments, upstream 4xx/5xx, timeout, egress denial,
+   credential failure) become MCP tool results with `isError: true` carrying `<stable code>:
+   <safe message>`. `ssrf_blocked` stays a distinct security refusal, never re-cast as an upstream
+   error; no message carries a target URL, address, header, or `details`. `_meta` carries the
+   audit correlation (`toolCallId`, `requestId`).
+
+4. **No retries, one timeout, single audit.** Exactly one execution attempt per request (a Tool
+   Call may be destructive — no automatic replay, no idempotency inference from annotations); the
+   Runtime's existing timeout governs; the Runtime writes the one audit row, now tagged
+   `caller.interface="mcp"` via a new server-set `RuntimeService(interface=...)` parameter
+   (default `"rest"` — every M1 call unchanged).
+
+**Consequences:** No migration (`alembic check` clean), no new dependency, no Runtime behavior
+change (only an additive, server-set `interface` label). Verified by 4 mapping-unit + 13
+real-Postgres+RLS+real-auth+real-Runtime integration tests, two live end-to-end runs against the
+running stack (a real execution and a real `169.254.169.254` SSRF rejection — `ssrf_blocked`,
+`denied`, no IP leaked, canary absent from response and audit), and a 11-mutation audit (10
+killed, 1 inert: a name guard redundant with `ToolCallCreate` validation; 0 meaningful
+survivors). **Deferred:** MCP `listChanged`, resources/prompts/sampling, async/streaming results,
+per-token scope narrowing; FastMCP re-evaluation stands (ADR-0035).
