@@ -103,6 +103,20 @@ def test_empty_resolution_is_fail_closed() -> None:
         resolve_and_validate("host", 443, _resolver())
 
 
+def test_dns_resolution_failure_is_an_ssrf_refusal_not_an_os_error() -> None:
+    """M2.4-pre: an NXDOMAIN/DNS failure surfaces as `SSRFError("unresolvable-address")`, never
+    a raw `socket.gaierror` escaping the egress taxonomy as an unaudited internal 500."""
+    import socket
+
+    def _failing_resolver(host: str, port: int) -> list[tuple[int, str]]:
+        raise socket.gaierror(-2, "Name or service not known")
+
+    with pytest.raises(SSRFError) as excinfo:
+        resolve_and_validate("no-such-host.invalid", 443, _failing_resolver)
+    assert "unresolvable-address" in str(excinfo.value)
+    assert "Name or service" not in str(excinfo.value)  # the OS detail never rides along
+
+
 def test_any_forbidden_record_refuses_the_whole_host() -> None:
     """A rebinding answer that mixes one public and one private record cannot smuggle the
     private one through — the whole host is refused."""
