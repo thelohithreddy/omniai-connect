@@ -8,9 +8,22 @@
 
 ## Current phase
 
-**M2 — MCP Interface, credential vault, OAuth: IN PROGRESS.** **M1 is COMPLETE and RELEASED
-to `main`** (final verified SHA `630daf9`, merged as `7141b2c`, post-merge CI green, 1312
-regression tests, 0 meaningful mutation survivors across all module audits). The M2 decision
+**M2 — MCP Interface, credential vault, OAuth: IN PROGRESS.** **The MCP slice (M2.1 events +
+M2.2 tools/list + M2.3 tools/call) is COMPLETE and RELEASED to `main`** as the `--no-ff` merge
+`93d9a72` (2026-08-18; tree byte-identical to the verified `63531ae`), post-merge CI 4/4 green,
+1375 regression tests, 0 meaningful mutation survivors across the M2.1/2.2/2.3 audits, adversarial
+security subset green (cross-tenant, stale-cache-cannot-authorize, SSRF, credential canary,
+no-retry). **M1 was COMPLETE and RELEASED to `main`** earlier (final verified SHA `630daf9`,
+merged as `7141b2c`, post-merge CI green, 1312 regression tests, 0 meaningful mutation survivors).
+
+**Open item discovered during the M2.3 release smoke (pre-existing M1 gap, not a regression, not
+security):** `core/net.py::_default_resolver`/`resolve_and_validate` does not map a DNS
+`socket.gaierror` (NXDOMAIN host) to `SSRFError`, so a Tool Call against an unresolvable host
+surfaces as an `internal` 500 with no audit row — identically on the REST and MCP paths (egress is
+stubbed in all tests, so this real-egress edge is uncovered). Fail-closed (request never made, no
+target/credential leak). Recommended targeted follow-up: wrap `getaddrinfo`'s `gaierror` →
+`SSRFError("unresolvable-address")` (or add it to `egress.py`'s except), with a resolver-injection
+test. Not fixed under the release-only directive. The M2 decision
 gate ran 2026-08-18: MCP auth (workspace `omc_` Bearer token) and the OAuth `auth_config`
 contract are canonically defined; the MCP protocol-version pin and Free-tier rate/quota numbers
 await founder ratification. Validated M2 order: cache-eviction events (M2.1, done) → MCP
