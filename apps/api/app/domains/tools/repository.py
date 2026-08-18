@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.pagination import CursorPosition
 from app.core.security import WorkspaceContext
+from app.domains.connections.models import Connection
 from app.domains.connectors.models import Tool
 
 
@@ -64,6 +65,39 @@ class ToolRepository:
         )
         tool: Tool | None = await self._session.scalar(stmt)
         return tool
+
+    async def list_discoverable(self) -> list[Tool]:
+        """Every Tool of this Workspace that an AI surface may currently discover (M2.2): live and
+        enabled, with its Connector bound by at least one live `active` Connection — exactly the
+        set the Runtime will execute (its resolve stage requires live+enabled and binds an active
+        Connection), so discovery and execution authority can never diverge on state.
+
+        Workspace-scoped in both the outer query and the EXISTS subquery (defense in depth over
+        RLS, P-14) — the tenant boundary is enforced server-side in SQL, never by filtering in
+        Python. Ordered `(created_at, id) DESC`, the canonical Tool listing order (deterministic:
+        UUIDv7 tie-break), matching `GET /v1/tools`.
+        """
+        bound_by_active_connection = (
+            select(Connection.id)
+            .where(
+                Connection.workspace_id == self._ctx.workspace_id,
+                Connection.connector_id == Tool.connector_id,
+                Connection.status == "active",
+                Connection.deleted_at.is_(None),
+            )
+            .exists()
+        )
+        stmt = (
+            select(Tool)
+            .where(
+                Tool.workspace_id == self._ctx.workspace_id,
+                Tool.deleted_at.is_(None),
+                Tool.enabled.is_(True),
+                bound_by_active_connection,
+            )
+            .order_by(Tool.created_at.desc(), Tool.id.desc())
+        )
+        return list((await self._session.scalars(stmt)).all())
 
     async def set_enabled(self, tool_id: uuid.UUID, *, enabled: bool) -> tuple[Tool | None, bool]:
         """Flip a LIVE Tool's `enabled` flag with a single atomic, workspace-scoped UPDATE; return

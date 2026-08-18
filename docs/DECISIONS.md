@@ -1751,3 +1751,64 @@ killed, 4 inert (2 defensively-unreachable prior-status guards awaiting the M2 `
 RLS-redundant workspace predicates, same class as prior audits), 0 meaningful survivors — and
 full regression (1332). **Deferred:** the eviction *consumer* (M2.2 MCP `tools/list`); the
 `active → error` emission site (M2 OAuth refresh worker); broker durability (ADR-0023's swap).
+
+## ADR-0035 — MCP tools/list: pinned protocol, minimal adapter, cached discovery (M2.2)
+
+**Status:** Accepted (2026-08-18) · **Context:** the first MCP surface. Canon fixes the shape —
+thin adapter (MCP_RUNTIME §1), api-token auth with token/slug binding (§2), the cached,
+event-invalidated listing over active Connections' enabled Tools (§3), Streamable HTTP (§5),
+explicit version pinning (§7) — but left three values open. All three were founder-ratified
+2026-08-18. M2.1 (ADR-0034) supplied the six eviction events and flagged the at-most-once
+lost-eviction gap this module's TTL closes.
+
+**Decision:**
+
+1. **Protocol pin (founder-ratified):** allowlist `{2025-06-18, 2025-11-25}`, advertising
+   `2025-11-25` (`interfaces/mcp/protocol.py::SUPPORTED_PROTOCOL_VERSIONS`). `initialize`
+   echoes a supported requested revision, otherwise answers with the advertised one; every
+   post-initialize request must present `MCP-Protocol-Version` from the allowlist (the spec's
+   2025-03-26 fallback is below our floor → 400, never a downgrade). `2026-07-28` (stateless
+   core, MRTR, beta SDKs) is excluded until reconciled with MCP_RUNTIME's session model;
+   adopting it is a deliberate upgrade PR with contract tests, never a dependency bump.
+
+2. **Minimal in-house adapter, no FastMCP (founder-ratified deviation from MCP_RUNTIME §1).**
+   `interfaces/mcp/` implements JSON-RPC over sessionless Streamable HTTP directly (JSON
+   responses; GET/DELETE 405; single messages only — batching left the spec in 2025-06-18):
+   `initialize`, `notifications/*` (202), `ping`, `tools/list`; everything else, including
+   `tools/call`, is the protocol's method-not-found until M2.3. Rationale: zero new
+   dependencies for a discovery-only surface, exact allowlist control, native reuse of the
+   existing auth stack. FastMCP is re-evaluated at M2.3 (streaming/elicitation). Mounted at
+   `/mcp/v1/{workspace_slug}` — outside REST `/v1` so user-chosen slugs can never collide with
+   resource paths; the `mcp.omniaiconnect.com` edge maps its `/v1/*` here. `listChanged` is
+   declared false (no server→client stream yet; deferred with tools/call).
+
+3. **Auth = machine tokens only, slug-bound.** The `omc_` workspace token authenticates and
+   selects the workspace (existing `get_workspace_context`); a human JWT gets the uniform 401
+   (MCP is machine identity, ADR-0002); the path slug must name the token's own workspace —
+   mismatch is the same uniform 401 before any listing (MCP_RUNTIME §2). Browser-origin
+   requests are refused outright (Streamable HTTP DNS-rebinding guard; no CORS surface).
+
+4. **Discovery = the Runtime-callable set, from the canonical schema.** One workspace-scoped
+   RLS-backed query (`ToolRepository.list_discoverable`): live + enabled Tools whose Connector
+   has ≥1 live `active` Connection — exactly what the Runtime will execute, so discovery and
+   execution authority cannot diverge. Ordered `(created_at, id) DESC` (the canonical Tool
+   listing order). The wire projection is a strict allowlist: `name`, `description`,
+   `inputSchema`, and `annotations.{readonly,destructive,idempotent}` →
+   `readOnlyHint/destructiveHint/idempotentHint`; ids, tenant, tags, rate_hints, endpoints,
+   and all credential material are structurally absent.
+
+5. **Cache = optimization only; TTL backstop = 300 s (founder-ratified).** Cache-aside on
+   `ws:{workspace_id}:mcp:tools` (key from the server-derived context, value in a versioned
+   envelope so shape drift reads as a miss). Evicted by the six ADR-0034 events, with the
+   workspace taken only from the trusted envelope. Because the bus is at-most-once, the TTL
+   (`settings.mcp_tools_cache_ttl_seconds`, default 300) is the guaranteed staleness bound for
+   a lost eviction — stale discovery is bounded; stale execution is impossible (the Runtime
+   re-authorizes every call). Redis failure degrades to the authoritative database — never an
+   empty list, never an authorization input.
+
+**Consequences:** No migration (`alembic check` clean), no new dependency, no Runtime/domain
+behavior change; domains still never import interfaces. Proven by 8 protocol-unit + 18
+real-Postgres+RLS+Redis+real-auth integration tests and a 17-mutation audit (15 killed, 2
+inert RLS-redundant tenant predicates, 0 meaningful survivors). **Deferred:** `tools/call` +
+result translation (M2.3); `listChanged` emission; FastMCP re-evaluation; per-token scope
+narrowing of listings (blocked on the scope vocabulary); `2026-07-28` adoption.

@@ -13,6 +13,21 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **MCP tools/list (M2.2, ADR-0035).** The first MCP surface: `POST /mcp/v1/{workspace_slug}`
+  (sessionless Streamable HTTP JSON-RPC; the `mcp.omniaiconnect.com` edge maps its `/v1/*`
+  here). Founder-ratified protocol pin — allowlist `{2025-06-18, 2025-11-25}`, advertising
+  `2025-11-25`; post-initialize requests must present a pinned `MCP-Protocol-Version` (400
+  otherwise, never a downgrade). Machine `omc_` tokens only (human JWTs → uniform 401), path
+  slug bound to the token's workspace, browser-origin requests refused. `tools/list` returns
+  the Runtime-callable set (live+enabled Tools with an active Connection) from one
+  workspace-scoped RLS-backed query, ordered `(created_at, id) DESC`, projected strictly to
+  `name`/`description`/`inputSchema`/safety hints — no internal or credential fields, ever.
+  Cache-aside Redis listing (`ws:{workspace_id}:mcp:tools`, versioned envelope) evicted by the
+  six ADR-0034 lifecycle events and bounded by a founder-ratified **300 s TTL backstop**
+  (recovery for at-most-once event loss); Redis failure degrades to the authoritative
+  database. `initialize`/`ping`/notifications implemented; `tools/call` is method-not-found
+  until M2.3. No migration, no new dependency. New setting `MCP_TOOLS_CACHE_TTL_SECONDS`.
+
 - **Connection & Tool lifecycle events (M2.1, ADR-0034).** The MCP cache-eviction foundation:
   five canonical events on the existing internal bus (ADR-0023) — `connection.activated`
   (credential attach, `pending_auth → active`), `connection.deactivated` (left the active set

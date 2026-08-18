@@ -33,6 +33,8 @@ from app.domains.runtime.router import tool_calls_router
 from app.domains.tools.router import tools_router
 from app.domains.workspaces.router import api_tokens_router, invitations_router, members_router
 from app.domains.workspaces.router import router as workspaces_router
+from app.interfaces.mcp.router import mcp_router
+from app.interfaces.mcp.subscribers import register_mcp_subscribers
 
 configure_logging()
 log = get_logger(__name__)
@@ -58,6 +60,9 @@ app.include_router(credentials_router)
 app.include_router(tool_calls_router)
 app.include_router(tools_router)
 app.include_router(audit_router)
+# The MCP interface adapter (M2.2, ADR-0035) — outside `/v1` so user-chosen workspace slugs can
+# never collide with REST resource paths; the mcp.* edge maps its `/v1/*` onto `/mcp/v1/*`.
+app.include_router(mcp_router)
 
 # Fail closed in production if the credential master key is missing/default/invalid (SECURITY §2):
 # the API refuses to boot rather than run the vault on a bad key. Local/CI use disposable keys.
@@ -67,6 +72,8 @@ if settings.is_production:
 # Register domain event-bus subscribers at startup (BACKEND_SPEC §4): the connectors handler
 # enqueues the Celery ingestion task after a request commits (M1.4-B1.1).
 register_connector_subscribers()
+# MCP tools-cache eviction (M2.2): the six lifecycle events → evict `ws:{id}:mcp:tools`.
+register_mcp_subscribers()
 
 
 def _envelope(

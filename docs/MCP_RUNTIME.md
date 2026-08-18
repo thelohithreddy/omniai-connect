@@ -10,7 +10,10 @@
 
 The MCP server is one adapter in `apps/api/app/interfaces/mcp/`, alongside REST
 tool-invocation, OpenAPI manifests, and framework SDK exporters. It translates MCP
-protocol messages to `ToolCallRequest`/`ToolCallResult` and nothing more. Per Bible
+protocol messages to `ToolCallRequest`/`ToolCallResult` and nothing more. *(M2.2,
+ADR-0035: the adapter is currently a minimal in-house JSON-RPC/Streamable-HTTP layer
+rather than FastMCP — founder-ratified for the discovery surface; FastMCP is
+re-evaluated when tools/call lands, M2.3.)* Per Bible
 tenet 4: **if an MCP handler contains an `if`, ask whether it belongs in the
 runtime.** Policy, rate limits, quotas, credential handling, audit — all happen in
 the Execution Runtime; the adapter owns only protocol translation and transport.
@@ -98,6 +101,10 @@ The MCP specification still evolves quickly (auth in particular). Mitigations:
 - **Pin protocol versions** explicitly: the server advertises and accepts a tested
   allowlist of protocol revisions, upgraded deliberately — never implicitly by a
   FastMCP dependency bump (uv lockfile, ADR-0006, keeps this deterministic).
+  *Current pin (founder-ratified 2026-08-18, ADR-0035): allowlist
+  `{2025-06-18, 2025-11-25}`, advertising `2025-11-25`; `2026-07-28` (stateless core,
+  beta SDKs) is deliberately excluded until reconciled with this document's session
+  model — adopting it is a normal upgrade PR with contract tests.*
 - **The adapter isolates churn**: because MCP touches nothing but
   `interfaces/mcp/`, a breaking spec change is an adapter-sized diff. The runtime
   contract (`ToolCallRequest`/`ToolCallResult`) does not move when MCP does.
