@@ -20,12 +20,25 @@ from app.domains.connections.models import Connection
 from app.domains.connectors.models import Connector, ConnectorVersion, Tool
 from app.domains.credentials.models import Credential
 from app.domains.runtime.models import ToolCall
+from app.domains.workspaces.models import Workspace
 
 
 class RuntimeRepository:
     def __init__(self, session: AsyncSession, ctx: WorkspaceContext) -> None:
         self._session = session
         self._ctx = ctx
+
+    async def get_workspace_plan(self) -> str:
+        """The bound Workspace's plan (M2.4 limit selector). `workspaces.plan` is authoritative
+        (NOT NULL, CHECK-constrained); read per call so a plan change takes effect immediately.
+        Scoped to the context's own workspace — there is no expression here that can read
+        another tenant's plan."""
+        plan: str | None = await self._session.scalar(
+            select(Workspace.plan).where(Workspace.id == self._ctx.workspace_id)
+        )
+        # The workspace row always exists for an authenticated context; `free` is the safe
+        # (most-restrictive) fallback if it were ever absent mid-transaction.
+        return plan if plan is not None else "free"
 
     async def resolve_tool(self, tool_name: str) -> Tool | None:
         """The one live, enabled Tool with this canonical name in the current Workspace, or None.

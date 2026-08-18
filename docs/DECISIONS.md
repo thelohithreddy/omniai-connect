@@ -1862,3 +1862,58 @@ running stack (a real execution and a real `169.254.169.254` SSRF rejection — 
 killed, 1 inert: a name guard redundant with `ToolCallCreate` validation; 0 meaningful
 survivors). **Deferred:** MCP `listChanged`, resources/prompts/sampling, async/streaming results,
 per-token scope narrowing; FastMCP re-evaluation stands (ADR-0035).
+
+## ADR-0037 — Tool-Call rate limits & quotas: the Runtime's stage-3 policy checks (M2.4)
+
+**Status:** Accepted (2026-08-18) · **Context:** MCP tools/call opened the platform's first
+broadly-exposed untrusted execution surface (R-08 egress-cost risk). Canon already fixed the
+architecture — enforcement in the Runtime's policy stage (AI_RUNTIME §2.3; MCP_RUNTIME §1 keeps
+adapters policy-free), a Redis token bucket on `ws:{workspace_id}:rl:*` seeded from
+`rate_hints`, plan quota failing closed (SYSTEM_ARCH §7, SECURITY §6), dimensions per
+Workspace/Connection (ROADMAP M2). The founder ratified the five open policy values 2026-08-18
+(D1–D5). A small precursor (M2.4-pre) first closed the pre-existing DNS gap so every executed
+call has an audit row before quota counts on them.
+
+**Decision:**
+
+1. **One enforcement point** — `RuntimeService.execute`, top of the audited region (after
+   resolve/bind, before validation/decrypt/egress). REST and MCP share one budget structurally;
+   `interface` stays audit metadata, never a counter dimension. Denials are audited outcomes:
+   `status=denied` with `rate_limited` / `quota_exceeded` (D4 — now a distinct §6.1 code; the
+   dormant `QuotaExceededError` activated, `RateLimitedError` added), mapped by the existing
+   REST envelope (429 + `Retry-After` from non-secret details) and the existing M2.3 MCP
+   contract (`isError: true`) with zero adapter changes.
+
+2. **Atomic Lua token bucket on Redis TIME** — state `HASH{tokens,ts}` per key; refill math
+   runs server-side in one script (no app clocks, no read-modify-write, no locks); malformed
+   state resets to a full bucket; keys carry idle-expiry TTLs. D1 (Free): 60 Tool Calls/min
+   sustained (1 token/s), burst 10; per-Connection buckets only when canonical
+   `annotations.rate_hints.requests_per_minute` exists (advisory data — no hint, no fabricated
+   bucket; a hint narrows within the workspace limit). Paid plans (`workspaces.plan`
+   authoritative, read per call) are unenforced until M3 wires billing.
+
+3. **Quota = executed calls only (D2)** — `ws:{workspace_id}:quota:{iso-week}` (UTC), checked
+   at stage 3, consumed exactly once at audit-write for statuses `succeeded`/`failed`/
+   `timeout`; `denied` and pre-audit failures never consume; idempotency replays never reach
+   `execute()` so can never re-consume. Free quota 1,000/week (D1). Bounded in-flight overshoot
+   near the boundary is accepted (check-then-execute; M3 reconciles from the audit ledger,
+   which this design keeps 1:1 with consumption).
+
+4. **Redis unavailable → fail closed for both checks (D3)** — the denial is a retryable 429
+   with a generic message (`limits_unavailable` logged for alerting); the post-execution quota
+   *increment* alone is logged-and-swallowed (the call already ran; an under-count never
+   over-charges). Kill switch `rate_limiting_enabled` (default on) is an all-or-nothing
+   operational rollback restoring exact pre-M2.4 behavior — it cannot partially weaken quota.
+
+**Consequences:** No migration (state is canonically ephemeral in Redis; plan pre-exists), no
+new dependency, no adapter changes, ~1–2 Redis ops per Tool Call. New settings in
+`.env.example`. API_GUIDELINES §6.1 gains `quota_exceeded`; §7's **general per-token request
+limiter and every-response `X-RateLimit-*` stamping are deferred (D5)** and documented as an
+open contract. Proven by 6 period/plan/hint unit tests + 13 real-Redis+Postgres+RLS
+integration tests (boundary, cross-surface shared budget, tenant isolation, 8-way concurrency
+admits exactly the burst, refill, hints, quota semantics incl. failure/timeout consumption,
+fail-closed outage on both surfaces, kill switch, idempotency-replay non-consumption, TTLs) and
+a 16-mutation audit — 15 killed, 1 inert (bucket idle-TTL is memory hygiene, not admission), 0
+meaningful survivors. M2.4-pre proven by resolver-injection unit + live-resolver integration
+tests. **Deferred:** §7 general limiter; per-Connection in-flight concurrency + circuit
+breaker; `usage_events` + paid-plan enforcement (M3); anomaly alerting (M3).

@@ -32,6 +32,8 @@ from app.core.exceptions import (
     DomainError,
     EgressBlockedError,
     NotFoundError,
+    QuotaExceededError,
+    RateLimitedError,
     UpstreamAPIError,
     UpstreamTimeoutError,
     ValidationFailedError,
@@ -42,6 +44,7 @@ from app.domains.runtime.build import build_request
 from app.domains.runtime.egress import execute_outbound
 from app.domains.runtime.events import tool_call_completed
 from app.domains.runtime.injection import build_auth_injection
+from app.domains.runtime.limits import enforce_tool_call_limits, record_executed_call
 from app.domains.runtime.normalization import normalize_response
 from app.domains.runtime.redaction import redact_arguments
 from app.domains.runtime.repository import RuntimeRepository
@@ -65,8 +68,10 @@ def _status_for(exc: DomainError) -> str:
     """Terminal Tool Call status for an audited failure (DATABASE_DESIGN:190, AI_RUNTIME §6)."""
     if isinstance(exc, UpstreamTimeoutError):
         return "timeout"
-    if isinstance(exc, (EgressBlockedError, ConflictError)):
-        return "denied"  # policy/state denial: blocked egress, inactive connection, no credential
+    if isinstance(exc, (EgressBlockedError, ConflictError, RateLimitedError, QuotaExceededError)):
+        # Policy/state denial: blocked egress, inactive connection, no credential, and the M2.4
+        # stage-3 limit denials — all audited as `denied` and, per D2, never quota-consuming.
+        return "denied"
     return "failed"  # bad arguments, connector config, upstream error, decrypt failure
 
 
@@ -79,6 +84,9 @@ class RuntimeService:
         # canonical UJ-5.3 `interface` filter distinguishes surfaces). Server-set by the calling
         # adapter (M2.3: "mcp"), never a client value; defaults keep every M1 call "rest".
         self._interface = interface
+        # The Workspace plan, resolved once per execute() (M2.4 limit selector). `free` is the
+        # most-restrictive default until the per-call read replaces it.
+        self._plan = "free"
 
     async def execute(self, payload: ToolCallCreate) -> ExecutionOutcome:
         """Run one Tool Call end to end. Pre-audit failures raise; audited outcomes return."""
@@ -92,7 +100,19 @@ class RuntimeService:
 
         # --- Audited region: one row + one event for every outcome ---
         input_summary = redact_arguments(payload.arguments)
+        # The workspace plan selects the enforced limits (M2.4); read per call, RLS-scoped.
+        self._plan = await self._repo.get_workspace_plan()
         try:
+            # Stage 3 (AI_RUNTIME §2): rate limits + quota, the canonical policy point — after
+            # resolve/bind (so the denial is audited with real tool/connection ids), before
+            # validation, decrypt, and egress. Raises RateLimitedError / QuotaExceededError,
+            # which the shared handler below records as `denied` — one audit path, no new one.
+            await enforce_tool_call_limits(
+                workspace_id=self._ctx.workspace_id,
+                plan=self._plan,
+                connection_id=connection.id,
+                tool_annotations=tool.annotations,
+            )
             content, output_summary, status_code = await self._run_authenticated_call(
                 tool, connection, payload
             )
@@ -297,6 +317,12 @@ class RuntimeService:
                 error_code=error_code,
                 duration_ms=duration_ms,
             )
+        )
+        # M2.4 D2: quota consumption happens HERE — exactly once per audited call, and only for
+        # executed statuses (succeeded/failed/timeout). Denied calls consume nothing; an
+        # idempotency replay never reaches execute(), so it can never re-consume.
+        await record_executed_call(
+            workspace_id=self._ctx.workspace_id, plan=self._plan, status=status
         )
         return row.id
 

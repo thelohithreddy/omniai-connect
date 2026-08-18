@@ -136,7 +136,8 @@ ever leaves the API:
 | `forbidden` | 403 | Authenticated, but role lacks the capability (SECURITY.md §4.1). |
 | `ssrf_blocked` | 403 | The Execution Runtime refused an outbound Tool Call request on egress policy — a target resolving to a private/link-local address, an off-allowlist redirect, or a rebinding answer (AI_RUNTIME.md §7, SECURITY.md §6). A policy denial; the message never carries the target URL or resolved address. |
 | `not_found` | 404 | Resource absent — or outside the caller's Workspace. |
-| `rate_limited` | 429 | Rate limit or quota exceeded. `Retry-After` header set. |
+| `rate_limited` | 429 | Short-window rate limit exceeded (token bucket), or limits temporarily unverifiable (fail-closed). `Retry-After` header set. |
+| `quota_exceeded` | 429 | The workspace's plan quota of executed Tool Calls is exhausted (M2.4, ADR-0037). `Retry-After` set to the period-reset horizon; `details.quota_resets_at` carries the reset instant. |
 | `connector_error` | 502 | The upstream API returned an error the runtime couldn't normalize into a Tool result. |
 | `upstream_timeout` | 504 | The upstream exceeded the runtime timeout (default 30 s, Architecture §7). |
 | `internal` | 500 | Our bug. Reported to Sentry with `request_id`; message is generic, never a stack trace. |
@@ -157,6 +158,12 @@ Every authenticated response includes:
 429 responses additionally set `Retry-After` (seconds). Limits are enforced per
 Workspace and per API token in Redis (Architecture §3.2); Tool Call quotas are a
 separate, billing-relevant layer that fails closed (Architecture §7).
+
+> **Implementation status (M2.4, ADR-0037, founder-ratified D5):** Tool-Call rate limits and
+> quotas are enforced in the Runtime, and Tool-Call 429 responses set `Retry-After`. The
+> *general* per-token authenticated-request limiter — and therefore the `X-RateLimit-*`
+> headers on every response — is **deliberately deferred** to its own slice; this section
+> remains the contract it must satisfy.
 
 ## 8. Versioning and deprecation
 

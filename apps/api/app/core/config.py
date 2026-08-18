@@ -73,6 +73,17 @@ class Settings(BaseSettings):
     # trades DB load for a tighter lost-event recovery bound only.
     mcp_tools_cache_ttl_seconds: int = 300
 
+    # --- Tool-Call rate limits & quotas (M2.4, ADR-0037; founder-ratified D1) ---
+    # Kill switch: an operational rollback lever. False restores exact pre-M2.4 behavior
+    # (no checks, no quota counting); True is full canonical enforcement incl. fail-closed
+    # on Redis unavailability. All-or-nothing by design — it cannot partially weaken quota.
+    rate_limiting_enabled: bool = True
+    # Free-plan workspace token bucket: sustained rate and burst capacity.
+    free_workspace_rate_per_minute: int = 60
+    free_workspace_burst: int = 10
+    # Free-plan weekly quota of *executed* Tool Calls (ISO week, UTC reset).
+    free_weekly_quota: int = 1000
+
     # --- Auth (Better Auth — provider in apps/web per ADR-0002/0014; verified here per
     # ADR-0015) ---
     better_auth_secret: SecretStr = SecretStr("change-me-32-chars-minimum")
