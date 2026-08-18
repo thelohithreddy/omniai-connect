@@ -14,6 +14,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from app.core.events import event_bus
 from app.core.exceptions import NotFoundError, ValidationFailedError
 from app.core.pagination import (
     DEFAULT_LIMIT,
@@ -22,6 +23,7 @@ from app.core.pagination import (
     encode_cursor,
     resolve_limit,
 )
+from app.domains.connections.events import connection_revoked
 from app.domains.connections.models import Connection
 from app.domains.connections.repository import ConnectionRepository
 from app.domains.connectors.service import validate_base_url
@@ -117,9 +119,22 @@ class ConnectionService:
 
     async def revoke(self, connection_id: uuid.UUID) -> None:
         """Revoke a live Connection (soft delete → `revoked`). A foreign or already-revoked id is a
-        uniform 404 — the second revoke matches nothing (idempotent at the repository)."""
-        if not await self._repository.revoke(connection_id):
+        uniform 404 — the second revoke matches nothing (idempotent at the repository).
+
+        Buffers `connection.revoked` (M2.1, ADR-0034) exactly when the row actually moved, stamped
+        from the RETURNING identifiers — dispatched only after this transaction commits, so a
+        rolled-back revoke emits nothing and the second revoke (no-op) emits nothing.
+        """
+        revoked = await self._repository.revoke(connection_id)
+        if revoked is None:
             raise NotFoundError("Connection not found.")
+        event_bus.publish(
+            connection_revoked(
+                revoked.workspace_id,
+                connection_id=revoked.id,
+                connector_id=revoked.connector_id,
+            )
+        )
 
 
 __all__ = ["ConnectionPage", "ConnectionService"]

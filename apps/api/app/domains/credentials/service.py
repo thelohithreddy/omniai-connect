@@ -16,7 +16,9 @@ import json
 import uuid
 from datetime import UTC, datetime
 
+from app.core.events import event_bus
 from app.core.exceptions import NotFoundError
+from app.domains.connections.events import connection_activated, connection_deactivated
 from app.domains.credentials import vault
 from app.domains.credentials.models import Credential
 from app.domains.credentials.repository import CredentialRepository
@@ -68,8 +70,22 @@ class CredentialService:
         )
         await self._seal_into(credential, payload)
         await self._repository.insert(credential)  # 409 if the connection already has one
+        previous_status = connection.status
         connection.credential_id = credential.id
         connection.status = "active"  # credential attached → out of pending_auth (§3)
+        # M2.1 (ADR-0034): the Connection entered the active set — buffer `connection.activated`,
+        # dispatched only after this transaction commits (a rolled-back attach emits nothing).
+        # Guarded on the *prior* persisted status so a hypothetical already-active row could never
+        # produce a spurious event; the tenant is the row's own workspace_id, and the UoW refuses
+        # a mismatch with the transaction's bound tenant (ADR-0022).
+        if previous_status != "active":
+            event_bus.publish(
+                connection_activated(
+                    connection.workspace_id,
+                    connection_id=connection.id,
+                    connector_id=connection.connector_id,
+                )
+            )
         return credential
 
     async def rotate(self, connection_id: uuid.UUID, payload: CredentialWrite) -> Credential:
@@ -104,10 +120,24 @@ class CredentialService:
         # Clear the connection's pointer and flush it BEFORE deleting the credential — the composite
         # FK has no SET NULL (which would null the NOT NULL workspace_id), so the reference must be
         # gone before the row is removed.
+        previous_status = connection.status
         connection.credential_id = None
         connection.status = "pending_auth"
         await self._repository.flush()
         await self._repository.delete(credential)
+        # M2.1 (ADR-0034, founder-ratified 5th eviction event): the Connection left the active set
+        # without being revoked. Guarded on the *prior* persisted status — only a row that was
+        # actually `active` deactivates (an `error` row, once M2 OAuth exists, was already out of
+        # the active set). Buffered, so a rolled-back revoke emits nothing.
+        if previous_status == "active":
+            event_bus.publish(
+                connection_deactivated(
+                    connection.workspace_id,
+                    connection_id=connection.id,
+                    connector_id=connection.connector_id,
+                    status="pending_auth",
+                )
+            )
 
 
 __all__ = ["CredentialService"]

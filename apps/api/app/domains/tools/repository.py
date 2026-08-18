@@ -65,13 +65,18 @@ class ToolRepository:
         tool: Tool | None = await self._session.scalar(stmt)
         return tool
 
-    async def set_enabled(self, tool_id: uuid.UUID, *, enabled: bool) -> Tool | None:
+    async def set_enabled(self, tool_id: uuid.UUID, *, enabled: bool) -> tuple[Tool | None, bool]:
         """Flip a LIVE Tool's `enabled` flag with a single atomic, workspace-scoped UPDATE; return
-        the updated row, or None if no live Tool matched (missing, foreign, or deprecated).
+        `(tool, changed)` — the current row (or None if no live Tool matched: missing, foreign, or
+        deprecated) and whether this statement actually transitioned the persisted state.
 
-        Idempotent — enabling an enabled Tool sets it to enabled again — and race-safe: the state is
-        never read-then-written, so concurrent toggles cannot corrupt each other. `updated_at`
-        is set explicitly because the ORM `onupdate` does not fire on a Core statement.
+        Idempotent at the API — enabling an enabled Tool is a 200 no-op — and race-safe: the
+        UPDATE is value-guarded (`enabled != :desired`, M2.1), so it matches only when a real flip
+        occurs. Two concurrent identical PATCHes serialize on the row lock and exactly one sees
+        `changed=True` (READ COMMITTED re-evaluates the predicate after the lock), which is what
+        makes `tool.enabled`/`tool.disabled` emit exactly once per persisted transition — a no-op
+        touches nothing (not even `updated_at`) and emits nothing. `updated_at` is set explicitly
+        because the ORM `onupdate` does not fire on a Core statement.
         """
         stmt = (
             update(Tool)
@@ -79,14 +84,16 @@ class ToolRepository:
                 Tool.id == tool_id,
                 Tool.workspace_id == self._ctx.workspace_id,
                 Tool.deleted_at.is_(None),
+                Tool.enabled != enabled,
             )
             .values(enabled=enabled, updated_at=func.now())
             .returning(Tool.id)
         )
         updated_id: uuid.UUID | None = await self._session.scalar(stmt)
-        if updated_id is None:
-            return None
-        return await self.get(tool_id)
+        # `get` distinguishes the two zero-row cases: no live Tool (→ 404 upstream) versus a
+        # no-op on an existing row (→ idempotent 200, no event). Same-transaction read, so a
+        # changed row reflects this statement's own write.
+        return await self.get(tool_id), updated_id is not None
 
 
 __all__ = ["ToolRepository"]

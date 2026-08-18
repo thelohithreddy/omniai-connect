@@ -1704,3 +1704,50 @@ RLS-redundant predicate), cross-tenant isolation, read-only-405, metadata-only (
 id`) assertions, and full regression at warning + debug. **Deferred M1 work:** the member "own logs"
 (`tools:execute`) caller-scoped view; CSV export + the log-explorer UI (frontend, FRONTEND_SPEC). This
 is the **final M1 product surface** — M1 is now feature-complete pending the final forensic audit.
+
+## ADR-0034 — Connection & Tool lifecycle events: the MCP cache-eviction foundation (M2.1)
+
+**Status:** Accepted (2026-08-18) · **Context:** M2's first slice. MCP `tools/list` (M2.2) will
+cache per-workspace listings (`ws:{workspace_id}:mcp:tools`, MCP_RUNTIME §3) and must evict on
+every transition that changes the active Tool set — a stale listing after a revocation is a
+discovery/authorization divergence, not a performance bug. The bus (ADR-0023), its post-commit
+UoW buffering, and the fail-closed tenant-match (ADR-0022) already exist; `connector.ingested`
+already covers ingestion *and* promotion (`promotion.promote` buffers it). Missing were the
+Connection and Tool lifecycle emissions. This records the decisions that discovery left open.
+
+**Decision:**
+
+1. **Five canonical lifecycle events, tied to persisted transitions — never to method names.**
+   Declared in the owning domain's `events.py`, published via `event_bus.publish` (post-commit
+   dispatch; a rolled-back request emits nothing): `connection.activated` (`pending_auth →
+   active`; emitted where the transition lives — the credentials domain's attach, guarded on the
+   prior persisted status); **`connection.deactivated`** (the Connection *left the active set
+   without being revoked*: `active → pending_auth` on credential revoke today, `active → error`
+   when the OAuth refresh worker lands — **founder-ratified 2026-08-18 as the 5th eviction
+   event**, closing the stale-listing gap canon's eviction list missed; payload carries the new
+   status word); `connection.revoked` (`* → revoked`, stamped from the revoking UPDATE's
+   RETURNING identifiers — the event describes what the database did, never what the caller
+   asked); `tool.enabled` / `tool.disabled` (persisted flips of `tools.enabled`).
+
+2. **No-op mutations emit nothing (INVARIANT: no persisted transition → no event).** The Tools
+   repository UPDATE is now value-guarded (`enabled != :desired`): a no-op PATCH stays an
+   idempotent 200 but touches nothing — not even `updated_at` — and emits nothing; two concurrent
+   identical PATCHes serialize on the row lock and exactly one emits. The idempotent second
+   connection-revoke (no row moved) and a 409 attach likewise emit nothing.
+
+3. **Payloads are non-secret identifiers only; the envelope is the tenant authority.** Payload =
+   `connection_id`/`tool_id` + `connector_id` (+ the `status` word on deactivation). The
+   workspace rides only in the trusted envelope `workspace_id`, cross-checked fail-closed against
+   the transaction's bound tenant at buffer time (ADR-0022) — an event can never evict another
+   workspace's cache namespace. Delivery is at-most-once in-process today, at-least-once under
+   the future broker (ADR-0023): the eviction consumer must be idempotent (cache eviction is).
+
+**Consequences:** No migration, no new dependency, no new bus, no new endpoint; MCP stays fully
+decoupled (no `interfaces/` module exists — the bus is the boundary). `ConnectionRepository.
+revoke` returns the moved row's identifiers instead of a bool; `ToolRepository.set_enabled`
+returns `(tool, changed)`. Proven by 8 unit + 12 real-Postgres+RLS+real-JWT integration tests
+(incl. service-level rollback-emits-nothing and cross-tenant no-event), a 13-mutation audit — 9
+killed, 4 inert (2 defensively-unreachable prior-status guards awaiting the M2 `error` status; 2
+RLS-redundant workspace predicates, same class as prior audits), 0 meaningful survivors — and
+full regression (1332). **Deferred:** the eviction *consumer* (M2.2 MCP `tools/list`); the
+`active → error` emission site (M2 OAuth refresh worker); broker durability (ADR-0023's swap).

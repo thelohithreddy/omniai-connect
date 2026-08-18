@@ -13,6 +13,20 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Connection & Tool lifecycle events (M2.1, ADR-0034).** The MCP cache-eviction foundation:
+  five canonical events on the existing internal bus (ADR-0023) — `connection.activated`
+  (credential attach, `pending_auth → active`), `connection.deactivated` (left the active set
+  without revocation: credential revoke today, OAuth-refresh `error` later; founder-ratified 5th
+  eviction event), `connection.revoked` (stamped from the revoking UPDATE's RETURNING),
+  `tool.enabled` / `tool.disabled` (persisted flips only). All buffered on the UnitOfWork and
+  dispatched **post-commit** (a rolled-back request emits nothing); payloads carry non-secret
+  identifiers only; the envelope's `workspace_id` is tenant-match-enforced at buffer time
+  (ADR-0022). **No migration, no new dependency, no new endpoint, no MCP code** — the eviction
+  consumer arrives with M2.2 `tools/list`. Behavior refinement: a no-op `PATCH /v1/tools/{id}`
+  (same `enabled` value) remains an idempotent 200 but no longer rewrites the row — `updated_at`
+  is untouched and no event is emitted. MCP_RUNTIME §3's eviction list now names all six events
+  (incl. `connector.ingested`).
+
 - **Audit Log Viewer (M1-Audit-v1, ADR-0033).** The final M1 product surface: a read-only,
   tenant-isolated view of the Tool Call audit ledger. New `GET /v1/tool-calls` (list) — the runtime
   already owns `POST` (invoke) and `GET /{id}` (fetch a result), so only the list is new. New

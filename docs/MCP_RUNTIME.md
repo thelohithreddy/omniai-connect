@@ -46,8 +46,11 @@ destructiveHint, idempotentHint).
 
 Listings are **cached** (Redis, `ws:{workspace_id}:mcp:tools`) and
 **event-invalidated**: `connector.ingested`, `connection.activated`,
-`connection.revoked`, and tool enable/disable events on the internal bus evict the
-cache (BACKEND_SPEC.md §4). The adapter then emits MCP `listChanged` notifications on
+`connection.deactivated` (a Connection left the active set without being revoked —
+credential revoke today, OAuth-refresh failure `error` later; founder-ratified
+2026-08-18, ADR-0034), `connection.revoked`, `tool.enabled`, and `tool.disabled` on the
+internal bus evict the cache (BACKEND_SPEC.md §4; emission contracts in ADR-0034 —
+implemented M2.1). The adapter then emits MCP `listChanged` notifications on
 transports that support them, so long-lived clients refresh without reconnecting.
 
 ## 4. Call translation
