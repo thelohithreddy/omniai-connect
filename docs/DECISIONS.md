@@ -1704,3 +1704,161 @@ RLS-redundant predicate), cross-tenant isolation, read-only-405, metadata-only (
 id`) assertions, and full regression at warning + debug. **Deferred M1 work:** the member "own logs"
 (`tools:execute`) caller-scoped view; CSV export + the log-explorer UI (frontend, FRONTEND_SPEC). This
 is the **final M1 product surface** — M1 is now feature-complete pending the final forensic audit.
+
+## ADR-0034 — Connection & Tool lifecycle events: the MCP cache-eviction foundation (M2.1)
+
+**Status:** Accepted (2026-08-18) · **Context:** M2's first slice. MCP `tools/list` (M2.2) will
+cache per-workspace listings (`ws:{workspace_id}:mcp:tools`, MCP_RUNTIME §3) and must evict on
+every transition that changes the active Tool set — a stale listing after a revocation is a
+discovery/authorization divergence, not a performance bug. The bus (ADR-0023), its post-commit
+UoW buffering, and the fail-closed tenant-match (ADR-0022) already exist; `connector.ingested`
+already covers ingestion *and* promotion (`promotion.promote` buffers it). Missing were the
+Connection and Tool lifecycle emissions. This records the decisions that discovery left open.
+
+**Decision:**
+
+1. **Five canonical lifecycle events, tied to persisted transitions — never to method names.**
+   Declared in the owning domain's `events.py`, published via `event_bus.publish` (post-commit
+   dispatch; a rolled-back request emits nothing): `connection.activated` (`pending_auth →
+   active`; emitted where the transition lives — the credentials domain's attach, guarded on the
+   prior persisted status); **`connection.deactivated`** (the Connection *left the active set
+   without being revoked*: `active → pending_auth` on credential revoke today, `active → error`
+   when the OAuth refresh worker lands — **founder-ratified 2026-08-18 as the 5th eviction
+   event**, closing the stale-listing gap canon's eviction list missed; payload carries the new
+   status word); `connection.revoked` (`* → revoked`, stamped from the revoking UPDATE's
+   RETURNING identifiers — the event describes what the database did, never what the caller
+   asked); `tool.enabled` / `tool.disabled` (persisted flips of `tools.enabled`).
+
+2. **No-op mutations emit nothing (INVARIANT: no persisted transition → no event).** The Tools
+   repository UPDATE is now value-guarded (`enabled != :desired`): a no-op PATCH stays an
+   idempotent 200 but touches nothing — not even `updated_at` — and emits nothing; two concurrent
+   identical PATCHes serialize on the row lock and exactly one emits. The idempotent second
+   connection-revoke (no row moved) and a 409 attach likewise emit nothing.
+
+3. **Payloads are non-secret identifiers only; the envelope is the tenant authority.** Payload =
+   `connection_id`/`tool_id` + `connector_id` (+ the `status` word on deactivation). The
+   workspace rides only in the trusted envelope `workspace_id`, cross-checked fail-closed against
+   the transaction's bound tenant at buffer time (ADR-0022) — an event can never evict another
+   workspace's cache namespace. Delivery is at-most-once in-process today, at-least-once under
+   the future broker (ADR-0023): the eviction consumer must be idempotent (cache eviction is).
+
+**Consequences:** No migration, no new dependency, no new bus, no new endpoint; MCP stays fully
+decoupled (no `interfaces/` module exists — the bus is the boundary). `ConnectionRepository.
+revoke` returns the moved row's identifiers instead of a bool; `ToolRepository.set_enabled`
+returns `(tool, changed)`. Proven by 8 unit + 12 real-Postgres+RLS+real-JWT integration tests
+(incl. service-level rollback-emits-nothing and cross-tenant no-event), a 13-mutation audit — 9
+killed, 4 inert (2 defensively-unreachable prior-status guards awaiting the M2 `error` status; 2
+RLS-redundant workspace predicates, same class as prior audits), 0 meaningful survivors — and
+full regression (1332). **Deferred:** the eviction *consumer* (M2.2 MCP `tools/list`); the
+`active → error` emission site (M2 OAuth refresh worker); broker durability (ADR-0023's swap).
+
+## ADR-0035 — MCP tools/list: pinned protocol, minimal adapter, cached discovery (M2.2)
+
+**Status:** Accepted (2026-08-18) · **Context:** the first MCP surface. Canon fixes the shape —
+thin adapter (MCP_RUNTIME §1), api-token auth with token/slug binding (§2), the cached,
+event-invalidated listing over active Connections' enabled Tools (§3), Streamable HTTP (§5),
+explicit version pinning (§7) — but left three values open. All three were founder-ratified
+2026-08-18. M2.1 (ADR-0034) supplied the six eviction events and flagged the at-most-once
+lost-eviction gap this module's TTL closes.
+
+**Decision:**
+
+1. **Protocol pin (founder-ratified):** allowlist `{2025-06-18, 2025-11-25}`, advertising
+   `2025-11-25` (`interfaces/mcp/protocol.py::SUPPORTED_PROTOCOL_VERSIONS`). `initialize`
+   echoes a supported requested revision, otherwise answers with the advertised one; every
+   post-initialize request must present `MCP-Protocol-Version` from the allowlist (the spec's
+   2025-03-26 fallback is below our floor → 400, never a downgrade). `2026-07-28` (stateless
+   core, MRTR, beta SDKs) is excluded until reconciled with MCP_RUNTIME's session model;
+   adopting it is a deliberate upgrade PR with contract tests, never a dependency bump.
+
+2. **Minimal in-house adapter, no FastMCP (founder-ratified deviation from MCP_RUNTIME §1).**
+   `interfaces/mcp/` implements JSON-RPC over sessionless Streamable HTTP directly (JSON
+   responses; GET/DELETE 405; single messages only — batching left the spec in 2025-06-18):
+   `initialize`, `notifications/*` (202), `ping`, `tools/list`; everything else, including
+   `tools/call`, is the protocol's method-not-found until M2.3. Rationale: zero new
+   dependencies for a discovery-only surface, exact allowlist control, native reuse of the
+   existing auth stack. FastMCP is re-evaluated at M2.3 (streaming/elicitation). Mounted at
+   `/mcp/v1/{workspace_slug}` — outside REST `/v1` so user-chosen slugs can never collide with
+   resource paths; the `mcp.omniaiconnect.com` edge maps its `/v1/*` here. `listChanged` is
+   declared false (no server→client stream yet; deferred with tools/call).
+
+3. **Auth = machine tokens only, slug-bound.** The `omc_` workspace token authenticates and
+   selects the workspace (existing `get_workspace_context`); a human JWT gets the uniform 401
+   (MCP is machine identity, ADR-0002); the path slug must name the token's own workspace —
+   mismatch is the same uniform 401 before any listing (MCP_RUNTIME §2). Browser-origin
+   requests are refused outright (Streamable HTTP DNS-rebinding guard; no CORS surface).
+
+4. **Discovery = the Runtime-callable set, from the canonical schema.** One workspace-scoped
+   RLS-backed query (`ToolRepository.list_discoverable`): live + enabled Tools whose Connector
+   has ≥1 live `active` Connection — exactly what the Runtime will execute, so discovery and
+   execution authority cannot diverge. Ordered `(created_at, id) DESC` (the canonical Tool
+   listing order). The wire projection is a strict allowlist: `name`, `description`,
+   `inputSchema`, and `annotations.{readonly,destructive,idempotent}` →
+   `readOnlyHint/destructiveHint/idempotentHint`; ids, tenant, tags, rate_hints, endpoints,
+   and all credential material are structurally absent.
+
+5. **Cache = optimization only; TTL backstop = 300 s (founder-ratified).** Cache-aside on
+   `ws:{workspace_id}:mcp:tools` (key from the server-derived context, value in a versioned
+   envelope so shape drift reads as a miss). Evicted by the six ADR-0034 events, with the
+   workspace taken only from the trusted envelope. Because the bus is at-most-once, the TTL
+   (`settings.mcp_tools_cache_ttl_seconds`, default 300) is the guaranteed staleness bound for
+   a lost eviction — stale discovery is bounded; stale execution is impossible (the Runtime
+   re-authorizes every call). Redis failure degrades to the authoritative database — never an
+   empty list, never an authorization input.
+
+**Consequences:** No migration (`alembic check` clean), no new dependency, no Runtime/domain
+behavior change; domains still never import interfaces. Proven by 8 protocol-unit + 18
+real-Postgres+RLS+Redis+real-auth integration tests and a 17-mutation audit (15 killed, 2
+inert RLS-redundant tenant predicates, 0 meaningful survivors). **Deferred:** `tools/call` +
+result translation (M2.3); `listChanged` emission; FastMCP re-evaluation; per-token scope
+narrowing of listings (blocked on the scope vocabulary); `2026-07-28` adoption.
+
+## ADR-0036 — MCP tools/call: the execution bridge over the canonical Runtime (M2.3)
+
+**Status:** Accepted (2026-08-18) · **Context:** the second and highest-risk MCP surface — remote
+AI clients invoking real Tools is a confused-deputy boundary. Canon fixes the shape: MCP is a
+thin adapter over the Execution Runtime (MCP_RUNTIME §1/§4), and the Runtime is already the sole
+authority for authorization, Connection resolution, argument validation, credential
+decrypt-at-use, SSRF/egress, timeout, and audit (ADR-0031). M2.3 adds only translation; it
+introduces no execution, credential, SSRF, or audit mechanism, no new dependency, no migration.
+
+**Decision:**
+
+1. **One execution path.** `interfaces/mcp/execution.py` maps `tools/call` params →
+   `ToolCallCreate` → the existing `RuntimeService.execute` → `ExecutionOutcome` → MCP tool
+   result. The adapter performs no HTTP, imports no vault/crypto/net internals (proven by a
+   structural grep in the mutation audit), validates nothing beyond protocol shape, and adds no
+   second audit row. The workspace is the authenticated `ctx` alone — `tools/call` params carry
+   only `name` + `arguments`; a `workspace_id`/`connection_id` placed inside `arguments` is inert
+   tool data (tested), never tenant authority.
+
+2. **The Runtime re-authorizes at execution time; the discovery cache is never execution
+   authority.** A Tool listed by a stale `tools/list` cache but since disabled/deprecated or
+   whose Connection went inactive/revoked is refused by the Runtime's resolve stage — the
+   mandatory stale-cache test drives exactly this (list → disable without evicting → call →
+   refused, no egress). Cross-tenant execution is impossible even when A knows B's exact Tool
+   name: the Runtime resolves within A's RLS-bound tenant and finds nothing (uniform "Unknown
+   tool.", no egress, no row in B).
+
+3. **Error split (MCP_RUNTIME §4).** Failures the Runtime *raises* (pre-audit: unresolvable Tool
+   → uniform phrase, never an oracle; ambiguous Connection) become JSON-RPC errors. Failures the
+   Runtime *returns* (audited outcomes: bad arguments, upstream 4xx/5xx, timeout, egress denial,
+   credential failure) become MCP tool results with `isError: true` carrying `<stable code>:
+   <safe message>`. `ssrf_blocked` stays a distinct security refusal, never re-cast as an upstream
+   error; no message carries a target URL, address, header, or `details`. `_meta` carries the
+   audit correlation (`toolCallId`, `requestId`).
+
+4. **No retries, one timeout, single audit.** Exactly one execution attempt per request (a Tool
+   Call may be destructive — no automatic replay, no idempotency inference from annotations); the
+   Runtime's existing timeout governs; the Runtime writes the one audit row, now tagged
+   `caller.interface="mcp"` via a new server-set `RuntimeService(interface=...)` parameter
+   (default `"rest"` — every M1 call unchanged).
+
+**Consequences:** No migration (`alembic check` clean), no new dependency, no Runtime behavior
+change (only an additive, server-set `interface` label). Verified by 4 mapping-unit + 13
+real-Postgres+RLS+real-auth+real-Runtime integration tests, two live end-to-end runs against the
+running stack (a real execution and a real `169.254.169.254` SSRF rejection — `ssrf_blocked`,
+`denied`, no IP leaked, canary absent from response and audit), and a 11-mutation audit (10
+killed, 1 inert: a name guard redundant with `ToolCallCreate` validation; 0 meaningful
+survivors). **Deferred:** MCP `listChanged`, resources/prompts/sampling, async/streaming results,
+per-token scope narrowing; FastMCP re-evaluation stands (ADR-0035).

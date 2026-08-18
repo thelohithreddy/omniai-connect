@@ -12,6 +12,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 
+from app.core.events import event_bus
 from app.core.exceptions import NotFoundError
 from app.core.pagination import (
     DEFAULT_LIMIT,
@@ -21,6 +22,7 @@ from app.core.pagination import (
     resolve_limit,
 )
 from app.domains.connectors.models import Tool
+from app.domains.tools.events import tool_disabled, tool_enabled
 from app.domains.tools.repository import ToolRepository
 
 
@@ -70,10 +72,20 @@ class ToolService:
         """Enable or disable a live Tool (idempotent, race-safe). A foreign / deprecated / missing
         Tool is a uniform 404 — the same response whether it never existed or belongs to another
         tenant — so the endpoint is not an oracle and a deprecated Tool cannot be revived.
+
+        Buffers `tool.enabled`/`tool.disabled` (M2.1, ADR-0034) exactly when the repository's
+        value-guarded UPDATE actually flipped the persisted flag — a no-op PATCH emits nothing —
+        dispatched only after this transaction commits. The tenant is the row's own workspace_id;
+        the UoW refuses a mismatch with the transaction's bound tenant (ADR-0022).
         """
-        tool = await self._repository.set_enabled(tool_id, enabled=enabled)
+        tool, changed = await self._repository.set_enabled(tool_id, enabled=enabled)
         if tool is None:
             raise NotFoundError("Tool not found.")
+        if changed:
+            factory = tool_enabled if enabled else tool_disabled
+            event_bus.publish(
+                factory(tool.workspace_id, tool_id=tool.id, connector_id=tool.connector_id)
+            )
         return tool
 
 

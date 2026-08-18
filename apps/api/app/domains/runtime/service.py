@@ -71,10 +71,14 @@ def _status_for(exc: DomainError) -> str:
 
 
 class RuntimeService:
-    def __init__(self, uow: UnitOfWork, ctx: WorkspaceContext) -> None:
+    def __init__(self, uow: UnitOfWork, ctx: WorkspaceContext, *, interface: str = "rest") -> None:
         self._uow = uow
         self._ctx = ctx
         self._repo = RuntimeRepository(uow.session, ctx)
+        # Which Interface adapter invoked the runtime — recorded in the audit `caller` (the
+        # canonical UJ-5.3 `interface` filter distinguishes surfaces). Server-set by the calling
+        # adapter (M2.3: "mcp"), never a client value; defaults keep every M1 call "rest".
+        self._interface = interface
 
     async def execute(self, payload: ToolCallCreate) -> ExecutionOutcome:
         """Run one Tool Call end to end. Pre-audit failures raise; audited outcomes return."""
@@ -267,7 +271,7 @@ class RuntimeService:
     ) -> uuid.UUID:
         """Insert the audit row and buffer `tool_call.completed` (dispatched post-commit)."""
         caller = {
-            "interface": "rest",
+            "interface": self._interface,
             "kind": self._ctx.caller.kind,
             "api_token_id": _opt_str(self._ctx.caller.api_token_id),
             "member_id": _opt_str(self._ctx.caller.member_id),

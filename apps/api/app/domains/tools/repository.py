@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.pagination import CursorPosition
 from app.core.security import WorkspaceContext
+from app.domains.connections.models import Connection
 from app.domains.connectors.models import Tool
 
 
@@ -65,13 +66,51 @@ class ToolRepository:
         tool: Tool | None = await self._session.scalar(stmt)
         return tool
 
-    async def set_enabled(self, tool_id: uuid.UUID, *, enabled: bool) -> Tool | None:
-        """Flip a LIVE Tool's `enabled` flag with a single atomic, workspace-scoped UPDATE; return
-        the updated row, or None if no live Tool matched (missing, foreign, or deprecated).
+    async def list_discoverable(self) -> list[Tool]:
+        """Every Tool of this Workspace that an AI surface may currently discover (M2.2): live and
+        enabled, with its Connector bound by at least one live `active` Connection — exactly the
+        set the Runtime will execute (its resolve stage requires live+enabled and binds an active
+        Connection), so discovery and execution authority can never diverge on state.
 
-        Idempotent — enabling an enabled Tool sets it to enabled again — and race-safe: the state is
-        never read-then-written, so concurrent toggles cannot corrupt each other. `updated_at`
-        is set explicitly because the ORM `onupdate` does not fire on a Core statement.
+        Workspace-scoped in both the outer query and the EXISTS subquery (defense in depth over
+        RLS, P-14) — the tenant boundary is enforced server-side in SQL, never by filtering in
+        Python. Ordered `(created_at, id) DESC`, the canonical Tool listing order (deterministic:
+        UUIDv7 tie-break), matching `GET /v1/tools`.
+        """
+        bound_by_active_connection = (
+            select(Connection.id)
+            .where(
+                Connection.workspace_id == self._ctx.workspace_id,
+                Connection.connector_id == Tool.connector_id,
+                Connection.status == "active",
+                Connection.deleted_at.is_(None),
+            )
+            .exists()
+        )
+        stmt = (
+            select(Tool)
+            .where(
+                Tool.workspace_id == self._ctx.workspace_id,
+                Tool.deleted_at.is_(None),
+                Tool.enabled.is_(True),
+                bound_by_active_connection,
+            )
+            .order_by(Tool.created_at.desc(), Tool.id.desc())
+        )
+        return list((await self._session.scalars(stmt)).all())
+
+    async def set_enabled(self, tool_id: uuid.UUID, *, enabled: bool) -> tuple[Tool | None, bool]:
+        """Flip a LIVE Tool's `enabled` flag with a single atomic, workspace-scoped UPDATE; return
+        `(tool, changed)` — the current row (or None if no live Tool matched: missing, foreign, or
+        deprecated) and whether this statement actually transitioned the persisted state.
+
+        Idempotent at the API — enabling an enabled Tool is a 200 no-op — and race-safe: the
+        UPDATE is value-guarded (`enabled != :desired`, M2.1), so it matches only when a real flip
+        occurs. Two concurrent identical PATCHes serialize on the row lock and exactly one sees
+        `changed=True` (READ COMMITTED re-evaluates the predicate after the lock), which is what
+        makes `tool.enabled`/`tool.disabled` emit exactly once per persisted transition — a no-op
+        touches nothing (not even `updated_at`) and emits nothing. `updated_at` is set explicitly
+        because the ORM `onupdate` does not fire on a Core statement.
         """
         stmt = (
             update(Tool)
@@ -79,14 +118,16 @@ class ToolRepository:
                 Tool.id == tool_id,
                 Tool.workspace_id == self._ctx.workspace_id,
                 Tool.deleted_at.is_(None),
+                Tool.enabled != enabled,
             )
             .values(enabled=enabled, updated_at=func.now())
             .returning(Tool.id)
         )
         updated_id: uuid.UUID | None = await self._session.scalar(stmt)
-        if updated_id is None:
-            return None
-        return await self.get(tool_id)
+        # `get` distinguishes the two zero-row cases: no live Tool (→ 404 upstream) versus a
+        # no-op on an existing row (→ idempotent 200, no event). Same-transaction read, so a
+        # changed row reflects this statement's own write.
+        return await self.get(tool_id), updated_id is not None
 
 
 __all__ = ["ToolRepository"]

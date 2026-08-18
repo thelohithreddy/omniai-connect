@@ -9,6 +9,7 @@ every read and the revoke filter `deleted_at IS NULL`. Transactions belong to th
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import func, select, tuple_, update
@@ -20,6 +21,16 @@ from app.core.pagination import CursorPosition
 from app.core.security import WorkspaceContext
 from app.domains.connections.models import Connection
 from app.domains.connectors.models import Connector
+
+
+@dataclass(frozen=True, slots=True)
+class RevokedConnection:
+    """The identifiers of a row `revoke` actually moved — read back from the UPDATE's RETURNING,
+    so they describe what the database did, not what the caller asked for (M2.1 event source)."""
+
+    id: uuid.UUID
+    workspace_id: uuid.UUID
+    connector_id: uuid.UUID
 
 
 class ConnectionRepository:
@@ -131,12 +142,15 @@ class ConnectionRepository:
             raise
         return connection
 
-    async def revoke(self, connection_id: uuid.UUID) -> bool:
-        """Revoke a live Connection: `status=revoked` + `deleted_at` set. Returns whether it moved.
+    async def revoke(self, connection_id: uuid.UUID) -> RevokedConnection | None:
+        """Revoke a live Connection: `status=revoked` + `deleted_at` set. Returns the revoked
+        row's identifiers, or None if nothing moved.
 
         A scoped Core `UPDATE … WHERE deleted_at IS NULL RETURNING`: idempotent (a second revoke
-        matches nothing → False), workspace-scoped (a foreign id is simply not found), and it sets
+        matches nothing → None), workspace-scoped (a foreign id is simply not found), and it sets
         `updated_at` explicitly because the ORM `onupdate` does not fire on a Core statement.
+        The returned identifiers come from the persisted row itself (M2.1) so the service can
+        stamp `connection.revoked` from what the database actually did, never from a parameter.
         """
         stmt = (
             update(Connection)
@@ -146,10 +160,14 @@ class ConnectionRepository:
                 Connection.deleted_at.is_(None),
             )
             .values(status="revoked", deleted_at=func.now(), updated_at=func.now())
-            .returning(Connection.id)
+            .returning(Connection.id, Connection.workspace_id, Connection.connector_id)
         )
-        revoked_id: uuid.UUID | None = await self._session.scalar(stmt)
-        return revoked_id is not None
+        row = (await self._session.execute(stmt)).first()
+        if row is None:
+            return None
+        return RevokedConnection(
+            id=row.id, workspace_id=row.workspace_id, connector_id=row.connector_id
+        )
 
 
-__all__ = ["ConnectionRepository"]
+__all__ = ["ConnectionRepository", "RevokedConnection"]

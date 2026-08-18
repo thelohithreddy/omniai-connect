@@ -67,6 +67,12 @@ class Settings(BaseSettings):
     def resolved_celery_broker_url(self) -> str:
         return self.celery_broker_url or self.redis_url
 
+    # TTL backstop for the MCP tools-discovery cache (`ws:{workspace_id}:mcp:tools`, ADR-0035;
+    # founder-ratified 300 s). Events evict eagerly; this bounds staleness when an eviction is
+    # lost (the in-process bus is at-most-once, ADR-0023). Not a freshness knob — lowering it
+    # trades DB load for a tighter lost-event recovery bound only.
+    mcp_tools_cache_ttl_seconds: int = 300
+
     # --- Auth (Better Auth — provider in apps/web per ADR-0002/0014; verified here per
     # ADR-0015) ---
     better_auth_secret: SecretStr = SecretStr("change-me-32-chars-minimum")

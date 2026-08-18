@@ -10,7 +10,10 @@
 
 The MCP server is one adapter in `apps/api/app/interfaces/mcp/`, alongside REST
 tool-invocation, OpenAPI manifests, and framework SDK exporters. It translates MCP
-protocol messages to `ToolCallRequest`/`ToolCallResult` and nothing more. Per Bible
+protocol messages to `ToolCallRequest`/`ToolCallResult` and nothing more. *(M2.2,
+ADR-0035: the adapter is currently a minimal in-house JSON-RPC/Streamable-HTTP layer
+rather than FastMCP — founder-ratified for the discovery surface; FastMCP is
+re-evaluated when tools/call lands, M2.3.)* Per Bible
 tenet 4: **if an MCP handler contains an `if`, ask whether it belongs in the
 runtime.** Policy, rate limits, quotas, credential handling, audit — all happen in
 the Execution Runtime; the adapter owns only protocol translation and transport.
@@ -46,8 +49,11 @@ destructiveHint, idempotentHint).
 
 Listings are **cached** (Redis, `ws:{workspace_id}:mcp:tools`) and
 **event-invalidated**: `connector.ingested`, `connection.activated`,
-`connection.revoked`, and tool enable/disable events on the internal bus evict the
-cache (BACKEND_SPEC.md §4). The adapter then emits MCP `listChanged` notifications on
+`connection.deactivated` (a Connection left the active set without being revoked —
+credential revoke today, OAuth-refresh failure `error` later; founder-ratified
+2026-08-18, ADR-0034), `connection.revoked`, `tool.enabled`, and `tool.disabled` on the
+internal bus evict the cache (BACKEND_SPEC.md §4; emission contracts in ADR-0034 —
+implemented M2.1). The adapter then emits MCP `listChanged` notifications on
 transports that support them, so long-lived clients refresh without reconnecting.
 
 ## 4. Call translation
@@ -62,6 +68,14 @@ transports that support them, so long-lived clients refresh without reconnecting
 
 The adapter performs **no** argument validation, no retries, no credential work —
 those are runtime stages. A `tools/call` handler is ~20 lines by design.
+
+*Implemented M2.3 (ADR-0036): `interfaces/mcp/execution.py` maps params → the existing
+`RuntimeService.execute` → MCP tool result. The Runtime re-authorizes at execution time, so a
+stale `tools/list` cache never authorizes a disabled/revoked Tool. Audited failures (upstream,
+timeout, `ssrf_blocked`, credential, bad arguments) map to `isError: true` results; an
+unresolvable Tool or ambiguous Connection is a JSON-RPC error. Exactly one execution attempt (no
+retries). Audit rows are tagged `caller.interface="mcp"`. `confirmation_required` and async/
+`pending` streaming remain deferred (no such Runtime status exists yet).*
 
 ## 5. Transports
 
@@ -95,6 +109,10 @@ The MCP specification still evolves quickly (auth in particular). Mitigations:
 - **Pin protocol versions** explicitly: the server advertises and accepts a tested
   allowlist of protocol revisions, upgraded deliberately — never implicitly by a
   FastMCP dependency bump (uv lockfile, ADR-0006, keeps this deterministic).
+  *Current pin (founder-ratified 2026-08-18, ADR-0035): allowlist
+  `{2025-06-18, 2025-11-25}`, advertising `2025-11-25`; `2026-07-28` (stateless core,
+  beta SDKs) is deliberately excluded until reconciled with this document's session
+  model — adopting it is a normal upgrade PR with contract tests.*
 - **The adapter isolates churn**: because MCP touches nothing but
   `interfaces/mcp/`, a breaking spec change is an adapter-sized diff. The runtime
   contract (`ToolCallRequest`/`ToolCallResult`) does not move when MCP does.

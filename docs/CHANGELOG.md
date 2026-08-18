@@ -13,6 +13,50 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **MCP tools/call (M2.3, ADR-0036).** The execution bridge: `tools/call` on the M2.2 endpoint
+  translates into the *existing* Execution Runtime (`ToolCallCreate` → `RuntimeService.execute` →
+  MCP tool result) — one execution path, no new engine. The Runtime remains the sole authority
+  for authorization, Connection resolution, argument validation, credential decrypt-at-use,
+  SSRF/egress, timeout, and audit; the MCP adapter performs no HTTP, touches no credential, adds
+  no second audit row. Re-authorized at execution time, so a **stale discovery cache can never
+  authorize a disabled/revoked Tool**; cross-tenant execution is impossible even given another
+  workspace's Tool name; a `workspace_id` in `arguments` is inert data, never authority. Error
+  split: unresolvable Tool / ambiguous Connection → JSON-RPC error (uniform "Unknown tool.");
+  audited failures (upstream, timeout, `ssrf_blocked`, credential, bad arguments) → tool result
+  with `isError: true` and the stable code, no target/secret/details ever leaked. No automatic
+  retries (one attempt — calls may be destructive). Audit rows from MCP are tagged
+  `caller.interface="mcp"` (new server-set `RuntimeService(interface=...)`, default `"rest"`).
+  No migration, no new dependency.
+
+- **MCP tools/list (M2.2, ADR-0035).** The first MCP surface: `POST /mcp/v1/{workspace_slug}`
+  (sessionless Streamable HTTP JSON-RPC; the `mcp.omniaiconnect.com` edge maps its `/v1/*`
+  here). Founder-ratified protocol pin — allowlist `{2025-06-18, 2025-11-25}`, advertising
+  `2025-11-25`; post-initialize requests must present a pinned `MCP-Protocol-Version` (400
+  otherwise, never a downgrade). Machine `omc_` tokens only (human JWTs → uniform 401), path
+  slug bound to the token's workspace, browser-origin requests refused. `tools/list` returns
+  the Runtime-callable set (live+enabled Tools with an active Connection) from one
+  workspace-scoped RLS-backed query, ordered `(created_at, id) DESC`, projected strictly to
+  `name`/`description`/`inputSchema`/safety hints — no internal or credential fields, ever.
+  Cache-aside Redis listing (`ws:{workspace_id}:mcp:tools`, versioned envelope) evicted by the
+  six ADR-0034 lifecycle events and bounded by a founder-ratified **300 s TTL backstop**
+  (recovery for at-most-once event loss); Redis failure degrades to the authoritative
+  database. `initialize`/`ping`/notifications implemented; `tools/call` is method-not-found
+  until M2.3. No migration, no new dependency. New setting `MCP_TOOLS_CACHE_TTL_SECONDS`.
+
+- **Connection & Tool lifecycle events (M2.1, ADR-0034).** The MCP cache-eviction foundation:
+  five canonical events on the existing internal bus (ADR-0023) — `connection.activated`
+  (credential attach, `pending_auth → active`), `connection.deactivated` (left the active set
+  without revocation: credential revoke today, OAuth-refresh `error` later; founder-ratified 5th
+  eviction event), `connection.revoked` (stamped from the revoking UPDATE's RETURNING),
+  `tool.enabled` / `tool.disabled` (persisted flips only). All buffered on the UnitOfWork and
+  dispatched **post-commit** (a rolled-back request emits nothing); payloads carry non-secret
+  identifiers only; the envelope's `workspace_id` is tenant-match-enforced at buffer time
+  (ADR-0022). **No migration, no new dependency, no new endpoint, no MCP code** — the eviction
+  consumer arrives with M2.2 `tools/list`. Behavior refinement: a no-op `PATCH /v1/tools/{id}`
+  (same `enabled` value) remains an idempotent 200 but no longer rewrites the row — `updated_at`
+  is untouched and no event is emitted. MCP_RUNTIME §3's eviction list now names all six events
+  (incl. `connector.ingested`).
+
 - **Audit Log Viewer (M1-Audit-v1, ADR-0033).** The final M1 product surface: a read-only,
   tenant-isolated view of the Tool Call audit ledger. New `GET /v1/tool-calls` (list) — the runtime
   already owns `POST` (invoke) and `GET /{id}` (fetch a result), so only the list is new. New
