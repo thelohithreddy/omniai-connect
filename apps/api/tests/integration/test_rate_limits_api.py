@@ -371,6 +371,53 @@ async def test_redis_outage_fails_closed_on_both_surfaces(
     assert statuses == ["denied", "denied"]
 
 
+async def test_partial_redis_failure_on_the_quota_read_still_fails_closed(
+    client: AsyncClient,
+    admin_engine: AsyncEngine,
+    workspace_a: SeededWorkspace,
+    egress: _Egress,
+    small_limits: pytest.MonkeyPatch,
+) -> None:
+    """D3 on the quota path in isolation: the rate bucket is HEALTHY (real Redis) but the quota
+    read fails — a partial outage (dropped connection, eviction, OOM on the second command).
+
+    The whole-outage test above can never reach this branch: it kills the bucket first. Without
+    this case, a quota-read fail-open would be indistinguishable from correct behavior, so a
+    workspace over its quota could execute whenever Redis half-failed.
+    """
+    await seed_tool(admin_engine, workspace_a.id)
+    real_client = redis_client
+
+    class _Proxy:
+        """Delegates every command to the real client except the quota GET."""
+
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._inner, name)
+
+        async def get(self, *args: Any, **kwargs: Any) -> Any:
+            raise ConnectionError("quota read unavailable")
+
+    class _QuotaReadFails:
+        def __init__(self) -> None:
+            self._client = real_client()
+
+        async def __aenter__(self) -> Any:
+            return _Proxy(await self._client.__aenter__())
+
+        async def __aexit__(self, *exc: object) -> Any:
+            return await self._client.__aexit__(*exc)
+
+    small_limits.setattr("app.domains.runtime.limits.redis_client", lambda: _QuotaReadFails())
+    resp = await _rest_call(client, workspace_a)
+    assert resp.status_code == 429, resp.text
+    assert resp.json()["error"]["code"] == "rate_limited"
+    assert "redis" not in resp.text.lower() and "ConnectionError" not in resp.text
+    assert egress.calls == [], "quota must never be skipped when it cannot be verified"
+
+
 # ------------------------------------------------------------------------------- kill switch
 
 
