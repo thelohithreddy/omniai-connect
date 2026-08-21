@@ -13,7 +13,7 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
-- **OAuth 2.0 authorization-code + PKCE (M2.5, ADR-0038).** Connect a provider once and every
+- **OAuth 2.0 authorization-code + PKCE (M2.5, ADR-0038).** *Released to `main` as `82cd651`.* Connect a provider once and every
   Interface can use it. `POST /v1/connections/{id}/oauth/authorize` (human, `connections:manage`)
   returns a provider `authorize_url`; the unauthenticated `GET /v1/oauth/callback` completes the
   dance. Its only authority is a single-use, tenant-bound `oauth_states` row (migration 0013):
