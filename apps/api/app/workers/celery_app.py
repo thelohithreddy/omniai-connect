@@ -30,8 +30,15 @@ from kombu import Queue
 from app.core.config import settings
 from app.core.logging import configure_logging
 
-#: The single queue this foundation declares. Future ingestion tasks route here; nothing else.
+#: The queue the ingestion pipeline runs on.
 INGESTION_QUEUE = "ingestion"
+#: The canonical queue for runtime-adjacent background work — today the OAuth token refresh
+#: worker (CONNECTOR_ENGINE §8 names this queue explicitly). Declared, never auto-created.
+RUNTIME_QUEUE = "runtime"
+
+#: How often the refresh sweep runs. It only *discovers* due credentials and fans out one task
+#: per credential, so the tick is cheap; individual refreshes carry their own jitter.
+REFRESH_SWEEP_INTERVAL_SECONDS = 60.0
 
 #: Retry foundation for future ingestion tasks (BACKEND_SPEC §5, CONNECTOR_ENGINE §4): bounded,
 #: exponential, jittered. Applied per-task (each task opts into its own transient exceptions via
@@ -58,7 +65,7 @@ celery_app = Celery(
     broker=settings.resolved_celery_broker_url,
     # Deterministic, explicit task registration — no import-time autodiscovery magic
     # (CONNECTOR_SPECIFICATION §15 registration discipline).
-    include=["app.workers.tasks"],
+    include=["app.workers.tasks", "app.workers.oauth_tasks"],
 )
 
 celery_app.conf.update(
@@ -78,8 +85,16 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,
     # --- queue topology: one declared queue, no client-chosen/auto queues ----------------
     task_default_queue=INGESTION_QUEUE,
-    task_queues=(Queue(INGESTION_QUEUE),),
+    task_queues=(Queue(INGESTION_QUEUE), Queue(RUNTIME_QUEUE)),
     task_create_missing_queues=False,
+    # --- scheduler: the only periodic work is OAuth refresh discovery (M2.5) ---------------
+    beat_schedule={
+        "oauth-refresh-sweep": {
+            "task": "workers.oauth.sweep_refreshes",
+            "schedule": REFRESH_SWEEP_INTERVAL_SECONDS,
+            "options": {"queue": RUNTIME_QUEUE, "expires": REFRESH_SWEEP_INTERVAL_SECONDS},
+        }
+    },
     # --- bounded execution ---------------------------------------------------------------
     task_time_limit=TASK_HARD_TIME_LIMIT_SECONDS,
     task_soft_time_limit=TASK_SOFT_TIME_LIMIT_SECONDS,
@@ -95,6 +110,8 @@ celery_app.conf.update(
 __all__ = [
     "DEFAULT_TASK_RETRY",
     "INGESTION_QUEUE",
+    "REFRESH_SWEEP_INTERVAL_SECONDS",
+    "RUNTIME_QUEUE",
     "MAX_RETRIES",
     "TASK_HARD_TIME_LIMIT_SECONDS",
     "TASK_SOFT_TIME_LIMIT_SECONDS",

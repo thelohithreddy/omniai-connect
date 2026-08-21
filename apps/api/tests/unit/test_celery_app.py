@@ -17,6 +17,7 @@ from app.workers.celery_app import (
     DEFAULT_TASK_RETRY,
     INGESTION_QUEUE,
     MAX_RETRIES,
+    RUNTIME_QUEUE,
     celery_app,
 )
 
@@ -62,9 +63,12 @@ def test_utc_is_enabled() -> None:
 # ------------------------------------------------------------------ queue topology
 
 
-def test_only_the_ingestion_queue_is_declared() -> None:
+def test_exactly_the_canonical_queues_are_declared() -> None:
+    """Two declared queues and no more: `ingestion`, plus the `runtime` queue CONNECTOR_ENGINE
+    §8 names for the OAuth refresh worker (M2.5). The default stays `ingestion`, so a task that
+    forgets to route itself cannot silently land on the runtime queue."""
     assert celery_app.conf.task_default_queue == INGESTION_QUEUE
-    assert [q.name for q in celery_app.conf.task_queues] == [INGESTION_QUEUE]
+    assert [q.name for q in celery_app.conf.task_queues] == [INGESTION_QUEUE, RUNTIME_QUEUE]
 
 
 def test_arbitrary_queues_are_not_auto_created() -> None:
@@ -87,7 +91,7 @@ def test_the_worker_autodiscovers_tasks_via_include() -> None:
     """The worker imports the tasks module via `include` at startup. This test imports `tasks`
     itself (above), which would mask an empty `include`, so the config the *worker* actually
     uses is asserted directly — an empty include means a worker that registers nothing."""
-    assert celery_app.conf.include == ["app.workers.tasks"]
+    assert celery_app.conf.include == ["app.workers.tasks", "app.workers.oauth_tasks"]
 
 
 # ------------------------------------------------------------------ bounded execution / retry

@@ -152,6 +152,50 @@ services:
     volumes:
       - ./apps/api:/app
 
+  # OAuth token-refresh worker on the canonical `runtime` queue (M2.5, ADR-0038). Same image and
+  # the same hand-scoped environment discipline as the ingestion worker: it needs the DB and the
+  # credential KEK (it re-seals refreshed tokens) but no frontend/API secrets. It consumes ONLY
+  # the `runtime` queue, so a backlog of spec ingestion can never starve token refresh.
+  worker-runtime:
+    image: omniai-connect-api
+    env_file: .env
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://omniai_app:omniai_app@db:5432/omniai
+      APP_ENV: development
+      LOG_LEVEL: info
+    command:
+      ["celery", "-A", "app.workers.celery_app", "worker", "-Q", "runtime",
+       "--concurrency=2", "--loglevel=INFO", "--without-gossip", "--without-mingle"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    volumes:
+      - ./apps/api:/app
+
+  # The scheduler (Celery beat). Exactly one replica must run: two would double-schedule every
+  # sweep. It only enqueues the discovery tick — it performs no refresh itself and holds no
+  # credential material.
+  scheduler:
+    image: omniai-connect-api
+    env_file: .env
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://omniai_app:omniai_app@db:5432/omniai
+      APP_ENV: development
+      LOG_LEVEL: info
+    command:
+      ["celery", "-A", "app.workers.celery_app", "beat", "--loglevel=INFO"]
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./apps/api:/app
+
 volumes:
   pgdata:
   miniodata:

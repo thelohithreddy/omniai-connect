@@ -192,8 +192,71 @@ def upgrade() -> None:
     op.execute(sa.text("REVOKE ALL ON FUNCTION auth.consume_oauth_state(text) FROM PUBLIC"))
     op.execute(sa.text(f"GRANT EXECUTE ON FUNCTION auth.consume_oauth_state(text) TO {APP_ROLE}"))
 
+    # ------------------------------------------- refresh discovery (the scheduler exemption)
+    #
+    # The refresh sweep is a platform-level job: it must see every tenant's due credentials to
+    # schedule them, but it runs before any workspace is bound (there is no "current tenant" for
+    # a cron tick). Same carve-out, same reasoning as above — and deliberately minimal: the
+    # function returns **identifiers only**, never ciphertext, so the scan cannot become a
+    # cross-tenant secret read. The per-credential task that follows binds its workspace and
+    # does its work under normal RLS.
+    op.execute(sa.text(f"GRANT SELECT ON public.credentials TO {AUTH_ROLE}"))
+    op.execute(sa.text(f"GRANT SELECT ON public.connections TO {AUTH_ROLE}"))
+    op.execute(
+        sa.text(f"""
+        CREATE POLICY refresh_discovery ON public.credentials
+            FOR SELECT TO {AUTH_ROLE}
+            USING (true);
+    """)
+    )
+    op.execute(
+        sa.text(f"""
+        CREATE POLICY refresh_discovery ON public.connections
+            FOR SELECT TO {AUTH_ROLE}
+            USING (true);
+    """)
+    )
+    op.execute(
+        sa.text("""
+        CREATE FUNCTION auth.due_oauth_refreshes(p_within_seconds integer, p_limit integer)
+        RETURNS TABLE (workspace_id uuid, connection_id uuid)
+        LANGUAGE sql
+        STABLE
+        SECURITY DEFINER
+        SET search_path = pg_catalog, public
+        AS $$
+            SELECT c.workspace_id, c.connection_id
+            FROM public.credentials c
+            JOIN public.connections n
+              ON n.id = c.connection_id AND n.workspace_id = c.workspace_id
+            WHERE c.credential_type = 'oauth2'
+              AND c.expires_at IS NOT NULL
+              AND c.expires_at < now() + make_interval(secs => p_within_seconds)
+              AND n.status = 'active'
+              AND n.deleted_at IS NULL
+            ORDER BY c.expires_at
+            LIMIT p_limit;
+        $$;
+    """)
+    )
+    op.execute(
+        sa.text(f"ALTER FUNCTION auth.due_oauth_refreshes(integer, integer) OWNER TO {AUTH_ROLE}")
+    )
+    op.execute(
+        sa.text("REVOKE ALL ON FUNCTION auth.due_oauth_refreshes(integer, integer) FROM PUBLIC")
+    )
+    op.execute(
+        sa.text(
+            "GRANT EXECUTE ON FUNCTION auth.due_oauth_refreshes(integer, integer)"
+            f" TO {APP_ROLE}"
+        )
+    )
+
 
 def downgrade() -> None:
+    op.execute(sa.text("DROP FUNCTION IF EXISTS auth.due_oauth_refreshes(integer, integer)"))
+    op.execute(sa.text("DROP POLICY IF EXISTS refresh_discovery ON public.connections"))
+    op.execute(sa.text("DROP POLICY IF EXISTS refresh_discovery ON public.credentials"))
     op.execute(sa.text("DROP FUNCTION IF EXISTS auth.consume_oauth_state(text)"))
     op.execute(sa.text("DROP POLICY IF EXISTS state_consumption ON public.oauth_states"))
     # Drops only M2.5's own table. Credentials and connections are never touched by an OAuth

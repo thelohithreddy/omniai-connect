@@ -502,3 +502,35 @@ async def test_oauth2_cannot_be_written_through_the_public_credential_api(
         json={"credential_type": "oauth2", "value": "attacker-supplied"},
     )
     assert resp.status_code == 400
+
+
+async def test_provider_error_bodies_never_reach_logs(
+    owner: dict[str, Any],
+    admin_engine: AsyncEngine,
+    workspace_a: SeededWorkspace,
+    fake_provider: FakeOAuthProvider,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """RFC 6749 §5.2 error bodies routinely echo request parameters, so a provider's response
+    body must not reach any sink — not the browser (asserted elsewhere) and not the logs.
+
+    This closes the gap that let a `leak-provider-error-body` mutation survive the first audit:
+    the response is a static page, so a body smuggled into an exception message would have been
+    invisible to every other test.
+    """
+    connection_id = await _seed_oauth_connection(admin_engine, workspace_a.id)
+    start = await _start(owner, connection_id)
+    code = fake_provider.issue_code(start["authorize_url"])
+    state = FakeOAuthProvider.state_from(start["authorize_url"])
+    fake_provider.next_response = (
+        400,
+        b'{"error":"invalid_grant","error_description":"SENSITIVE-PROVIDER-DETAIL"}',
+    )
+
+    capsys.readouterr()  # drop anything emitted while seeding
+    resp = await _callback(owner["client"], code=code, state=state)
+    assert resp.status_code == 400
+    captured = capsys.readouterr()
+    emitted = captured.out + captured.err
+    assert "SENSITIVE-PROVIDER-DETAIL" not in emitted, "a provider error body reached the logs"
+    assert "invalid_grant" not in emitted
