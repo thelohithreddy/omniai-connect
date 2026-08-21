@@ -17,6 +17,7 @@ from app.workers.celery_app import (
     DEFAULT_TASK_RETRY,
     INGESTION_QUEUE,
     MAX_RETRIES,
+    RUNTIME_QUEUE,
     celery_app,
 )
 
@@ -62,9 +63,12 @@ def test_utc_is_enabled() -> None:
 # ------------------------------------------------------------------ queue topology
 
 
-def test_only_the_ingestion_queue_is_declared() -> None:
+def test_exactly_the_canonical_queues_are_declared() -> None:
+    """Two declared queues and no more: `ingestion`, plus the `runtime` queue CONNECTOR_ENGINE
+    §8 names for the OAuth refresh worker (M2.5). The default stays `ingestion`, so a task that
+    forgets to route itself cannot silently land on the runtime queue."""
     assert celery_app.conf.task_default_queue == INGESTION_QUEUE
-    assert [q.name for q in celery_app.conf.task_queues] == [INGESTION_QUEUE]
+    assert [q.name for q in celery_app.conf.task_queues] == [INGESTION_QUEUE, RUNTIME_QUEUE]
 
 
 def test_arbitrary_queues_are_not_auto_created() -> None:
@@ -72,7 +76,16 @@ def test_arbitrary_queues_are_not_auto_created() -> None:
     assert celery_app.conf.task_create_missing_queues is False
 
 
-def test_the_demo_tasks_are_registered() -> None:
+def test_the_registered_tasks_are_exactly_the_declared_set() -> None:
+    """The registry is asserted exactly, so a task added without review fails here.
+
+    Both task modules are imported explicitly rather than relying on whichever tests ran first:
+    Celery registers a task at import time, so an implicit import elsewhere in the suite would
+    otherwise make this assertion order-dependent.
+    """
+    import app.workers.oauth_tasks  # noqa: F401
+    import app.workers.tasks  # noqa: F401
+
     names = {t for t in celery_app.tasks if t.startswith("workers.")}
     assert names == {
         "workers.ping",
@@ -80,6 +93,8 @@ def test_the_demo_tasks_are_registered() -> None:
         "workers.retry_probe",
         "workers.count_visible_connectors",  # B0.3 tenant-boundary demo task
         "workers.ingest_connector_spec",  # B1.1 connector ingestion pipeline
+        "workers.oauth.sweep_refreshes",  # M2.5 refresh discovery (runtime queue)
+        "workers.oauth.refresh_credential",  # M2.5 per-credential refresh (runtime queue)
     }
 
 
@@ -87,7 +102,7 @@ def test_the_worker_autodiscovers_tasks_via_include() -> None:
     """The worker imports the tasks module via `include` at startup. This test imports `tasks`
     itself (above), which would mask an empty `include`, so the config the *worker* actually
     uses is asserted directly — an empty include means a worker that registers nothing."""
-    assert celery_app.conf.include == ["app.workers.tasks"]
+    assert celery_app.conf.include == ["app.workers.tasks", "app.workers.oauth_tasks"]
 
 
 # ------------------------------------------------------------------ bounded execution / retry

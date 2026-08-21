@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 import app.domains.connections.models  # noqa: F401
 import app.domains.connectors.models  # noqa: F401
 import app.domains.credentials.models  # noqa: F401
+import app.domains.oauth.models  # noqa: F401
 import app.domains.runtime.models  # noqa: F401
 import app.domains.workspaces.models  # noqa: F401
 from alembic import context

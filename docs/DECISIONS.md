@@ -1917,3 +1917,65 @@ a 16-mutation audit — 15 killed, 1 inert (bucket idle-TTL is memory hygiene, n
 meaningful survivors. M2.4-pre proven by resolver-injection unit + live-resolver integration
 tests. **Deferred:** §7 general limiter; per-Connection in-flight concurrency + circuit
 breaker; `usage_events` + paid-plan enforcement (M3); anomaly alerting (M3).
+
+## ADR-0038 — OAuth 2.0 authorization-code + PKCE: the backend-owned flow (M2.5)
+
+**Status:** Accepted (2026-08-21) · **Context:** M2's OAuth module, implemented from the frozen
+M2.5 architecture after the founder ratified D1–D5. Canon fixed most of it already
+(CONNECTOR_SPECIFICATION §5:215, CONNECTOR_ENGINE §8, PRD §74); this ADR records the five
+ratified decisions and the implementation choices canon left derivable.
+
+**Decision:**
+
+1. **Backend owns the flow and the callback (D1).** `POST /v1/connections/{id}/oauth/authorize`
+   (human, `connections:manage`) returns `{authorize_url, expires_at}`; the unauthenticated
+   `GET /v1/oauth/callback` is the provider's redirect target. This satisfies PRD §74 (the
+   callback lands in the credentials domain) and keeps `state` and the PKCE verifier entirely
+   server-side. A dashboard, when it exists, simply redirects to the URL the API returns — no
+   re-architecture. **Deferred:** the dashboard UX slice.
+
+2. **`oauth_states` is the callback's only authority.** A provider redirect carries just `code`
+   and `state`, both attacker-influencable, so workspace/connection are read from the row the
+   request atomically consumes — never from the request. `state` is stored **SHA-256 hashed** (a
+   database read cannot forge a callback); the PKCE `code_verifier` is stored **sealed** by the
+   existing vault, because RFC 7636 §4.5 requires presenting it verbatim. The consume runs
+   through `auth.consume_oauth_state`, the **same narrowly-scoped SECURITY DEFINER carve-out M1
+   established for bearer tokens** (migration 0001) — never a weakened policy, never BYPASSRLS —
+   with the conditional `UPDATE … RETURNING` inside the function, so single-use is a property of
+   the database. The refresh sweep uses a second such function returning **identifiers only**.
+
+3. **PKCE S256 only; public client.** `plain` is never generated or accepted. §215's auth-code
+   contract names only `authorization_url`/`token_url`/`scopes` — no client secret — so M2.5
+   speaks the RFC 6749 §2.1 public-client profile where PKCE replaces a secret. `auth_config`
+   **refuses** `client_secret`/token-shaped keys outright, since it is public metadata (§219).
+   **Grant scope (D3): `authorization_code` only** — `client_credentials` is refused explicitly
+   and remains **M2/P1 deferred**, never silently moved to M3.
+
+4. **One egress, one vault, one Runtime.** Token exchange and refresh go through
+   `core.net.request` with the token host pinned as the allowlist — no second HTTP client, no
+   second SSRF implementation (an `SSRFError` maps to the canonical `ssrf_blocked`). Tokens are
+   sealed into the single Credential per Connection by the credentials domain. The Runtime gains
+   **one** `oauth2` branch injecting `Authorization: Bearer`; there is no refresh-before-use, so
+   an expired token surfaces as the canonical upstream failure. `vault.unseal_flow_secret` is
+   added for the PKCE verifier only — ephemeral protocol material, not a Credential; the private
+   `_unseal` stays Runtime-only and its encapsulation test still passes unchanged.
+
+5. **Refresh: `runtime` queue, jittered, row-locked (D2/D5).** A beat-scheduled sweep discovers
+   due credentials and fans out one task per credential with jitter; each task carries
+   **identifiers only** (never a token — Celery arguments are JSON at rest in Redis). The refresh
+   **claims the Connection with `SELECT … FOR UPDATE` and re-checks expiry inside the lock**, so
+   concurrent workers perform exactly one exchange and a **rotated refresh token can never be
+   lost**. A terminal failure sets `status='error'` and emits `connection.deactivated`;
+   **`webhooks_outbox` is not built here — it belongs to Connection Health (D2)**. `needs_reauth`
+   is **derived** (`status == 'error'` AND an oauth2 credential), not a fifth status and not an
+   `error_reason` column (D5) — the released `status_valid` CHECK is untouched.
+
+**Consequences:** One additive migration (`0013_oauth_states`), no change to released migrations,
+no new dependency. New settings (`OAUTH_*`) plus two deployment processes: a `runtime`-queue
+worker and exactly one beat scheduler. Proven by 21 config-unit + 30 real-Postgres+RLS+vault+
+Celery integration tests (state replay/expiry/concurrency/cross-tenant, PKCE mismatch/downgrade,
+redirect binding, provider 4xx/5xx/malformed, SSRF, refresh rotation + concurrency + outage,
+terminal transition, REST **and** MCP execution, secret canaries in response/audit/logs) and an
+18-mutation audit — 17 killed, 1 empirically-proven inert, 0 meaningful survivors.
+**Deferred:** `client_credentials` (M2/P1), dashboard UX, `webhooks_outbox` + Connection Health,
+vault hardening, MCP streaming/`listChanged`. **M2 is NOT complete after M2.5.**

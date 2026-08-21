@@ -13,6 +13,25 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **OAuth 2.0 authorization-code + PKCE (M2.5, ADR-0038).** Connect a provider once and every
+  Interface can use it. `POST /v1/connections/{id}/oauth/authorize` (human, `connections:manage`)
+  returns a provider `authorize_url`; the unauthenticated `GET /v1/oauth/callback` completes the
+  dance. Its only authority is a single-use, tenant-bound `oauth_states` row (migration 0013):
+  `state` stored SHA-256-hashed, the PKCE verifier sealed by the existing vault, consumed
+  atomically through the same SECURITY DEFINER carve-out M1 uses for bearer tokens — so replay,
+  expiry and concurrent callbacks all resolve to exactly one winner. **PKCE S256 only**; the
+  redirect URI is server-configured and exact-match; `auth_config` refuses secret material.
+  Token exchange and refresh reuse the canonical guarded egress (no second HTTP client, no second
+  SSRF implementation); tokens are sealed into the one Credential per Connection and injected by
+  a **single** new Runtime `oauth2` branch, so REST and MCP execute OAuth Tools identically.
+  Refresh runs on the canonical Celery **`runtime` queue** with a beat-scheduled, jittered sweep;
+  each refresh claims its Connection with `SELECT … FOR UPDATE` and re-checks expiry inside the
+  lock, so concurrent workers perform exactly one exchange and a **rotated refresh token is never
+  lost**. Terminal failure sets the Connection to `error` and emits `connection.deactivated`;
+  **`needs_reauth` is derived** (`error` + an oauth2 credential), not a new status. Scope:
+  `authorization_code` only — `client_credentials` stays **M2/P1 deferred**. New `OAUTH_*`
+  settings and two processes (`worker-runtime`, `scheduler`). One additive migration.
+
 - **Tool-Call rate limits & quotas (M2.4, ADR-0037).** Enforcement lives in the Runtime's
   stage-3 policy checks — REST and MCP share one budget structurally, adapters unchanged.
   Atomic Redis Lua token bucket (server-side `TIME`, no app clocks) on the canonical

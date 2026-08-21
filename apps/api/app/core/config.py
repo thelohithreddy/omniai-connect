@@ -84,6 +84,22 @@ class Settings(BaseSettings):
     # Free-plan weekly quota of *executed* Tool Calls (ISO week, UTC reset).
     free_weekly_quota: int = 1000
 
+    # --- OAuth 2.0 authorization-code flow (M2.5, ADR-0038) ---
+    # Kill switch: an operational rollback lever. False makes the OAuth endpoints refuse and the
+    # refresh worker no-op; it never weakens an already-issued credential.
+    oauth_enabled: bool = True
+    # The ONE redirect URI registered with every provider. Server-configured, exact-match, never
+    # client-supplied — an attacker-chosen redirect is the classic OAuth open-redirect vector.
+    oauth_redirect_uri: str = "http://localhost:8000/v1/oauth/callback"
+    # How long an in-flight authorization may sit before its state row is unusable. Short by
+    # design: the row is a bearer-grade artifact and the user is mid-flow in a browser.
+    oauth_state_ttl_seconds: int = 600
+    # Refresh when the remaining lifetime drops below this fraction of the token's total
+    # lifetime (0.25 → refresh at ~75% elapsed), leaving room for retries before expiry.
+    oauth_refresh_threshold_ratio: float = 0.25
+    # Bounded retry for a failing refresh before the Connection is transitioned to `error`.
+    oauth_refresh_max_attempts: int = 5
+
     # --- Auth (Better Auth — provider in apps/web per ADR-0002/0014; verified here per
     # ADR-0015) ---
     better_auth_secret: SecretStr = SecretStr("change-me-32-chars-minimum")
