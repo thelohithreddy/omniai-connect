@@ -32,6 +32,10 @@ class CredentialSecret:
     value: str | None = None
     username: str | None = None
     password: str | None = None
+    #: oauth2 only — the bearer access token the runtime injects (M2.5). The refresh token is
+    #: deliberately NOT surfaced here: the runtime never redeems it (the Celery refresh worker
+    #: owns that), so the execution path holds the narrowest material that can do its job.
+    access_token: str | None = None
 
     def __repr__(self) -> str:  # never leak the secret through repr / f-strings / tracebacks
         return f"<CredentialSecret {self.credential_type} redacted>"
@@ -62,6 +66,7 @@ def open_credential_secret(
         value=data.get("value"),
         username=data.get("username"),
         password=data.get("password"),
+        access_token=data.get("access_token"),
     )
 
 

@@ -88,6 +88,78 @@ class CredentialService:
             )
         return credential
 
+    async def store_oauth_tokens(
+        self,
+        connection_id: uuid.UUID,
+        *,
+        access_token: str,
+        refresh_token: str | None,
+        token_type: str,
+        scope: str | None,
+        expires_at: datetime,
+    ) -> Credential:
+        """Seal an OAuth token set onto a Connection (M2.5, ADR-0038) — attach **or** refresh.
+
+        This is the credentials domain's OAuth entry point: PRD §74 places the callback's effect
+        here, so token sealing stays with the domain that owns Credential rows rather than being
+        duplicated inside the OAuth flow. The token set is sealed by the same vault envelope as
+        every other credential (AAD = workspace‖connection); nothing plaintext is persisted.
+
+        First call for a Connection creates the row and transitions `pending_auth → active`,
+        emitting `connection.activated` exactly as an api_key attach does. A later call (the
+        refresh worker) re-seals in place with a **fresh DEK + nonce**, stamps `rotated_at`, and
+        leaves the Connection's status untouched — a refresh is not a lifecycle transition.
+        """
+        connection = await self._repository.connection_for_update(connection_id)
+        if connection is None:
+            raise NotFoundError("Connection not found.")
+
+        secret = {"access_token": access_token, "token_type": token_type}
+        if refresh_token is not None:
+            secret["refresh_token"] = refresh_token
+        if scope is not None:
+            secret["scope"] = scope
+        plaintext = json.dumps(secret, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        sealed = vault.seal(
+            plaintext, workspace_id=connection.workspace_id, connection_id=connection.id
+        )
+
+        credential = await self._repository.get_by_connection(connection_id)
+        is_new = credential is None
+        if credential is None:
+            credential = Credential(
+                workspace_id=connection.workspace_id,
+                connection_id=connection.id,
+                credential_type="oauth2",
+                ciphertext=b"",
+                encrypted_dek=b"",
+                nonce=b"",
+                key_version=vault.KEY_VERSION,
+            )
+        credential.credential_type = "oauth2"
+        credential.ciphertext = sealed.ciphertext
+        credential.encrypted_dek = sealed.encrypted_dek
+        credential.nonce = sealed.nonce
+        credential.key_version = sealed.key_version
+        credential.expires_at = expires_at
+        if is_new:
+            await self._repository.insert(credential)
+        else:
+            credential.rotated_at = datetime.now(UTC)
+
+        previous_status = connection.status
+        connection.credential_id = credential.id
+        if previous_status == "pending_auth":
+            connection.status = "active"
+            event_bus.publish(
+                connection_activated(
+                    connection.workspace_id,
+                    connection_id=connection.id,
+                    connector_id=connection.connector_id,
+                )
+            )
+        return credential
+
     async def rotate(self, connection_id: uuid.UUID, payload: CredentialWrite) -> Credential:
         """Re-seal a Connection's Credential with a **fresh DEK + nonce** and set `rotated_at`. The
         connection stays `active`. A missing connection/credential is a uniform 404."""

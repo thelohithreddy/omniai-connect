@@ -29,6 +29,7 @@ from app.core.pagination import (
 from app.domains.connectors import promotion
 from app.domains.connectors.events import connector_ingestion_requested
 from app.domains.connectors.models import Connector
+from app.domains.connectors.oauth_config import is_oauth2, validate_oauth_auth_config
 from app.domains.connectors.repository import ConnectorRepository
 
 _NON_SLUG = re.compile(r"[^a-z0-9]+")
@@ -39,7 +40,7 @@ def _slugify(name: str) -> str:
     return _NON_SLUG.sub("-", name.strip().lower()).strip("-")[:64]
 
 
-def validate_base_url(raw: str) -> str:
+def validate_base_url(raw: str, *, field: str = "base_url") -> str:
     """SSRF lint for a Connector's base URL (CONNECTOR_SPECIFICATION.md §11, SECURITY.md §6).
 
     Applies to spec-declared URLs *before any Tool exists* — a stored `base_url` is a wire
@@ -55,20 +56,20 @@ def validate_base_url(raw: str) -> str:
     try:
         parts = urlsplit(value)
     except ValueError as exc:
-        raise ValidationFailedError("base_url is not a valid URL.") from exc
+        raise ValidationFailedError(f"{field} is not a valid URL.") from exc
 
     if parts.scheme != "https":
-        raise ValidationFailedError("base_url must use https.")
+        raise ValidationFailedError(f"{field} must use https.")
     if parts.username or parts.password or "@" in parts.netloc:
-        raise ValidationFailedError("base_url must not embed credentials.")
+        raise ValidationFailedError(f"{field} must not embed credentials.")
 
     host = parts.hostname
     if not host:
-        raise ValidationFailedError("base_url must include a host.")
+        raise ValidationFailedError(f"{field} must include a host.")
 
     lowered = host.lower()
     if lowered == "localhost" or lowered.endswith((".localhost", ".local")):
-        raise ValidationFailedError("base_url must not point at a local or internal host.")
+        raise ValidationFailedError(f"{field} must not point at a local or internal host.")
 
     try:
         address: ipaddress.IPv4Address | ipaddress.IPv6Address | None = ipaddress.ip_address(host)
@@ -83,7 +84,7 @@ def validate_base_url(raw: str) -> str:
         or address.is_multicast
     ):
         raise ValidationFailedError(
-            "base_url must not point at a private, loopback, link-local, or reserved address."
+            f"{field} must not point at a private, loopback, link-local, or reserved address."
         )
     return value
 
@@ -110,8 +111,15 @@ class ConnectorService:
         slug: str | None = None,
     ) -> Connector:
         """Create a manual Connector. `source_type` is server-set to `manual`; `status` starts
-        at `draft`; `base_url` is SSRF-linted; the slug is derived from the name when absent."""
+        at `draft`; `base_url` is SSRF-linted; the slug is derived from the name when absent.
+
+        An `oauth2` auth_config is additionally validated at definition time (M2.5, ADR-0038):
+        both provider endpoints pass the same SSRF lint as `base_url`, and secret material is
+        refused outright — `auth_config` is public metadata (CONNECTOR_SPECIFICATION §5:219).
+        """
         clean_base_url = validate_base_url(base_url)
+        if is_oauth2(auth_config):
+            validate_oauth_auth_config(auth_config)
         connector_slug = slug or _slugify(name)
         if not connector_slug:
             raise ValidationFailedError(

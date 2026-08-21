@@ -12,7 +12,8 @@ I/O and holds no state. The canonical M1 mapping:
 
 Where the api_key goes is authority owned by the Connector, not the caller and not the Credential —
 so a malformed/absent `auth_config` fails closed (`UpstreamAPIError` → `connector_error`), never a
-guess. `location: body` and the M2 credential types (jwt/oauth2/custom_headers) are out of M1 scope
+guess. `oauth2` injects the stored access token as a bearer token (M2.5); `location: body` and the
+remaining credential types (jwt/custom_headers) are still out of scope
 and rejected explicitly.
 """
 
@@ -49,6 +50,14 @@ def build_auth_injection(secret: CredentialSecret, auth_config: Mapping[str, Any
         if not secret.value:
             raise UpstreamAPIError("Credential is not usable for this Connection.")
         return InjectedAuth(headers={"Authorization": f"Bearer {secret.value}"})
+
+    if credential_type == "oauth2":
+        # M2.5: an OAuth access token is injected exactly like a bearer token (RFC 6750 §2.1).
+        # The runtime never refreshes here — a stale token surfaces as the canonical
+        # `auth_expired` upstream 401 and the background worker owns renewal (ADR-0038).
+        if not secret.access_token:
+            raise UpstreamAPIError("Credential is not usable for this Connection.")
+        return InjectedAuth(headers={"Authorization": f"Bearer {secret.access_token}"})
 
     if credential_type == "basic":
         if secret.username is None or secret.password is None:

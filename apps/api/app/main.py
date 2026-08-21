@@ -29,6 +29,7 @@ from app.domains.connectors.router import connectors_router
 from app.domains.connectors.subscribers import register_connector_subscribers
 from app.domains.credentials.router import credentials_router
 from app.domains.credentials.vault import validate_master_key_configured
+from app.domains.oauth.router import oauth_router
 from app.domains.runtime.router import tool_calls_router
 from app.domains.tools.router import tools_router
 from app.domains.workspaces.router import api_tokens_router, invitations_router, members_router
@@ -60,6 +61,9 @@ app.include_router(credentials_router)
 app.include_router(tool_calls_router)
 app.include_router(tools_router)
 app.include_router(audit_router)
+# OAuth 2.0 authorization-code flow (M2.5, ADR-0038): an authenticated authorize endpoint plus
+# the unauthenticated provider callback whose authority is the single-use oauth_states row.
+app.include_router(oauth_router)
 # The MCP interface adapter (M2.2, ADR-0035) — outside `/v1` so user-chosen workspace slugs can
 # never collide with REST resource paths; the mcp.* edge maps its `/v1/*` onto `/mcp/v1/*`.
 app.include_router(mcp_router)

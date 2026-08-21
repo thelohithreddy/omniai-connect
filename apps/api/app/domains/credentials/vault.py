@@ -114,11 +114,30 @@ def _unseal(sealed: SealedSecret, *, workspace_id: uuid.UUID, connection_id: uui
         raise VaultDecryptError("credential authentication failed") from exc
 
 
+def unseal_flow_secret(
+    sealed: SealedSecret, *, workspace_id: uuid.UUID, connection_id: uuid.UUID
+) -> bytes:
+    """Recover **ephemeral protocol material** — never a Credential (M2.5, ADR-0038).
+
+    The credential decrypt boundary is unchanged: `_unseal` stays private and the Execution
+    Runtime (`runtime/secrets.py`) remains its only importer, which is now mechanically asserted
+    by a test rather than merely documented. This function exists for one narrow case that is
+    *not* a customer credential: the PKCE `code_verifier`, which RFC 7636 §4.5 requires to be
+    presented verbatim at the token endpoint and therefore cannot be hashed like `state`.
+
+    It deliberately reuses the identical AES-256-GCM envelope and AAD (workspace‖connection)
+    rather than introducing a second crypto path — one implementation, two labelled callers.
+    The recovered value is a single-use nonce that dies with its `oauth_states` row.
+    """
+    return _unseal(sealed, workspace_id=workspace_id, connection_id=connection_id)
+
+
 __all__ = [
     "KEY_VERSION",
     "SealedSecret",
     "VaultConfigError",
     "VaultDecryptError",
     "seal",
+    "unseal_flow_secret",
     "validate_master_key_configured",
 ]
