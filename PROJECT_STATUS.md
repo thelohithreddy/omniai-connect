@@ -16,14 +16,11 @@ security subset green (cross-tenant, stale-cache-cannot-authorize, SSRF, credent
 no-retry). **M1 was COMPLETE and RELEASED to `main`** earlier (final verified SHA `630daf9`,
 merged as `7141b2c`, post-merge CI green, 1312 regression tests, 0 meaningful mutation survivors).
 
-**Open item discovered during the M2.3 release smoke (pre-existing M1 gap, not a regression, not
-security):** `core/net.py::_default_resolver`/`resolve_and_validate` does not map a DNS
-`socket.gaierror` (NXDOMAIN host) to `SSRFError`, so a Tool Call against an unresolvable host
-surfaces as an `internal` 500 with no audit row — identically on the REST and MCP paths (egress is
-stubbed in all tests, so this real-egress edge is uncovered). Fail-closed (request never made, no
-target/credential leak). Recommended targeted follow-up: wrap `getaddrinfo`'s `gaierror` →
-`SSRFError("unresolvable-address")` (or add it to `egress.py`'s except), with a resolver-injection
-test. Not fixed under the release-only directive. The M2 decision
+**Resolved (M2.4-pre, on `feat/m24-rate-limits-quotas`):** the DNS gap found in the M2.3 release
+smoke — `resolve_and_validate` now maps resolver `socket.gaierror` → `SSRFError
+("unresolvable-address")`, so an unresolvable-host Tool Call is an audited `ssrf_blocked` denial
+on REST and MCP instead of an `internal` 500 with no audit row (resolver-injection unit test +
+live-resolver end-to-end test). The M2 decision
 gate ran 2026-08-18: MCP auth (workspace `omc_` Bearer token) and the OAuth `auth_config`
 contract are canonically defined; the MCP protocol-version pin and Free-tier rate/quota numbers
 await founder ratification. Validated M2 order: cache-eviction events (M2.1, done) → MCP
@@ -32,7 +29,9 @@ health. M2.1 (lifecycle events, ADR-0034) is implemented on `feat/m2-cache-evict
 M2.2 (MCP tools/list, ADR-0035) is implemented on `feat/m22-mcp-tools-list` — the protocol pin
 ({2025-06-18, 2025-11-25} advertising 2025-11-25), the minimal no-FastMCP adapter, and the
 300 s cache TTL were founder-ratified 2026-08-18. M2.3 (MCP tools/call, ADR-0036) is implemented
-on `feat/m23-mcp-tools-call` — the execution bridge over the existing Runtime.
+on `feat/m23-mcp-tools-call` — the execution bridge over the existing Runtime. M2.4 (rate
+limits & quotas, ADR-0037; D1–D5 founder-ratified 2026-08-18) is implemented on
+`feat/m24-rate-limits-quotas`, together with the M2.4-pre DNS remediation.
 
 <details><summary>M1 phase summary (historical)</summary>
 
@@ -100,6 +99,8 @@ _**M1 RELEASED (2026-08-18):** final forensic audit passed; the verified branch 
 _M2.1 (Cache-eviction event foundation, ADR-0034) on `feat/m2-cache-eviction-events`: the five canonical lifecycle events MCP `tools/list` (M2.2) will consume to evict `ws:{workspace_id}:mcp:tools` — `connection.activated` (credential attach), **`connection.deactivated`** (left the active set un-revoked: credential revoke now, OAuth `error` later; founder-ratified 5th eviction event), `connection.revoked` (stamped from the UPDATE's RETURNING), `tool.enabled`/`tool.disabled` (value-guarded UPDATE: no-op PATCH → 200, no row touch, no event). All on the existing bus (ADR-0023): post-commit dispatch, rollback emits nothing, fail-closed tenant-match (ADR-0022), non-secret identifier payloads. **No migration, no new dependency, no MCP code** (the consumer is M2.2). 20 new tests (8 unit + 12 real-Postgres+RLS+real-JWT integration incl. service-level rollback + cross-tenant no-event), 13-mutation audit (9 killed, 4 inert, 0 meaningful survivors), full regression 1332. main untouched._
 
 _M2.2 (MCP tools/list, ADR-0035) on `feat/m22-mcp-tools-list`: the first MCP surface — `POST /mcp/v1/{workspace_slug}` (sessionless Streamable HTTP JSON-RPC; edge maps mcp.omniaiconnect.com/v1/* here). Founder-ratified: protocol allowlist {2025-06-18, 2025-11-25} advertising 2025-11-25 (2026-07-28 excluded until reconciled with the session model); minimal in-house adapter (no FastMCP — re-evaluated at M2.3); cache TTL 300 s. Machine `omc_` tokens only + token/slug binding + browser-origin refusal; `tools/list` = the Runtime-callable set (live+enabled Tools with an active Connection) via one RLS-backed workspace-scoped query, `(created_at,id) DESC`, strict metadata-only projection (name/description/inputSchema/safety hints). Cache-aside `ws:{id}:mcp:tools` (versioned envelope) evicted by the six ADR-0034 events (trusted-envelope tenant), TTL-bounded against at-most-once event loss; Redis outage degrades to Postgres — never an empty list, never an authz input. `initialize`/`ping`/notifications live; `tools/call` = method-not-found until M2.3. **No migration, no new dependency.** 26 new tests (8 protocol unit + 18 real-Postgres+RLS+Redis+real-auth integration; plus a live-stack smoke), 17-mutation audit (15 killed, 2 inert RLS-redundant, 0 meaningful survivors), full regression 1358. main untouched._
+
+_M2.4 (Tool-Call rate limits & quotas, ADR-0037) on `feat/m24-rate-limits-quotas`: the Runtime's stage-3 policy checks — one enforcement point in `RuntimeService.execute` (REST and MCP share one budget structurally; adapters untouched). Atomic Redis Lua token bucket on server-side `TIME` (`ws:{id}:rl:tools`, per-Connection `ws:{id}:rl:conn:{cid}` only when canonical `rate_hints` exist); founder-ratified D1–D5: Free = 60/min burst 10 + 1,000 executed calls/ISO-week (UTC), paid plans unenforced until M3; quota consumes executed calls only (succeeded/failed/timeout, exactly once at audit-write; denials/pre-audit/replays never consume); Redis down → **fail closed** both checks; distinct `quota_exceeded` code (§6.1 row added, dormant exception activated); REST 429+`Retry-After`, MCP `isError` via the existing M2.3 mapping; kill switch `RATE_LIMITING_ENABLED` restores exact pre-M2.4 behavior; §7 general request limiter explicitly deferred (D5). **M2.4-pre** shipped first as its own commit: `core/net.py` maps resolver `gaierror` → `SSRFError` — unresolvable hosts are now audited `ssrf_blocked` denials, closing the M2.3-audit gap. **No migration, no new dependency.** 21 new tests (6 period/plan/hint unit + 1 resolver-injection unit + 13 real-Redis+Postgres+RLS integration + 1 DNS end-to-end incl. cross-surface shared budget, 8-way concurrency admitting exactly the burst, fail-closed outage, idempotency non-consumption) + DNS remediation tests; 16-mutation audit (15 killed, 1 inert bucket-TTL-hygiene, 0 meaningful survivors); full regression 1396. main untouched._
 
 _M2.3 (MCP tools/call, ADR-0036) on `feat/m23-mcp-tools-call`: the execution bridge — `tools/call` translates into the *existing* Execution Runtime (`ToolCallCreate` → `RuntimeService.execute` → MCP tool result). One execution authority: the Runtime alone does authorization, Connection resolution, argument validation, credential decrypt-at-use, SSRF/egress, timeout, audit; the MCP adapter (`interfaces/mcp/execution.py`) is pure translation — no HTTP, no vault/crypto imports (structurally grep-verified), no second audit. Re-authorized at execution time → a stale discovery cache can never authorize a disabled/revoked Tool (mandatory test); cross-tenant execution impossible even given B's Tool name; `workspace_id` in arguments is inert. Error split: unresolvable Tool/ambiguous Connection → JSON-RPC error (uniform "Unknown tool."); audited failures (upstream/timeout/ssrf_blocked/credential/bad-args) → `isError:true` result with the stable code, no target/secret/details leaked. No retries (one attempt); audit tagged `caller.interface="mcp"` (new server-set `RuntimeService(interface=...)`, default "rest"). **No migration, no new dependency.** 17 new tests (4 mapping unit + 13 real-Postgres+RLS+real-auth+real-Runtime integration) + two live E2E runs (real execution + real 169.254.169.254 SSRF rejection), 11-mutation audit (10 killed, 1 inert, 0 meaningful survivors), full regression 1375. main untouched._
 

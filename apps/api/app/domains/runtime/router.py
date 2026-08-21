@@ -103,6 +103,7 @@ async def create_tool_call(
             await idempotency.release(ctx.workspace_id, idem_key)
         raise
 
+    headers: dict[str, str] = {}
     if outcome.result is not None:
         status_code = status.HTTP_200_OK
         body: dict[str, Any] = outcome.result.model_dump(mode="json")
@@ -110,10 +111,17 @@ async def create_tool_call(
         assert outcome.error is not None
         status_code = outcome.error.http_status
         body = _error_body(outcome.error, ctx.request_id)
+        if status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+            # API_GUIDELINES §6.1/§7: 429 responses set Retry-After. The value comes from the
+            # limiter's own non-secret details (bucket refill delay or quota reset horizon).
+            # The general every-response X-RateLimit-* stamping is deferred (D5, ADR-0037).
+            retry_after = (outcome.error.details or {}).get("retry_after_seconds")
+            if isinstance(retry_after, int):
+                headers["Retry-After"] = str(retry_after)
 
     if idem_key is not None:
         await idempotency.complete(ctx.workspace_id, idem_key, digest, status_code, body)
-    return JSONResponse(status_code=status_code, content=body)
+    return JSONResponse(status_code=status_code, content=body, headers=headers)
 
 
 @tool_calls_router.get(

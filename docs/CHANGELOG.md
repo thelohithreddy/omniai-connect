@@ -13,6 +13,29 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Tool-Call rate limits & quotas (M2.4, ADR-0037).** Enforcement lives in the Runtime's
+  stage-3 policy checks — REST and MCP share one budget structurally, adapters unchanged.
+  Atomic Redis Lua token bucket (server-side `TIME`, no app clocks) on the canonical
+  `ws:{workspace_id}:rl:*` namespace; per-Connection buckets only when a Tool's canonical
+  `rate_hints` exist. Founder-ratified Free-plan numbers: 60 Tool Calls/min (burst 10) and a
+  1,000 executed-call ISO-week quota (UTC); paid plans unenforced until M3 billing. Quota
+  consumes **executed** calls only (`succeeded`/`failed`/`timeout`, exactly once at
+  audit-write); denials and pre-audit failures never consume; idempotent replays never
+  re-consume. Denials are audited (`status=denied`) with the stable codes `rate_limited` and
+  the new **`quota_exceeded`** (§6.1 row added); REST returns 429 + `Retry-After`, MCP maps
+  through the existing tools/call contract (`isError: true`). **Redis unavailable → fail
+  closed** for both checks. Kill switch `RATE_LIMITING_ENABLED` restores exact pre-M2.4
+  behavior. The API_GUIDELINES §7 *general* request limiter (every-response `X-RateLimit-*`)
+  is explicitly deferred. No migration, no new dependency.
+
+### Fixed
+
+- **DNS resolution failures are now egress-policy refusals (M2.4-pre).** `core/net.py` maps
+  resolver `socket.gaierror` to `SSRFError("unresolvable-address")`: an unresolvable-host Tool
+  Call is an audited `ssrf_blocked` denial (403 REST / `isError` MCP) instead of an `internal`
+  500 with no audit row — closing the pre-existing M1 gap found in the M2.3 release audit and
+  restoring the "every executed call has an audit row" invariant quota accounting relies on.
+
 - **MCP tools/call (M2.3, ADR-0036).** The execution bridge: `tools/call` on the M2.2 endpoint
   translates into the *existing* Execution Runtime (`ToolCallCreate` → `RuntimeService.execute` →
   MCP tool result) — one execution path, no new engine. The Runtime remains the sole authority

@@ -62,8 +62,20 @@ class ConflictError(DomainError):
     http_status = 409
 
 
-class QuotaExceededError(DomainError):
+class RateLimitedError(DomainError):
+    """Short-window rate exhaustion (M2.4, ADR-0037): the token bucket denied this call.
+    Retryable — `details.retry_after_seconds` drives the `Retry-After` header."""
+
     code = "rate_limited"
+    http_status = 429
+
+
+class QuotaExceededError(DomainError):
+    """Weekly executed-Tool-Call quota exhaustion (M2.4, founder-ratified D4): distinct from
+    `rate_limited` because the reset horizon is days, not seconds — clients deserve to know
+    which one they hit. Activated in M2.4; previously a dormant seam under `rate_limited`."""
+
+    code = "quota_exceeded"
     http_status = 429
 
 

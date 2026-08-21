@@ -151,7 +151,13 @@ def resolve_and_validate(host: str, port: int, resolver: Resolver = _default_res
     one private answer cannot smuggle the private one through). The returned string is a
     literal IP that the caller connects to directly — closing the resolve→connect TOCTOU.
     """
-    records = resolver(host, port)
+    try:
+        records = resolver(host, port)
+    except socket.gaierror as exc:
+        # M2.4-pre: a host that does not resolve (NXDOMAIN, DNS failure) is an egress-policy
+        # refusal like every other unresolvable target — never a raw OS error escaping the
+        # taxonomy as an unaudited 500. Same fail-closed shape as a malformed literal address.
+        raise SSRFError("unresolvable-address") from exc
     if not records:
         raise SSRFError("no-address")
     validated: list[str] = []
