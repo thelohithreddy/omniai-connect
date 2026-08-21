@@ -247,8 +247,7 @@ def upgrade() -> None:
     )
     op.execute(
         sa.text(
-            "GRANT EXECUTE ON FUNCTION auth.due_oauth_refreshes(integer, integer)"
-            f" TO {APP_ROLE}"
+            f"GRANT EXECUTE ON FUNCTION auth.due_oauth_refreshes(integer, integer) TO {APP_ROLE}"
         )
     )
 
