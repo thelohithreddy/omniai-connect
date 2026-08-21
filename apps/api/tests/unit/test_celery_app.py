@@ -76,7 +76,16 @@ def test_arbitrary_queues_are_not_auto_created() -> None:
     assert celery_app.conf.task_create_missing_queues is False
 
 
-def test_the_demo_tasks_are_registered() -> None:
+def test_the_registered_tasks_are_exactly_the_declared_set() -> None:
+    """The registry is asserted exactly, so a task added without review fails here.
+
+    Both task modules are imported explicitly rather than relying on whichever tests ran first:
+    Celery registers a task at import time, so an implicit import elsewhere in the suite would
+    otherwise make this assertion order-dependent.
+    """
+    import app.workers.oauth_tasks  # noqa: F401
+    import app.workers.tasks  # noqa: F401
+
     names = {t for t in celery_app.tasks if t.startswith("workers.")}
     assert names == {
         "workers.ping",
@@ -84,6 +93,8 @@ def test_the_demo_tasks_are_registered() -> None:
         "workers.retry_probe",
         "workers.count_visible_connectors",  # B0.3 tenant-boundary demo task
         "workers.ingest_connector_spec",  # B1.1 connector ingestion pipeline
+        "workers.oauth.sweep_refreshes",  # M2.5 refresh discovery (runtime queue)
+        "workers.oauth.refresh_credential",  # M2.5 per-credential refresh (runtime queue)
     }
 
 
