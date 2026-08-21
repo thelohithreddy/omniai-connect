@@ -8,8 +8,22 @@
 
 ## Current phase
 
-**M2 — MCP Interface, credential vault, OAuth: IN PROGRESS.** **M2.5 (OAuth 2.0) is RELEASED to
-`main`** as the `--no-ff` merge `82cd651` (2026-08-21; implementation `f3d7e35`, audited tree
+**M2 — MCP Interface, credential vault, OAuth: IN PROGRESS.** **M2.6 (Credential Vault Hardening,
+ADR-0039; A1/A2/A3/P1/P2 founder-ratified 2026-08-22) is implemented on
+`feat/m26-vault-hardening`** — the four ROADMAP §56 vault deliverables: a multi-version local KEK
+keyring behind a stable `KeyProvider` seam (no KMS, per ratified A1), HKDF-derived per-workspace
+data keys with **version 1 preserved as M1's direct-KEK wrapping forever** (so the hierarchy
+arrives *as* a rotation instead of orphaning every stored credential), the five-step rotation
+runbook with retirement gated on a database `COUNT(key_version < target) = 0`, a vault access audit
+as structured logs + a bounded counter, and redaction extended to the **stdlib logging tree** in all
+four deployed processes — a gap verified leaking `api_key=…` from `celery.worker` before the fix.
+Migration 0014 is additive (two SECURITY DEFINER functions + a `key_version` index; no table, no
+column). 1516 tests green, 24-mutation audit (23 killed, 1 empirically-proven inert, 0 meaningful
+survivors), EC3 red-team pass finding **zero** plaintext across every table, the log stream, and
+Celery arguments. Default configuration is behaviourally identical to M2.5. Not yet promoted to
+`main`.
+
+**M2.5 (OAuth 2.0) is RELEASED to `main`** as the `--no-ff` merge `82cd651` (2026-08-21; implementation `f3d7e35`, audited tree
 `d568022`, tree byte-identical to the audited SHA), after an independent adversarial release audit:
 post-merge CI 4/4 green, 1457 regression tests, independent mutation subset 7/7 killed (0
 survivors) on top of the implementation's 18-mutation audit, Gitleaks clean, `alembic check` clean
@@ -41,7 +55,12 @@ M2.2 (MCP tools/list, ADR-0035) is implemented on `feat/m22-mcp-tools-list` — 
 on `feat/m23-mcp-tools-call` — the execution bridge over the existing Runtime. M2.4 (rate
 limits & quotas, ADR-0037; D1–D5 founder-ratified 2026-08-18) is implemented on
 `feat/m24-rate-limits-quotas`, together with the M2.4-pre DNS remediation. M2.5 (OAuth 2.0,
-ADR-0038; its own D1–D5 ratified 2026-08-21) is implemented on `feat/m25-oauth2`.
+ADR-0038; its own D1–D5 ratified 2026-08-21) is implemented on `feat/m25-oauth2`. M2.6 (credential
+vault hardening, ADR-0039; A1/A2/A3/P1/P2 ratified 2026-08-22) is implemented on
+`feat/m26-vault-hardening`.
+
+**M2 is NOT complete after M2.6.** Remaining: Connection Health (test-call, status states, Resend
+notifications), MCP streaming transport + `listChanged`, and `client_credentials` (P1).
 
 <details><summary>M1 phase summary (historical)</summary>
 

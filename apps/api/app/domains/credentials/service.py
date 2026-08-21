@@ -66,7 +66,7 @@ class CredentialService:
             ciphertext=b"",
             encrypted_dek=b"",
             nonce=b"",
-            key_version=vault.KEY_VERSION,
+            key_version=vault.active_key_version(),
         )
         await self._seal_into(credential, payload)
         await self._repository.insert(credential)  # 409 if the connection already has one
@@ -134,7 +134,7 @@ class CredentialService:
                 ciphertext=b"",
                 encrypted_dek=b"",
                 nonce=b"",
-                key_version=vault.KEY_VERSION,
+                key_version=vault.active_key_version(),
             )
         credential.credential_type = "oauth2"
         credential.ciphertext = sealed.ciphertext

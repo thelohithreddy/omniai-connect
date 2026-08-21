@@ -85,6 +85,7 @@ def test_the_registered_tasks_are_exactly_the_declared_set() -> None:
     """
     import app.workers.oauth_tasks  # noqa: F401
     import app.workers.tasks  # noqa: F401
+    import app.workers.vault_tasks  # noqa: F401
 
     names = {t for t in celery_app.tasks if t.startswith("workers.")}
     assert names == {
@@ -95,6 +96,8 @@ def test_the_registered_tasks_are_exactly_the_declared_set() -> None:
         "workers.ingest_connector_spec",  # B1.1 connector ingestion pipeline
         "workers.oauth.sweep_refreshes",  # M2.5 refresh discovery (runtime queue)
         "workers.oauth.refresh_credential",  # M2.5 per-credential refresh (runtime queue)
+        "workers.vault.sweep_key_rotations",  # M2.6 re-wrap discovery (runtime queue)
+        "workers.vault.rewrap_credential_key",  # M2.6 per-credential re-wrap (runtime queue)
     }
 
 
@@ -102,7 +105,11 @@ def test_the_worker_autodiscovers_tasks_via_include() -> None:
     """The worker imports the tasks module via `include` at startup. This test imports `tasks`
     itself (above), which would mask an empty `include`, so the config the *worker* actually
     uses is asserted directly — an empty include means a worker that registers nothing."""
-    assert celery_app.conf.include == ["app.workers.tasks", "app.workers.oauth_tasks"]
+    assert celery_app.conf.include == [
+        "app.workers.tasks",
+        "app.workers.oauth_tasks",
+        "app.workers.vault_tasks",
+    ]
 
 
 # ------------------------------------------------------------------ bounded execution / retry
@@ -153,3 +160,24 @@ def eager() -> Iterator[None]:
 
 def test_ping_executes_and_returns_the_nonce(eager: None) -> None:
     assert tasks.ping.apply(args=["abc123"]).get() == {"pong": "abc123"}
+
+
+# ------------------------------------------------------------------ scheduler (M2.5, M2.6)
+
+
+def test_the_beat_schedule_is_exactly_the_declared_periodic_work() -> None:
+    """Asserted exactly, so periodic work cannot be added without review. Anything scheduled here
+    runs unattended against every tenant, which is the highest-blast-radius thing this app does."""
+    assert set(celery_app.conf.beat_schedule) == {
+        "oauth-refresh-sweep",
+        "vault-key-rotation-sweep",
+    }
+
+
+def test_scheduled_sweeps_run_on_the_runtime_queue_and_expire() -> None:
+    """`expires` matters: without it a tick queued during an outage replays on recovery, stacking
+    duplicate sweeps at exactly the moment the system is least able to absorb them. A missed sweep
+    is worthless anyway — the next one discovers the same work."""
+    for name, entry in celery_app.conf.beat_schedule.items():
+        assert entry["options"]["queue"] == RUNTIME_QUEUE, name
+        assert entry["options"]["expires"] == entry["schedule"], name

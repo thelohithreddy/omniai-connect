@@ -53,6 +53,25 @@ class CredentialRepository:
         credential: Credential | None = await self._session.scalar(stmt)
         return credential
 
+    async def credential_for_update(self, credential_id: uuid.UUID) -> Credential | None:
+        """One Credential by id, row-locked for the transaction (M2.6 key rotation, ADR-0039).
+
+        The re-wrap sweep locks the credential itself rather than its Connection: it is the only
+        writer that targets a Credential by its own id, and it must serialize against an attach /
+        rotate / OAuth refresh re-sealing the same row with a fresh DEK. Workspace-scoped like
+        every other statement here — a foreign id is simply not found, even for a platform job.
+        """
+        stmt = (
+            select(Credential)
+            .where(
+                Credential.id == credential_id,
+                Credential.workspace_id == self._ctx.workspace_id,
+            )
+            .with_for_update()
+        )
+        credential: Credential | None = await self._session.scalar(stmt)
+        return credential
+
     async def insert(self, credential: Credential) -> Credential:
         """Persist a new Credential. The unique `(connection_id)` index is the DB arbiter that a
         connection has at most one credential; a violation surfaces as a `ConflictError`."""

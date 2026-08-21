@@ -50,13 +50,66 @@ is the only code allowed to touch plaintext secrets.
   material is encrypted with its data key; the data key is then wrapped (encrypted) by the
   master key and stored alongside the ciphertext. Nonce is random per encryption and never
   reused with the same key; the GCM auth tag is stored and verified on every decrypt.
-- **Master key:** environment-provided (`CREDENTIAL_MASTER_KEY`) today; migrates to a KMS
-  (wrapping happens inside the KMS, key never leaves it) when we harden for Team/Enterprise.
-  Because only the *wrapped data keys* depend on the master key, rotation re-wraps data
-  keys without re-encrypting payloads.
-- **Key rotation:** every wrapped data key records the master key version. Rotation
-  runbook: introduce new master key version → background job re-wraps all data keys →
-  retire old version. Per-Credential data keys rotate on credential update.
+- **Master key (KEK):** environment-provided, and since M2.6 a **versioned keyring**:
+  `CREDENTIAL_MASTER_KEY` is version 1 permanently (rows stamped `key_version = 1` were wrapped
+  by it directly, so its meaning can never be reassigned) and `CREDENTIAL_MASTER_KEYS` supplies
+  versions ≥ 2 as `version:base64key`. `CREDENTIAL_KEY_VERSION` selects which version seals *new*
+  credentials; every version in the keyring still *decrypts*. Fail-closed on a missing, default,
+  malformed, wrong-length, duplicated, or unknown-active version — the API refuses to boot rather
+  than operate with a hole in the keyring. Migrates to a KMS (wrapping happens inside the KMS, key
+  never leaves it) when we harden for Team/Enterprise; because only the *wrapped data keys* depend
+  on the master key, that is a new `KeyProvider` implementation plus a re-wrap pass, with no schema
+  change and no ciphertext rewrite.
+- **Workspace keys (M2.6):** a data key is not wrapped by the KEK directly (except at version 1,
+  see above). It is wrapped by a **per-workspace key derived with HKDF-Expand** (RFC 5869 — the
+  Extract step is correctly skipped because the KEK is already a uniformly random 256-bit key),
+  domain-separated by a fixed label, the key version, and the workspace UUID. The key is never
+  stored and never logged; it is recomputed on demand. Effect: a wrapped data key from one
+  workspace is cryptographically useless in another **even if the AAD check above it were
+  bypassed**, so tenant isolation survives a bug in the application layer.
+
+#### Key rotation runbook
+
+Every wrapped data key records its KEK version. Rotation is **annual as routine, immediate on
+compromise**, and runs in five ordered steps. Per-Credential data keys additionally rotate on
+credential update.
+
+1. **INTRODUCE** — add the new version to `CREDENTIAL_MASTER_KEYS` and set
+   `CREDENTIAL_KEY_VERSION` to it. New credentials seal under it immediately; **the old version
+   stays in the keyring**, so every existing credential keeps working. There is no cutover moment
+   and no window in which live traffic fails.
+2. **RE-WRAP** — the `vault-key-rotation-sweep` beat task discovers credentials below the target
+   (`auth.pending_key_rotations`) and fans out one `rewrap_credential_key` task each, carrying
+   **identifiers only**. Each re-wrap unwraps the data key under its own version and re-wraps it
+   under the target, under a row lock. **The payload is never decrypted and never rewritten** —
+   `ciphertext` and `nonce` are byte-identical afterwards — so an interrupted rotation cannot
+   corrupt a secret. Target: complete within **24 hours**.
+3. **PROVE COMPLETION** — `auth.count_credentials_below_key_version(target)` must return **0**.
+   The database is the authority. Never conclude a rotation is complete because a timer elapsed,
+   the scheduler reported success, or a batch appeared to finish. The sweep logs this number as
+   `pending` on every tick, so it is answerable from logs.
+4. **OVERLAP** — hold the old version in the keyring for at least **7 days** after the count
+   reaches zero, as insurance against a straggler, a restored backup, or a replica lagging.
+5. **RETIRE** — only now remove the old version from `CREDENTIAL_MASTER_KEYS`. Retiring while any
+   row still depends on it makes that row **permanently unreadable**. If it happens anyway, the
+   failure is loud and specific: `VaultKeyVersionError`, audited as `key_unavailable` rather than
+   as tampering, because the two demand opposite responses — restore the key versus investigate an
+   attack.
+
+**Rollback.** Steps 1–2 are reversible at any time by lowering `CREDENTIAL_KEY_VERSION`; already
+re-wrapped rows stay readable because their version remains in the keyring, and the sweep never
+moves a row *down*. `CREDENTIAL_ROTATION_ENABLED=false` pauses re-wrapping without weakening any
+sealed credential. The only irreversible step is 5, which is why 3 and 4 gate it.
+
+#### Vault access audit (M2.6)
+
+Every credential decrypt — success **and** each distinct failure — is recorded at the single
+decrypt boundary as a structured log event (`vault.credential_opened` /
+`vault.credential_open_failed`) carrying workspace, connection, credential, credential type, key
+version, and a classified outcome, plus a **bounded** counter whose labels are drawn from closed
+sets so cardinality cannot grow with tenants. No new table and no second audit ledger: the log
+platform holds per-event detail, the counter holds the aggregate. The record itself never contains
+plaintext, ciphertext, key material, or an exception body.
 
 ### 2.2 Decryption boundary
 
@@ -77,8 +130,23 @@ Defense-in-depth so a bug cannot leak a secret through observability:
 
 - A structlog processor scrubs known secret fields (`authorization`, `api_key`, `token`,
   `secret`, `password`, plus registered per-Connector credential field names) from every
-  log event before emission.
-- Sentry `before_send` runs the same scrubber over event payloads and breadcrumbs.
+  log event before emission. It also scrubs `marker=value` patterns **inside strings**, because
+  a secret echoed by an upstream API arrives as exception text where no key exists to match on;
+  the processor therefore runs *after* `format_exc_info`, not before.
+- **Every deployed process covers the stdlib logging tree too (M2.6).** structlog writes through
+  `PrintLoggerFactory` and never touches stdlib, so records from libraries — Celery logging a
+  failed task *with its arguments*, SQLAlchemy logging a statement, httpx, uvicorn — previously
+  went out unscrubbed. Redaction is now installed at `Logger.makeRecord`, which is the only hook
+  that sees the rendered message, the exception text, *and* `extra={...}` fields, and which covers
+  loggers a library configures with `propagate = False`. `configure_logging()` installs it, and is
+  called at import by the API and by `workers/celery_app.py` — the entry point for the **worker,
+  worker-runtime, and scheduler** containers alike.
+- **Reference identifiers survive redaction.** A key ending in `_id` whose value is a UUID is kept:
+  `credential_id` contains "credential" and `api_token_id` contains "token", so the broad marker
+  match was rendering audit records as *"someone opened «redacted»"*. Both conditions are required,
+  so `token_id="sk-live-…"` is still redacted.
+- Sentry is **not deployed**; when it is, `before_send` must run the same scrubber over event
+  payloads and breadcrumbs. Do not treat this bullet as coverage until that process exists.
 - API response serialization goes through Pydantic schemas that simply do not contain
   secret fields — redaction is the backstop, omission is the design.
 - Tool Call audit rows store request/response *metadata* (status, latency, sizes, tool,

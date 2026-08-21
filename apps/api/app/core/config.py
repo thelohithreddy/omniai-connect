@@ -125,8 +125,28 @@ class Settings(BaseSettings):
     # Server-enforced invitation lifetime. 7 days per the ratified contract.
     invitation_expiry_days: int = 7
 
-    # --- Encryption (credential vault — SECURITY.md §2.1) ---
+    # --- Encryption (credential vault — SECURITY.md §2.1; hardened M2.6, ADR-0039) ---
+    # KEK **version 1**, and the only key M1 knew. Its historical meaning is fixed forever: rows
+    # stamped `key_version = 1` were wrapped by this key directly, so it can never be reassigned.
     credential_master_key: SecretStr = SecretStr("change-me")
+    # Additional KEK versions for the rotation runbook (SECURITY.md §2.1), as a comma-separated
+    # `version:base64key` list — e.g. "2:AAAA...". Versions **≥ 2** only; declaring 1 here is a
+    # boot failure, because version 1 already means `credential_master_key` and a second answer
+    # for the same version is how a rotation silently destroys data. Empty = single-key operation.
+    credential_master_keys: SecretStr = SecretStr("")
+    # Which version seals NEW credentials. During an overlap window every version in the keyring
+    # still *decrypts*; only this one *encrypts*. Must exist in the keyring or the vault fails
+    # closed at startup — a typo here would otherwise mint unreadable ciphertext.
+    credential_key_version: int = 1
+    # Kill switch for the re-wrap sweep — an operational lever, never a security one: pausing it
+    # only leaves credentials at an older key version, which stays readable for as long as that
+    # version is in the keyring. It cannot weaken an already-sealed credential.
+    credential_rotation_enabled: bool = True
+    # How often the re-wrap sweep ticks. Derived, not chosen: the ratified runbook gives a 24h
+    # re-wrap target, and one tick schedules at most `ROTATION_BATCH_LIMIT` (500) credentials, so
+    # a 300 s tick sustains ~144k re-wraps/day — comfortably inside 24h at any plausible scale.
+    # Idle cost is one indexed COUNT, so this is cheap when no rotation is in progress.
+    credential_rotation_sweep_seconds: float = 300.0
 
     # --- Frontend ---
     next_public_app_url: str = "http://localhost:3000"

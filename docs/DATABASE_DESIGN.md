@@ -175,9 +175,14 @@ An encrypted secret bound to a Connection — radioactive per Bible tenet 2. Col
 `id`, `workspace_id`, `connection_id`, `credential_type`
 (`api_key|bearer|basic|jwt|oauth2|custom_headers`), `ciphertext bytea NOT NULL`
 (AES-256-GCM envelope-encrypted blob), `encrypted_dek bytea NOT NULL` (data key wrapped
-by the master KEK), `key_version int NOT NULL` (which KEK wrapped the DEK — enables
-rotation), `nonce bytea NOT NULL`, `expires_at NULL` (OAuth token expiry, drives the
-refresh worker), `rotated_at NULL`, timestamps. **Plaintext never touches this table,
+by its workspace-derived key), `key_version int NOT NULL` (which KEK version wrapped the
+DEK — drives rotation; **version 1 means the M1 scheme, where the DEK is wrapped by the KEK
+directly**, and 2+ means it is wrapped by an HKDF-derived per-workspace key. Indexed, because the
+re-wrap sweep and the retirement gate both ask `key_version < target` across every tenant at once —
+the one index here that cannot lead with `workspace_id`), `nonce bytea NOT NULL`, `expires_at NULL`
+(OAuth token expiry, drives the refresh worker), `rotated_at NULL` (set when the *secret* is
+re-sealed — a key re-wrap deliberately does not stamp it, or an operational rotation would look
+like a customer credential rotation in every audit view), timestamps. **Plaintext never touches this table,
 logs, or API responses**; decryption happens only inside the Execution Runtime
 (AI_RUNTIME.md). No soft delete — revocation deletes the row.
 
