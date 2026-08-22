@@ -32,6 +32,13 @@ CONNECTION_ACTIVATED = "connection.activated"
 CONNECTION_DEACTIVATED = "connection.deactivated"
 CONNECTION_REVOKED = "connection.revoked"
 
+#: M2.10 (ADR-0041). A completed health check found the Connection unusable. Like every event here
+#: it is tied to a persisted change — the check stamped `last_health_check_at` — not to a method
+#: call, so a refused or unevaluated check (no stamp) emits nothing. It is deliberately **not** an
+#: MCP cache-eviction event: a failing provider does not change which Tools are discoverable, and
+#: adding it to the eviction set would flush a workspace's listing on every transient upstream blip.
+CONNECTION_HEALTH_CHECK_FAILED = "connection.health_check_failed"
+
 
 def connection_activated(
     workspace_id: uuid.UUID, *, connection_id: uuid.UUID, connector_id: uuid.UUID
@@ -76,11 +83,33 @@ def connection_revoked(
     )
 
 
+def connection_health_check_failed(
+    workspace_id: uuid.UUID,
+    *,
+    connection_id: uuid.UUID,
+    reason: str,
+) -> Event:
+    """A completed health check found this Connection unusable (M2.10).
+
+    `reason` is the Runtime's **stable error code** — an enumerated token such as `upstream_error`
+    or `timeout` — never `str(exception)`, which for an upstream failure can carry provider text and
+    with it a leaked secret. It rides in the payload so the notification can name a cause without
+    the subscriber re-reading the audit ledger.
+    """
+    return Event(
+        event_type=CONNECTION_HEALTH_CHECK_FAILED,
+        workspace_id=workspace_id,
+        payload={"connection_id": str(connection_id), "reason": reason},
+    )
+
+
 __all__ = [
     "CONNECTION_ACTIVATED",
     "CONNECTION_DEACTIVATED",
+    "CONNECTION_HEALTH_CHECK_FAILED",
     "CONNECTION_REVOKED",
     "connection_activated",
     "connection_deactivated",
+    "connection_health_check_failed",
     "connection_revoked",
 ]

@@ -29,6 +29,7 @@ from app.domains.connectors.router import connectors_router
 from app.domains.connectors.subscribers import register_connector_subscribers
 from app.domains.credentials.router import credentials_router
 from app.domains.credentials.vault import validate_master_key_configured
+from app.domains.notifications.subscribers import register_notification_subscribers
 from app.domains.oauth.router import oauth_router
 from app.domains.runtime.router import tool_calls_router
 from app.domains.tools.router import tools_router
@@ -78,6 +79,10 @@ if settings.is_production:
 register_connector_subscribers()
 # MCP tools-cache eviction (M2.2): the six lifecycle events → evict `ws:{id}:mcp:tools`.
 register_mcp_subscribers()
+# Connection Health failure notifications (M2.10, ADR-0041). Registered here for the health-check
+# path, which runs in this process; the OAuth path runs in the worker, whose own composition root
+# (`workers/celery_app.py`) registers the same handlers. Both are required.
+register_notification_subscribers()
 
 
 def _envelope(

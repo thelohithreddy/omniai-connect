@@ -65,7 +65,12 @@ celery_app = Celery(
     broker=settings.resolved_celery_broker_url,
     # Deterministic, explicit task registration — no import-time autodiscovery magic
     # (CONNECTOR_SPECIFICATION §15 registration discipline).
-    include=["app.workers.tasks", "app.workers.oauth_tasks", "app.workers.vault_tasks"],
+    include=[
+        "app.workers.tasks",
+        "app.workers.oauth_tasks",
+        "app.workers.vault_tasks",
+        "app.workers.notification_tasks",
+    ],
 )
 
 celery_app.conf.update(
@@ -116,6 +121,31 @@ celery_app.conf.update(
     broker_connection_retry_on_startup=True,
     worker_hijack_root_logger=False,
 )
+
+
+def _register_worker_subscribers() -> None:
+    """The worker's event-bus composition root (M2.10).
+
+    `app/main.py` registers subscribers for the **API** process; nothing did so for the worker, so
+    until now every event published inside a Celery task dispatched to an empty handler map. That
+    is invisible for the MCP eviction handler — the listing's TTL bounds a lost eviction by design
+    (ADR-0035 §5) — but it would be fatal here: `connection.deactivated` is published by the OAuth
+    refresh worker, *in this process*, and it is the unattended failure the whole notification
+    feature exists for.
+
+    Deliberately only the notification subscribers. Registering MCP's eviction handler here would
+    change caching behaviour in a process that has never had it, which is out of M2.10's scope; the
+    gap is recorded rather than quietly fixed.
+
+    Imported inside the function because `app.domains.notifications.subscribers` reaches back into
+    `app.workers.notification_tasks`, which imports this module.
+    """
+    from app.domains.notifications.subscribers import register_notification_subscribers
+
+    register_notification_subscribers()
+
+
+_register_worker_subscribers()
 
 
 __all__ = [

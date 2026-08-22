@@ -4,7 +4,7 @@
 > AI engineers: read this at session start (per CLAUDE.md). Detail lives in the linked
 > docs — this file is the dashboard, not the archive.
 >
-> **Last updated:** 2026-08-18 · **Updated by:** CTO Agent
+> **Last updated:** 2026-08-22 · **Updated by:** CTO Agent
 
 ## Current phase
 
@@ -78,10 +78,29 @@ discovery function itself**. The production scheduler wrapper, the real discover
 
 **EC1 does not make M2 complete.** Connection Health notifications remain DEFERRED and BLOCKED BY ADR-0014; MCP streaming and `listChanged` remain DEFERRED; OAuth `client_credentials` remains DEFERRED; dashboard/UI is M3; F2 (Tool-name resolution) stays a pre-existing Runtime hardening item; M3 is NOT STARTED.
 
+**M2.10 (Connection Health failure notifications, ADR-0042) is IMPLEMENTED on
+`feat/m210-health-notifications` — NOT audited, NOT promoted.** ROADMAP §58's last unimplemented
+clause. Migration `0015` adds one nullable `workspaces.notification_email VARCHAR(320)`; **ADR-0014 is
+unchanged** — no identity access, no SECURITY DEFINER function, no `user_id → email` primitive. The
+address is one a human typed, reusing ADR-0017's ratified `invitations.invited_email` pattern, and the
+recipient contract is explicitly *"the Workspace's declared notification destination"* rather than
+"Owners and Admins". Configuration is OWNER-only (`workspace:manage`, its first enforcement anywhere).
+Two triggers — a failing health check and the OAuth worker's `connection.deactivated(status="error")`
+— converge on one service, one Redis key space and one template; platform refusals stay `unknown` and
+never notify; there is no recovery email. Dedup is `SET NX GET EX 86400`, giving **exactly one winner
+within the TTL window, not durable exactly-once delivery**; the task id owns the claim so a retry
+re-enters its own window while another worker is refused. It also closed a latent gap: the Celery
+worker had **no event-bus composition root**, so every event published in a task dispatched to nobody.
+1717 tests green, 37-mutation audit, two defects found and fixed by the tests (an unbounded
+destination reaching `VARCHAR(320)` as a 500, and a malformed identifier crashing into the retry
+ladder). Awaiting independent release audit.
+
 **M2 completion tracker.** MCP tools/list DONE · MCP tools/call DONE · rate limits & quotas DONE ·
 OAuth auth-code + PKCE DONE · OAuth refresh DONE · OAuth runtime injection DONE · vault hardening
-DONE · **Connection Health core DONE, notifications DEFERRED (ADR-0014)** · MCP streaming DEFERRED · MCP `listChanged` DEFERRED ·
-OAuth `client_credentials` DEFERRED · M3 NOT STARTED. **M2 is therefore NOT COMPLETE.**
+DONE · **Connection Health core DONE; notifications IMPLEMENTED, awaiting audit + promotion** · MCP
+streaming DEFERRED · MCP `listChanged` DEFERRED · OAuth `client_credentials` DEFERRED · M3 NOT
+STARTED. **M2 is therefore NOT COMPLETE** — notifications are not released, and M2 completion also
+depends on the separately-tracked EC3 and §55 decisions.
 
 **M2.5 (OAuth 2.0) is RELEASED to `main`** as the `--no-ff` merge `82cd651` (2026-08-21; implementation `f3d7e35`, audited tree
 `d568022`, tree byte-identical to the audited SHA), after an independent adversarial release audit:

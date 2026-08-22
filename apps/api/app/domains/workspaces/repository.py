@@ -54,6 +54,31 @@ class WorkspaceRepository:
         workspace: Workspace | None = await self._session.scalar(stmt)
         return workspace
 
+    async def set_notification_email(self, email: str | None) -> tuple[bool, str | None]:
+        """Set (or clear) this Workspace's notification destination.
+
+        Returns `(matched, stored_value)`. The boolean is separate because `None` is a legitimate
+        *stored* value — it is how an owner disables notifications — so a bare `str | None` could
+        not distinguish "cleared" from "no such workspace", and the second must not report success.
+
+        Scoped on `id == ctx.workspace_id` in the statement itself, so the tenant predicate is part
+        of the mutation rather than a property of whatever the caller happened to load — the same
+        reason `get_current` filters explicitly even under RLS (DATABASE_DESIGN §6). The context's
+        workspace is server-derived, so no request field can reach this predicate and an UPDATE
+        here cannot be aimed at another tenant.
+        """
+        stmt = (
+            update(Workspace)
+            .where(Workspace.id == self._ctx.workspace_id)
+            .values(notification_email=email)
+            .returning(Workspace.notification_email)
+        )
+        row = (await self._session.execute(stmt)).first()
+        if row is None:
+            return False, None
+        stored: str | None = row[0]
+        return True, stored
+
 
 class ApiTokenRepository:
     def __init__(self, session: AsyncSession, ctx: WorkspaceContext) -> None:

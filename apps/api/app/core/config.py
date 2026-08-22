@@ -106,6 +106,20 @@ class Settings(BaseSettings):
     # Connection — health is a read-only observation plus one timestamp.
     connection_health_enabled: bool = True
 
+    # --- Connection Health failure notifications (M2.10, ROADMAP §58, ADR-0041) ---
+    # Kill switch for notification *delivery* only. False stops mail; it never changes a health
+    # verdict, a timestamp, or an audit row, because notification has no authority over health.
+    connection_health_notifications_enabled: bool = True
+    # The dedup window: at most one notification winner per Connection per failure event type
+    # within this many seconds. Ratified at 24 h (ADR-0041 §8). This is the notification *cadence*
+    # — a deliberate bound, not an accident — and it is NOT durable exactly-once delivery: a Redis
+    # flush or eviction re-arms the key and permits one duplicate (ADR-0041 §9).
+    health_notification_dedup_ttl_seconds: int = 86_400
+    # The From address for failure notifications. A plain str, not a secret: it appears in every
+    # message header. Separate from `invitation_from_email` so alerts and invitations can be
+    # diagnosed — and throttled at the provider — independently.
+    notification_from_email: str = "OmniAI Connect <alerts@omni.example>"
+
     # --- Auth (Better Auth — provider in apps/web per ADR-0002/0014; verified here per
     # ADR-0015) ---
     better_auth_secret: SecretStr = SecretStr("change-me-32-chars-minimum")

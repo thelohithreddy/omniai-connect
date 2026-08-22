@@ -17,6 +17,7 @@ import pytest
 import structlog
 from pydantic import ValidationError
 
+from app.core import events as events_module
 from app.core.db import UnitOfWork, WorkspaceNotBoundError
 from app.core.events import (
     MAX_DISPATCH_DEPTH,
@@ -240,10 +241,23 @@ async def test_publish_without_a_bound_transaction_fails_closed() -> None:
 # ------------------------------------------------------------------ secret-safe logging
 
 
-async def test_a_handler_failure_logs_identifiers_only_never_the_payload() -> None:
+async def test_a_handler_failure_logs_identifiers_only_never_the_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The isolation log records the non-secret envelope identifiers and *not* the payload —
     so a secret a domain accidentally placed in a payload cannot ride a handler traceback out
-    to the logs (§34: zero raw event payload dumps)."""
+    to the logs (§34: zero raw event payload dumps).
+
+    The module's `log` is replaced with a **fresh proxy inside** the capture block, and that is
+    load-bearing rather than tidiness. `configure_logging()` sets `cache_logger_on_first_use=True`
+    — correct in production, where logging is configured once at startup — which means the
+    module-level proxy binds permanently the first time anything logs through it. Any earlier test
+    in the session that causes a handler to fail (M2.10's notification suite does exactly that,
+    legitimately) binds it against the real processor chain, and `capture_logs` then sees nothing:
+    the assertions below would silently observe an empty list. Binding a fresh proxy while the
+    capturing configuration is active makes this test independent of what ran before it. Same
+    remedy as the M2.6 vault-audit suite, for the same reason.
+    """
     bus = EventBus()
 
     def boom(_e: Event) -> None:
@@ -252,6 +266,7 @@ async def test_a_handler_failure_logs_identifiers_only_never_the_payload() -> No
     bus.subscribe("connector.ingested", boom)
     leaked_marker = "sk-must-not-appear"  # noqa: S105 (a fake marker, not a real credential)
     with structlog.testing.capture_logs() as logs:
+        monkeypatch.setattr(events_module, "log", structlog.get_logger("app.core.events"))
         await bus.dispatch([_event(payload={"api_key": leaked_marker})])
 
     failed = [e for e in logs if e.get("event") == "event.handler_failed"]

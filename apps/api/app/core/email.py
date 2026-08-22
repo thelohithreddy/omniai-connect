@@ -89,3 +89,21 @@ def get_email_sender() -> EmailSender:
         api_key=settings.resend_api_key.get_secret_value(),
         from_address=settings.invitation_from_email,
     )
+
+
+def get_notification_email_sender() -> EmailSender:
+    """The sender for Connection Health notifications (M2.10, ADR-0041).
+
+    The same transport with a different `From`: an operational alert should not arrive from an
+    address named "invites", and separating them means a deliverability problem with one class of
+    mail can be diagnosed — and if necessary suppressed at the provider — without touching the
+    other.
+
+    Unlike `get_email_sender` this is called from a **Celery task**, where FastAPI's
+    `dependency_overrides` does not exist. Tests substitute a capturing sender by monkeypatching
+    this name in the task module, which is the same seam the OAuth worker tests already use.
+    """
+    return ResendEmailSender(
+        api_key=settings.resend_api_key.get_secret_value(),
+        from_address=settings.notification_from_email,
+    )
