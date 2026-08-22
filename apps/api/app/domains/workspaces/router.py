@@ -46,6 +46,8 @@ from app.domains.workspaces.schemas import (
     MemberRoleUpdate,
     MembershipList,
     MembershipRead,
+    WorkspaceNotificationSettings,
+    WorkspaceNotificationUpdate,
     WorkspaceRead,
 )
 from app.domains.workspaces.service import (
@@ -81,6 +83,13 @@ AuthorizedTokenAdmin = Annotated[
 #: callable, so a second construction would run the membership lookup twice per request.
 AuthorizedMemberAdmin = Annotated[
     WorkspaceContext, Depends(require_permission(Permission.MEMBERS_MANAGE))
+]
+
+#: `workspace:manage` — OWNER only (authz.py's matrix, transcribed from SECURITY.md §4.1). Built
+#: once for the same dependency-cache reason as the two above. This is the permission's **first**
+#: enforcement anywhere in the API: it was transcribed in M1.2-D and, until M2.10, guarded nothing.
+AuthorizedWorkspaceAdmin = Annotated[
+    WorkspaceContext, Depends(require_permission(Permission.WORKSPACE_MANAGE))
 ]
 
 
@@ -130,8 +139,74 @@ async def get_current_workspace(
 
     The canonical "does my token work?" probe: it exercises token resolution, tenant
     binding, RLS, and the response envelope in one call.
+
+    Deliberately does **not** carry `notification_email`. This endpoint authenticates with
+    `CurrentWorkspace`, which every machine token satisfies, so a field added here is a field
+    handed to every MCP client holding a workspace token. The destination is read through the
+    `workspace:manage` endpoint below instead (M2.10, ADR-0041).
     """
     return WorkspaceRead.model_validate(await service.get_current())
+
+
+def get_workspace_admin_service(
+    uow: Annotated[UnitOfWork, Depends(get_uow)],
+    ctx: AuthorizedWorkspaceAdmin,
+) -> WorkspaceService:
+    """Composition root for the OWNER-only workspace-configuration endpoints.
+
+    Identical to `get_workspace_service` except for the dependency that produces the context:
+    resolving `AuthorizedWorkspaceAdmin` here means authorization runs *before* the service — and
+    therefore before any query — rather than inside a handler that could forget to ask.
+    """
+    return WorkspaceService(WorkspaceRepository(uow.session, ctx))
+
+
+@router.get(
+    "/me/notification-settings",
+    response_model=WorkspaceNotificationSettings,
+    summary="Read the Workspace's notification destination",
+    responses={
+        403: {"description": "The caller does not hold workspace:manage (OWNER only)."},
+        404: {"description": "Workspace not found."},
+    },
+)
+async def get_notification_settings(
+    service: Annotated[WorkspaceService, Depends(get_workspace_admin_service)],
+) -> WorkspaceNotificationSettings:
+    """Where this Workspace's Connection Health failure notifications are sent (M2.10).
+
+    OWNER-only on both read and write: the value is an address a human typed, so exposing it to
+    ADMIN — let alone to a machine token — would widen PII for no operational gain.
+    """
+    return WorkspaceNotificationSettings(notification_email=await service.get_notification_email())
+
+
+@router.patch(
+    "/me",
+    response_model=WorkspaceNotificationSettings,
+    summary="Set the Workspace's notification destination",
+    responses={
+        403: {"description": "The caller does not hold workspace:manage (OWNER only)."},
+        404: {"description": "Workspace not found."},
+        422: {"description": "The destination is not a valid email address."},
+    },
+)
+async def update_current_workspace(
+    payload: WorkspaceNotificationUpdate,
+    service: Annotated[WorkspaceService, Depends(get_workspace_admin_service)],
+) -> WorkspaceNotificationSettings:
+    """Configure Connection Health failure notifications for the caller's own Workspace.
+
+    The Workspace is the one the caller is already authenticated against — there is no
+    `workspace_id` in the path or the body, so this endpoint is structurally incapable of being
+    aimed at another tenant. `notification_email: null` (or an emptied field) disables
+    notifications; the Connection Health path then simply has nowhere to send and does not send.
+
+    `extra="forbid"` on the payload means this cannot become a general workspace mutator by
+    accident: an attempt to set `plan`, `slug`, or `name` here is a 422, not a silent no-op.
+    """
+    stored = await service.set_notification_email(payload.notification_email)
+    return WorkspaceNotificationSettings(notification_email=stored)
 
 
 def get_member_service(

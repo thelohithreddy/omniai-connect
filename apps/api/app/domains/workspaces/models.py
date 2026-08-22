@@ -48,6 +48,18 @@ class Workspace(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     plan: Mapped[str] = mapped_column(String(20), nullable=False, server_default=text("'free'"))
     stripe_customer_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
+    # Where Connection Health failure notifications are sent (M2.10, ADR-0041). NULL means the
+    # Workspace has not configured one and therefore does not notify — notification is opt-in, and
+    # a default would either invent an address or hide the difference between "unconfigured" and
+    # "deliberately off".
+    #
+    # This is deliberately **not** a Member's address. Member email lives in `identity.user`, which
+    # ADR-0014 keeps unreachable from this role in both directions; the ratified recipient contract
+    # is "the Workspace's declared notification destination", not "Owners and Admins" (ADR-0041 §6).
+    # It is a value an owner typed, stored the same way and at the same width as
+    # `invitations.invited_email` (ADR-0017), never a reference to an identity row.
+    notification_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+
     __table_args__ = (
         # Named `plan_valid`, not `ck_workspaces_plan_valid`: the metadata naming
         # convention renders `ck_%(table_name)s_%(constraint_name)s`, so the longer name

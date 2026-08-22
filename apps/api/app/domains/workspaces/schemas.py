@@ -47,7 +47,7 @@ class MembershipList(BaseModel):
     data: list[MembershipRead]
 
 
-def _normalize_email(value: str) -> str:
+def _normalize_email(value: str, field: str = "invited_email") -> str:
     """Lightweight email validation + normalization (ADR-0017).
 
     Not a full RFC validator — deliberately no `email-validator` dependency — because the
@@ -56,14 +56,61 @@ def _normalize_email(value: str) -> str:
     surrounding whitespace so the stored value can match the verified claim. Anything that
     passes here but is not a real address simply never matches a verified email and can never
     be accepted.
+
+    `field` names the offending field in the error. It defaults to `invited_email` so the
+    invitation contract's messages are unchanged; M2.10's notification destination passes its
+    own name rather than claiming to be an invitation.
     """
     email = value.strip().lower()
     local, sep, domain = email.partition("@")
     if not sep or not local or "." not in domain or domain.startswith(".") or domain.endswith("."):
-        raise ValueError("invited_email must be a valid email address")
+        raise ValueError(f"{field} must be a valid email address")
     if any(ch.isspace() for ch in email):
-        raise ValueError("invited_email must not contain whitespace")
+        raise ValueError(f"{field} must not contain whitespace")
     return email
+
+
+class WorkspaceNotificationSettings(BaseModel):
+    """The Workspace's Connection Health notification destination (M2.10, ADR-0041).
+
+    A response model of its own rather than a field on `WorkspaceRead`, and the reason is a
+    security boundary: `GET /v1/workspaces/me` authenticates with `CurrentWorkspace`, which any
+    **machine token** satisfies (ADR-0002 — a token has no membership and therefore no
+    permissions). Widening that response would hand the destination address to every MCP client
+    holding a workspace token. The destination is PII a human typed, so it is read and written
+    only through the `workspace:manage` endpoints below.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    notification_email: str | None
+
+
+class WorkspaceNotificationUpdate(BaseModel):
+    """Set or clear the Workspace's notification destination.
+
+    `extra="forbid"`: `name`, `slug`, `plan`, `stripe_customer_id` and `id` are **not**
+    updatable here. This endpoint exists to configure one thing, and accepting-then-ignoring a
+    `plan` field would look like a working billing change to the caller.
+
+    `None` is meaningful and distinct from omission — it is how an owner turns notifications off,
+    and the field is required precisely so "clear it" cannot be confused with "leave it alone".
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    notification_email: str | None = Field(
+        description="Where Connection Health failure notifications are sent; null disables them."
+    )
+
+    @field_validator("notification_email")
+    @classmethod
+    def _email(cls, value: str | None) -> str | None:
+        # An all-whitespace string is a clear, not a validation error: it is what an emptied
+        # form field sends, and the caller's evident intent is "off".
+        if value is None or not value.strip():
+            return None
+        return _normalize_email(value, field="notification_email")
 
 
 class InvitationCreate(BaseModel):

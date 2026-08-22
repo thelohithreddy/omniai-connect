@@ -51,6 +51,24 @@ class WorkspaceService:
             raise NotFoundError("Workspace not found.")
         return workspace
 
+    async def get_notification_email(self) -> str | None:
+        """The Workspace's Connection Health notification destination, or None if unset."""
+        return (await self.get_current()).notification_email
+
+    async def set_notification_email(self, email: str | None) -> str | None:
+        """Set or clear the notification destination (M2.10, ADR-0041).
+
+        The value is already normalized and validated by the schema (`strip().lower()`, the same
+        treatment `invited_email` gets), so this layer only persists it. A missed row is the same
+        `not_found` `get_current` raises, for the same reason: the caller cannot act on the
+        difference between a deleted tenant and an RLS misconfiguration, and reporting success for
+        an UPDATE that changed nothing would be a lie the caller would act on.
+        """
+        matched, stored = await self._repository.set_notification_email(email)
+        if not matched:
+            raise NotFoundError("Workspace not found.")
+        return stored
+
 
 class MemberService:
     """Application operations over Members of one Workspace.
