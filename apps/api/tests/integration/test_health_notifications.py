@@ -1186,3 +1186,100 @@ async def test_a_payload_supplied_workspace_id_is_ignored_in_favour_of_the_envel
     assert len(dispatches.calls) == 1, dispatches.calls
     assert dispatches.calls[0]["args"][0] == str(workspace_a.id)
     assert str(workspace_b.id) not in json.dumps(dispatches.calls, default=str)
+
+
+# ============================================ provider-failure retry (release-audit finding F1)
+#
+# Celery does not retry a task merely because it raised — a retry needs an explicit `self.retry`
+# or `autoretry_for`. The dedup window is already claimed by the time the send is attempted, so a
+# non-retrying failure loses the notification for the whole 24-hour TTL *and* makes the same-task
+# re-entry design unreachable in production. These fix the gap in kind: they fail if the task stops
+# retrying a transient provider error.
+
+
+class _FlakyMailbox:
+    """Fails with a realistic provider error until `fail_times` is exhausted, then delivers."""
+
+    def __init__(self, fail_times: int, error: Exception) -> None:
+        self.remaining = fail_times
+        self.error = error
+        self.attempts = 0
+        self.sent: list[EmailMessage] = []
+
+    async def send(self, message: EmailMessage) -> None:
+        self.attempts += 1
+        if self.remaining > 0:
+            self.remaining -= 1
+            raise self.error
+        self.sent.append(message)
+
+
+def _http_status_error(status: int) -> httpx.HTTPStatusError:
+    """What `ResendEmailSender.raise_for_status()` actually raises on a non-2xx."""
+    request = httpx.Request("POST", "https://api.resend.com/emails")
+    return httpx.HTTPStatusError(
+        f"{status}", request=request, response=httpx.Response(status, request=request)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("label", "error"),
+    [
+        ("non-2xx", _http_status_error(500)),
+        ("timeout", httpx.ReadTimeout("provider timed out")),
+        ("connect", httpx.ConnectError("dns failure")),
+    ],
+)
+async def test_a_transient_provider_failure_retries_and_eventually_delivers(
+    admin_engine: AsyncEngine,
+    workspace_a: SeededWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+    label: str,
+    error: Exception,
+) -> None:
+    """Retries, and — because the claim is keyed on this task's own id — still delivers."""
+    ids = await seed(admin_engine, workspace_a.id)
+    await set_destination(admin_engine, workspace_a.id, DESTINATION)
+    flaky = _FlakyMailbox(fail_times=2, error=error)
+    monkeypatch.setattr(notification_tasks, "_email_sender", lambda: flaky)
+
+    result = await asyncio.to_thread(run_task, workspace_a.id, ids["connection_id"], "unhealthy")
+
+    assert flaky.attempts > 1, f"{label}: the task did not retry — the notification is lost"
+    assert result.result == "sent", f"{label}: {result.traceback}"
+    assert [m.to for m in flaky.sent] == [DESTINATION]
+
+
+@pytest.mark.asyncio
+async def test_the_retry_budget_is_bounded_rather_than_infinite(
+    admin_engine: AsyncEngine, workspace_a: SeededWorkspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A permanently-broken provider must dead-letter, not loop forever."""
+    ids = await seed(admin_engine, workspace_a.id)
+    await set_destination(admin_engine, workspace_a.id, DESTINATION)
+    always = _FlakyMailbox(fail_times=10_000, error=_http_status_error(500))
+    monkeypatch.setattr(notification_tasks, "_email_sender", lambda: always)
+
+    result = await asyncio.to_thread(run_task, workspace_a.id, ids["connection_id"], "unhealthy")
+
+    assert not result.successful()
+    assert always.attempts <= send_health_notification.max_retries + 1, always.attempts
+    assert always.sent == []
+
+
+@pytest.mark.asyncio
+async def test_a_programming_error_is_surfaced_rather_than_retried(
+    admin_engine: AsyncEngine, workspace_a: SeededWorkspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`autoretry_for` is narrow on purpose: a bug in the template is not a transient provider
+    failure, and burning five attempts on it would hide it behind backoff."""
+    ids = await seed(admin_engine, workspace_a.id)
+    await set_destination(admin_engine, workspace_a.id, DESTINATION)
+    broken = _FlakyMailbox(fail_times=10_000, error=TypeError("template bug"))
+    monkeypatch.setattr(notification_tasks, "_email_sender", lambda: broken)
+
+    result = await asyncio.to_thread(run_task, workspace_a.id, ids["connection_id"], "unhealthy")
+
+    assert not result.successful()
+    assert broken.attempts == 1, "a programming error was retried"

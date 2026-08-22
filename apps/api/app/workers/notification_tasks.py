@@ -12,10 +12,20 @@ crafted queue entry can only ever cause a Workspace to be notified at the addres
 configured.
 
 Retry semantics matter here more than usual. `ResendEmailSender` raises on a non-2xx, so the first
-attempt can claim the dedup window and *then* fail to send. Celery preserves the task id across
-`self.retry`, and the claim is stored under that id, so a retry re-enters its own window and still
+attempt can claim the dedup window and *then* fail to send. Celery preserves the task id across a
+retry, and the claim is stored under that id, so a retry re-enters its own window and still
 delivers — while a genuinely different worker is refused. Deduplication therefore discriminates
 between *workers*, not between *attempts*, which is the boundary ADR-0041 §7 requires.
+
+**That only holds if a failed send actually retries.** Celery does not retry a task merely
+because it raised: a retry happens on an explicit `self.retry` or via `autoretry_for`.
+`DedupUnavailableError` takes the explicit path; a transport or non-2xx failure from the provider
+is covered by `autoretry_for=(httpx.HTTPError,)` — the narrow supertype of both `HTTPStatusError`
+(from `raise_for_status`) and `RequestError` (timeout, DNS, connection reset). Without it a single
+transient blip fails the task permanently *while the 24-hour claim stays held*, silently losing the
+notification and leaving the re-entry design unreachable in production — which is what the release
+audit found. The set is deliberately narrow rather than `Exception`: a template or programming
+error is a bug to surface, not something to attempt five more times.
 """
 
 from __future__ import annotations
@@ -23,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 
+import httpx
 import structlog
 
 from app.core.email import EmailSender, get_notification_email_sender
@@ -67,6 +78,10 @@ def _context(workspace_id: uuid.UUID) -> WorkspaceContext:
     bind=True,
     name="workers.notifications.send_health_notification",
     queue=RUNTIME_QUEUE,
+    # Transport and non-2xx failures from the mail provider are transient and MUST retry: the dedup
+    # window is already claimed by this task id at that point, so without a retry the notification
+    # is lost for the full TTL. Narrow on purpose — see the module docstring.
+    autoretry_for=(httpx.HTTPError,),
     max_retries=MAX_RETRIES,
     retry_backoff=True,
     retry_backoff_max=RETRY_BACKOFF_MAX_SECONDS,
