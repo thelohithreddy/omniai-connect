@@ -13,6 +13,29 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Credential vault hardening (M2.6, ADR-0039).** Key rotation, derived per-Workspace data keys,
+  redaction across every deployed log sink, and a vault access audit — the four ROADMAP §56 vault
+  deliverables. The KEK becomes a **versioned keyring** (`CREDENTIAL_MASTER_KEY` is version 1
+  permanently; `CREDENTIAL_MASTER_KEYS` supplies 2+) behind a stable `KeyProvider` seam, so a future
+  KMS is a new implementation and a re-wrap pass rather than a migration. Data keys are now wrapped
+  by a **per-Workspace key derived with HKDF-Expand** (RFC 5869), never stored — a wrapped data key
+  from one Workspace is useless in another *even if the AAD check above it were bypassed*.
+  Version 1 keeps M1's direct-KEK wrapping forever, so introducing the hierarchy is itself a
+  rotation: existing rows migrate 1 → 2 through the ordinary runbook rather than being redefined
+  underneath (redefining it would have made every stored credential permanently unreadable).
+  Rotation runs on the existing `runtime` queue with identifier-only arguments and **never decrypts
+  a payload** — `ciphertext` and `nonce` are byte-identical after a re-wrap — and retirement is
+  gated on `COUNT(key_version < target) = 0` measured in the database, never on a timer or a job's
+  exit status (migration 0014 adds the two SECURITY DEFINER discovery/gate functions and a
+  `key_version` index; no table, no column). Every credential decrypt is audited at the single
+  boundary — success and each distinct failure — as a structured log event plus a counter whose
+  labels are drawn from closed sets, so cardinality is bounded by construction. Redaction now covers
+  the **stdlib logging tree** in all four deployed processes (api, worker, worker-runtime,
+  scheduler): structlog bypasses stdlib entirely, so Celery task-failure logs, SQLAlchemy, httpx and
+  uvicorn were emitting unscrubbed — verified leaking `api_key=…` before the fix. UUID-valued `*_id`
+  keys are now preserved so audit records can name what was accessed. Default configuration is
+  behaviourally identical to M2.5.
+
 - **OAuth 2.0 authorization-code + PKCE (M2.5, ADR-0038).** *Released to `main` as `82cd651`.* Connect a provider once and every
   Interface can use it. `POST /v1/connections/{id}/oauth/authorize` (human, `connections:manage`)
   returns a provider `authorize_url`; the unauthenticated `GET /v1/oauth/callback` completes the

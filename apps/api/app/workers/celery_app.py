@@ -65,7 +65,7 @@ celery_app = Celery(
     broker=settings.resolved_celery_broker_url,
     # Deterministic, explicit task registration — no import-time autodiscovery magic
     # (CONNECTOR_SPECIFICATION §15 registration discipline).
-    include=["app.workers.tasks", "app.workers.oauth_tasks"],
+    include=["app.workers.tasks", "app.workers.oauth_tasks", "app.workers.vault_tasks"],
 )
 
 celery_app.conf.update(
@@ -87,13 +87,24 @@ celery_app.conf.update(
     task_default_queue=INGESTION_QUEUE,
     task_queues=(Queue(INGESTION_QUEUE), Queue(RUNTIME_QUEUE)),
     task_create_missing_queues=False,
-    # --- scheduler: the only periodic work is OAuth refresh discovery (M2.5) ---------------
+    # --- scheduler: OAuth refresh discovery (M2.5) and vault key re-wrap (M2.6) ------------
     beat_schedule={
         "oauth-refresh-sweep": {
             "task": "workers.oauth.sweep_refreshes",
             "schedule": REFRESH_SWEEP_INTERVAL_SECONDS,
             "options": {"queue": RUNTIME_QUEUE, "expires": REFRESH_SWEEP_INTERVAL_SECONDS},
-        }
+        },
+        # Idle until an operator introduces a new key version; then it drains the backlog toward
+        # the ratified 24h re-wrap target. `expires` keeps a tick from piling up behind an outage:
+        # a missed rotation tick is not worth replaying, the next one sees the same work.
+        "vault-key-rotation-sweep": {
+            "task": "workers.vault.sweep_key_rotations",
+            "schedule": settings.credential_rotation_sweep_seconds,
+            "options": {
+                "queue": RUNTIME_QUEUE,
+                "expires": settings.credential_rotation_sweep_seconds,
+            },
+        },
     },
     # --- bounded execution ---------------------------------------------------------------
     task_time_limit=TASK_HARD_TIME_LIMIT_SECONDS,

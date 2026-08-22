@@ -1979,3 +1979,97 @@ terminal transition, REST **and** MCP execution, secret canaries in response/aud
 18-mutation audit — 17 killed, 1 empirically-proven inert, 0 meaningful survivors.
 **Deferred:** `client_credentials` (M2/P1), dashboard UX, `webhooks_outbox` + Connection Health,
 vault hardening, MCP streaming/`listChanged`. **M2 is NOT complete after M2.5.**
+
+---
+
+## ADR-0039 — Credential Vault Hardening: local versioned keyring, derived workspace keys, log-based vault audit (M2.6)
+
+**Status:** Accepted · **Date:** 2026-08-22 · **Supersedes:** nothing (extends ADR-0030)
+
+**Context.** ROADMAP §56 asks for four things: key rotation, a derived per-workspace data key,
+redaction hardening, and a vault access audit. EC3 additionally requires a deliberate red-team pass
+finding zero plaintext. ADR-0030 shipped envelope encryption with a single env KEK and a
+`key_version` column whose only purpose was this milestone. Five decisions were surfaced and
+founder-ratified before implementation.
+
+**Decision.**
+
+1. **A1 — No KMS (ratified OUT).** AWS/GCP/Azure KMS and HSMs stay out of M2.6. Instead: a
+   multi-version **local KEK keyring** behind a stable `KeyProvider` seam. This is the interface
+   ADR-0030 promised — because only wrapped data keys depend on the KEK, a future KMS is a new
+   implementation of this protocol plus a re-wrap pass, with no schema change and no ciphertext
+   rewrite. Exactly one implementation ships (`LocalKeyringProvider`); the protocol exists so that
+   stays true.
+
+2. **A3 — Derived workspace keys via HKDF, no `workspace_keys` table.** A data key is wrapped by
+   `HKDF-Expand(KEK_v, label ‖ version ‖ workspace_id)`, not by the KEK directly. RFC 5869 §3.3
+   permits skipping Extract because the KEK is already a uniformly random 256-bit key. The key is
+   derived on demand and never stored, so there is no new table, no new secret at rest, and nothing
+   to keep in sync. The property this buys is worth stating plainly: a wrapped data key from
+   workspace A is useless in workspace B **even if the AAD check above it were bypassed** — tenant
+   isolation stops depending on the application layer getting `workspace_id` right.
+
+   **Version 1 keeps M1's direct-KEK wrapping, permanently.** Redefining it would have made every
+   credential already in production undecryptable — silent, total, unrecoverable. So introducing the
+   hierarchy *is itself a KEK rotation*: rows migrate 1 → 2 through the ordinary runbook. The
+   hierarchy is not bolted onto history; history is migrated into it. This is the single most
+   load-bearing decision in M2.6 and it is pinned by a test that reconstructs an M1-era record
+   byte-for-byte and requires the hardened vault to read it.
+
+3. **P1 — Rotation runbook: INTRODUCE → RE-WRAP → PROVE COMPLETION → OVERLAP → RETIRE.** Annual as
+   routine, immediate on compromise; 24h re-wrap target; ≥7-day overlap after completion. Re-wrap
+   runs on the existing `runtime` queue with identifier-only task arguments and **never decrypts the
+   payload** — `ciphertext` and `nonce` come out byte-identical, so an interrupted rotation cannot
+   corrupt a secret. **Retirement is gated on `COUNT(key_version < target) = 0` measured in the
+   database**, never on a timer, a scheduler's report, or a batch that looked successful. Reading
+   a row whose key was retired raises `VaultKeyVersionError`, audited as `key_unavailable` and
+   deliberately distinguishable from tampering: one says restore the key, the other says
+   investigate an attack.
+
+4. **A2 — Vault audit is structured logs + a bounded metric.** No new table, no second audit
+   ledger, no `tool_calls` extension. Hooked at `open_credential_secret`, the single decrypt
+   boundary and therefore the only place the record can be complete; every call is recorded,
+   success and each distinct failure, because an audit that logs only successes reads as a full
+   history while omitting exactly the events an investigation needs. The counter's labels are drawn
+   from closed sets and an undeclared value **raises**, so cardinality is bounded by construction
+   rather than by intention.
+
+5. **P2 — Harden all four deployed sinks (api, worker, worker-runtime, scheduler); no Sentry.**
+   The gap found was real and was verified before being fixed: structlog uses `PrintLoggerFactory`
+   and never touches the stdlib tree, so a `celery.worker` record containing `api_key=…` was emitted
+   verbatim. Redaction is now installed at `Logger.makeRecord` — the record factory was tried first
+   and rejected because stdlib applies `extra={...}` *after* it, which a test caught. Sentry is not
+   deployed and is not claimed as covered.
+
+**Consequences.** One additive migration (`0014_key_rotation_discovery`) adding two SECURITY DEFINER
+functions — the same sanctioned carve-out as `auth.resolve_api_token` (0001) and
+`auth.due_oauth_refreshes` (0013), returning identifiers and counts only — plus an index on
+`key_version`. No table, no column, no change to released migrations, no new dependency (HKDF comes
+from `cryptography`, already present). New settings (`CREDENTIAL_MASTER_KEYS`,
+`CREDENTIAL_KEY_VERSION`, `CREDENTIAL_ROTATION_*`) and one new beat entry; **default configuration
+is behaviourally identical to M2.5** — single key, version 1, sweep idle at one indexed COUNT.
+
+Proven by 1524 passing tests, including the M2.6 additions: keyring/derivation/rotation crypto
+units, real-Postgres+RLS rotation integration (payload byte-identity, overlap readability, the
+retirement gate across two tenants, cross-tenant refusal, RLS-independent repository scoping), the
+vault-access audit, the stdlib redaction bridge, and a **red-team pass that drives a canary through
+the full lifecycle and then searches every row of every table, the log stream, and Celery arguments
+— finding zero**, with a companion test that plants the canary to prove the instrument works. A
+24-mutation audit killed 23; the one survivor (`rewrap`'s target-version guard) was **empirically
+proven inert** — the provider raises the identical `VaultKeyVersionError` one layer down — and is
+kept because it fails before materializing a data key.
+
+An **independent release audit** then re-derived every claim from code, database, and running
+infrastructure, and ran a further 10-mutation subset weighted toward what the implementation had
+not tried (rotation row lock, AAD, decrypt boundary, cross-milestone safety) — all killed. It
+closed three genuine defects the implementation missed: `credential_type` was emitted as
+«redacted» because its key matched the "credential" marker, gutting the very audit A2 ratified
+(the unit tests observed the event *before* the redaction processor, so they could not see it —
+now asserted on the rendered JSON line); a generated `celerybeat-schedule` artifact had been
+committed; and a key-shaped test canary would have failed CI's secret scan. It also added the
+rotation concurrency coverage the implementation lacked (2/4/8 workers, plus rotation racing a
+concurrent re-seal), without which removing the `FOR UPDATE` claim went undetected.
+
+**Deferred:** external KMS/HSM (Team/Enterprise), Sentry `before_send`, automatic key generation,
+per-Connector credential field-name registration in the redactor, a metrics exporter (the counter is
+a hook with a bound, not a backend). **M2 is NOT complete after M2.6.**

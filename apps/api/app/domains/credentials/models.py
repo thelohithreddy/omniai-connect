@@ -16,6 +16,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKeyConstraint,
+    Index,
     Integer,
     LargeBinary,
     String,
@@ -45,9 +46,14 @@ class Credential(UUIDPrimaryKeyMixin, WorkspaceScopedMixin, TimestampMixin, Base
     credential_type: Mapped[str] = mapped_column(String(20), nullable=False)
     # AES-256-GCM ciphertext (+tag) of the secret. Never plaintext.
     ciphertext: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
-    # The per-Credential DEK, wrapped by the master KEK (wrap-nonce ‖ ciphertext+tag).
+    # The per-Credential DEK, wrapped by the key for this row's `key_version`
+    # (wrap-nonce ‖ ciphertext+tag): the master KEK itself at version 1, an HKDF-derived
+    # per-workspace key at 2+ (M2.6, ADR-0039).
     encrypted_dek: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
-    # Which master-key version wrapped the DEK — enables rotation (M2). 1 in M1.
+    # Which KEK version wrapped the DEK — the rotation runbook's state (M2.6, ADR-0039).
+    # Version 1 means M1's direct-KEK wrapping; 2+ means the DEK is wrapped by an HKDF-derived
+    # per-workspace key. Indexed below: the re-wrap sweep and the retirement gate both ask
+    # `key_version < target` across every tenant at once.
     key_version: Mapped[int] = mapped_column(Integer, nullable=False)
     # The GCM nonce for the payload encryption.
     nonce: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
@@ -65,6 +71,9 @@ class Credential(UUIDPrimaryKeyMixin, WorkspaceScopedMixin, TimestampMixin, Base
         UniqueConstraint("connection_id", name="uq_credentials_connection_id"),
         # Composite-FK target for connections.credential_id (added additively in migration 0011).
         UniqueConstraint("workspace_id", "id", name="uq_credentials_workspace_id_id"),
+        # Rotation discovery + the retirement gate (migration 0014). A platform-level scan, so
+        # unlike every tenant query this index cannot lead with `workspace_id`.
+        Index("ix_credentials_key_version", "key_version"),
         # A credential binds a connection in the same workspace (composite intra-tenant FK).
         ForeignKeyConstraint(
             ["workspace_id", "connection_id"],
