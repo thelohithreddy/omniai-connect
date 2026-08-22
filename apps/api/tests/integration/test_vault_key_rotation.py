@@ -16,6 +16,7 @@ infrastructure can show is the part that would actually hurt in production:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
@@ -326,3 +327,88 @@ async def test_repository_scoping_holds_even_without_rls(
 
         repository = CredentialRepository(session, _context(workspace_a.id))
         assert await repository.credential_for_update(credential_b) is None
+
+
+# ================================================= concurrency (added by the M2.6 release audit)
+#
+# The implementation claims the row lock serializes re-wraps, but nothing exercised it. These
+# tests exist because "under a row lock" is an assertion about behaviour under contention, and
+# an untested lock is indistinguishable from no lock.
+
+
+@pytest.mark.parametrize("workers", [2, 4, 8])
+@pytest.mark.asyncio
+async def test_concurrent_rewraps_produce_exactly_one_effective_rotation(
+    admin_engine: AsyncEngine, workspace_a: SeededWorkspace, rotated_keyring: str, workers: int
+) -> None:
+    """N workers, one credential, exactly one effective re-wrap — and a readable row afterwards.
+
+    Without the `FOR UPDATE` claim (or without the re-check inside it) several workers would read
+    the same v1 DEK, each wrap it independently, and the last writer would win. That is not
+    corrupting in itself, but it is wasted work that masks a real hazard: the same interleaving
+    against a concurrent re-seal is how an `encrypted_dek` gets orphaned from its ciphertext.
+    """
+    connection_id, credential_id = await seed_credential(admin_engine, workspace_a.id)
+
+    outcomes = await asyncio.gather(
+        *(_rewrap(workspace_a.id, credential_id, to=2) for _ in range(workers))
+    )
+
+    assert outcomes.count(RewrapOutcome.REWRAPPED) == 1, outcomes
+    assert outcomes.count(RewrapOutcome.ALREADY_CURRENT) == workers - 1, outcomes
+
+    row = await read_row(admin_engine, credential_id)
+    assert row["key_version"] == 2
+    async with worker_tenant_uow(str(workspace_a.id)) as uow:
+        credential = await uow.session.get(Credential, credential_id)
+        assert credential is not None
+        secret = open_credential_secret(
+            credential, workspace_id=workspace_a.id, connection_id=connection_id
+        )
+    assert secret.value == SECRET
+
+
+@pytest.mark.asyncio
+async def test_rotation_and_a_concurrent_reseal_cannot_orphan_the_ciphertext(
+    admin_engine: AsyncEngine, workspace_a: SeededWorkspace, rotated_keyring: str
+) -> None:
+    """Rotation and credential re-seal take **different** locks — this proves that is still safe.
+
+    Rotation claims the *credential* row; the OAuth refresh path claims the *connection* row and
+    writes the credential through the ORM. Different locks is normally how two writers corrupt a
+    row: rotation could re-wrap the DEK it read while a re-seal replaces the ciphertext, leaving
+    an `encrypted_dek` that unwraps to a key which decrypts nothing.
+
+    It is safe here only because Postgres serializes the two writes on the credentials row itself
+    and rotation re-reads the version *inside* its lock. Whichever order they land in, the row must
+    end up internally consistent and decryptable — that is what is asserted, rather than an
+    assumption about which one wins.
+    """
+    connection_id, credential_id = await seed_credential(admin_engine, workspace_a.id)
+    fresh_secret = "M2_6_RESEAL_CANARY_value"  # noqa: S105 (synthetic test secret)
+
+    async def reseal() -> None:
+        async with worker_tenant_uow(str(workspace_a.id)) as uow:
+            credential = await uow.session.get(Credential, credential_id)
+            assert credential is not None
+            sealed = vault.seal(
+                json.dumps({"value": fresh_secret}).encode(),
+                workspace_id=workspace_a.id,
+                connection_id=connection_id,
+            )
+            credential.ciphertext = sealed.ciphertext
+            credential.encrypted_dek = sealed.encrypted_dek
+            credential.nonce = sealed.nonce
+            credential.key_version = sealed.key_version
+
+    await asyncio.gather(_rewrap(workspace_a.id, credential_id, to=2), reseal())
+
+    async with worker_tenant_uow(str(workspace_a.id)) as uow:
+        credential = await uow.session.get(Credential, credential_id)
+        assert credential is not None
+        # The row must decrypt to *one* of the two coherent states — never to nothing.
+        secret = open_credential_secret(
+            credential, workspace_id=workspace_a.id, connection_id=connection_id
+        )
+    assert secret.value in (SECRET, fresh_secret)
+    assert (await read_row(admin_engine, credential_id))["key_version"] == 2

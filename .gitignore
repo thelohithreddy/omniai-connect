@@ -46,3 +46,10 @@ logs/
 # Misc
 .vercel
 .railway
+
+# Celery beat's persistent schedule database — runtime state written by the scheduler
+# container, not source. Committing it would ship a last-run timestamp that could make a
+# fresh deployment skip or misschedule a sweep.
+celerybeat-schedule
+celerybeat-schedule.*
+celerybeat.pid

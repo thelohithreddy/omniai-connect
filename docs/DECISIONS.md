@@ -2049,7 +2049,7 @@ from `cryptography`, already present). New settings (`CREDENTIAL_MASTER_KEYS`,
 `CREDENTIAL_KEY_VERSION`, `CREDENTIAL_ROTATION_*`) and one new beat entry; **default configuration
 is behaviourally identical to M2.5** — single key, version 1, sweep idle at one indexed COUNT.
 
-Proven by 1516 passing tests, including the M2.6 additions: keyring/derivation/rotation crypto
+Proven by 1524 passing tests, including the M2.6 additions: keyring/derivation/rotation crypto
 units, real-Postgres+RLS rotation integration (payload byte-identity, overlap readability, the
 retirement gate across two tenants, cross-tenant refusal, RLS-independent repository scoping), the
 vault-access audit, the stdlib redaction bridge, and a **red-team pass that drives a canary through
@@ -2058,6 +2058,17 @@ the full lifecycle and then searches every row of every table, the log stream, a
 24-mutation audit killed 23; the one survivor (`rewrap`'s target-version guard) was **empirically
 proven inert** — the provider raises the identical `VaultKeyVersionError` one layer down — and is
 kept because it fails before materializing a data key.
+
+An **independent release audit** then re-derived every claim from code, database, and running
+infrastructure, and ran a further 10-mutation subset weighted toward what the implementation had
+not tried (rotation row lock, AAD, decrypt boundary, cross-milestone safety) — all killed. It
+closed three genuine defects the implementation missed: `credential_type` was emitted as
+«redacted» because its key matched the "credential" marker, gutting the very audit A2 ratified
+(the unit tests observed the event *before* the redaction processor, so they could not see it —
+now asserted on the rendered JSON line); a generated `celerybeat-schedule` artifact had been
+committed; and a key-shaped test canary would have failed CI's secret scan. It also added the
+rotation concurrency coverage the implementation lacked (2/4/8 workers, plus rotation racing a
+concurrent re-seal), without which removing the `FOR UPDATE` claim went undetected.
 
 **Deferred:** external KMS/HSM (Team/Enterprise), Sentry `before_send`, automatic key generation,
 per-Connector credential field-name registration in the redactor, a metrics exporter (the counter is

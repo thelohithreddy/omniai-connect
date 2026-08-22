@@ -46,7 +46,9 @@ class Credential(UUIDPrimaryKeyMixin, WorkspaceScopedMixin, TimestampMixin, Base
     credential_type: Mapped[str] = mapped_column(String(20), nullable=False)
     # AES-256-GCM ciphertext (+tag) of the secret. Never plaintext.
     ciphertext: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
-    # The per-Credential DEK, wrapped by the master KEK (wrap-nonce ‖ ciphertext+tag).
+    # The per-Credential DEK, wrapped by the key for this row's `key_version`
+    # (wrap-nonce ‖ ciphertext+tag): the master KEK itself at version 1, an HKDF-derived
+    # per-workspace key at 2+ (M2.6, ADR-0039).
     encrypted_dek: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     # Which KEK version wrapped the DEK — the rotation runbook's state (M2.6, ADR-0039).
     # Version 1 means M1's direct-KEK wrapping; 2+ means the DEK is wrapped by an HKDF-derived

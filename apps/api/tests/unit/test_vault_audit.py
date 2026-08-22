@@ -30,7 +30,7 @@ from app.domains.runtime.secrets import open_credential_secret
 WS = uuid.uuid4()
 CONN = uuid.uuid4()
 
-SECRET_VALUE = "sk-live-DO-NOT-LEAK-4242"  # noqa: S105 (synthetic test secret)
+SECRET_VALUE = "M2_6_AUDIT_CANARY_value"  # noqa: S105 (synthetic test secret)
 
 
 def _credential(plaintext: bytes, *, credential_type: str = "api_key") -> Credential:
@@ -219,3 +219,85 @@ def test_the_snapshot_cannot_be_mutated_by_a_caller() -> None:
     snapshot = metrics.snapshot()
     with pytest.raises(TypeError):
         snapshot[("x", ())] = 1  # type: ignore[index]
+
+
+# ======================================= rendered-output audit (added by the M2.6 release audit)
+#
+# Every test above inspects the event dict *before* the processor chain runs. That is a blind
+# spot: `configure_logging` installs a redaction processor that rewrites the event on its way
+# out, so an assertion made upstream of it can pass while production emits something different.
+# It did exactly that — `credential_type` matched the "credential" marker and shipped as
+# «redacted», leaving an audit that could not say what kind of credential was opened.
+#
+# These tests therefore assert on the **rendered JSON line**, which is what an operator and an
+# incident responder actually get.
+
+
+def _render_open(credential: Credential) -> dict:
+    """Open a credential through the real production logging chain and return the emitted JSON."""
+    import contextlib
+    import io
+
+    configure_logging()
+    # A fresh proxy, because `cache_logger_on_first_use=True` means the module-level logger keeps
+    # whatever chain it first bound to. In production it binds once, to the production chain; in a
+    # test run an earlier test has already bound it, so without this the rendered output would be
+    # whatever renderer happened to be installed first.
+    original = secrets_module.log
+    secrets_module.log = structlog.get_logger("m26-audit-render")
+    buffer = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buffer):
+            open_credential_secret(credential, workspace_id=WS, connection_id=CONN)
+    finally:
+        secrets_module.log = original
+    lines = [ln for ln in buffer.getvalue().splitlines() if "credential_opened" in ln]
+    assert lines, "no audit line was emitted — the assertion below would be vacuous"
+    return json.loads(lines[-1])
+
+
+@pytest.mark.parametrize("app_env", ["production", "staging"])
+def test_the_rendered_audit_line_identifies_what_was_opened(
+    monkeypatch: pytest.MonkeyPatch, app_env: str
+) -> None:
+    """The audit must survive its own redactor. Asserted in both JSON-rendering environments."""
+    from app.core import logging as logging_module
+
+    monkeypatch.setattr(logging_module.settings, "app_env", app_env)
+    credential = _credential(json.dumps({"value": SECRET_VALUE}).encode())
+    event = _render_open(credential)
+
+    assert event["credential_type"] == "api_key", event
+    assert event["credential_id"] == str(credential.id), event
+    assert event["workspace_id"] == str(WS), event
+    assert event["key_version"] == credential.key_version, event
+    assert event["outcome"] == "ok", event
+    configure_logging()
+
+
+def test_the_rendered_audit_line_still_carries_no_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The exemption must not have opened a hole: the rendered line is searched for the plaintext
+    and for every ciphertext component."""
+    from app.core import logging as logging_module
+
+    monkeypatch.setattr(logging_module.settings, "app_env", "production")
+    credential = _credential(json.dumps({"value": SECRET_VALUE}).encode())
+    raw = json.dumps(_render_open(credential))
+    assert SECRET_VALUE not in raw
+    for material in (credential.ciphertext, credential.encrypted_dek, credential.nonce):
+        assert material.hex() not in raw
+    configure_logging()
+
+
+def test_a_secret_named_field_is_still_redacted_after_the_exemption() -> None:
+    """The allowlist is exact-name. Anything else matching a marker still redacts."""
+    from app.core.logging import REDACTED, redact_secrets
+
+    out = redact_secrets(
+        None,
+        "info",
+        {"credential_type": "oauth2", "credential": "sk-live-LEAK", "api_key": "sk-live-LEAK"},
+    )
+    assert out["credential_type"] == "oauth2"
+    assert out["credential"] == REDACTED
+    assert out["api_key"] == REDACTED

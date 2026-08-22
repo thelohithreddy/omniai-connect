@@ -104,8 +104,21 @@ def redact_secrets(
     }
 
 
+#: Exact field names that contain a secret marker but never carry a secret value. An
+#: exact-name allowlist rather than a suffix rule, so it cannot widen by accident — adding a
+#: name here is a deliberate, reviewable act.
+#:
+#: `credential_type` is a discriminator from a closed six-value set (`api_key`, `oauth2`, …).
+#: It matched "credential" and so was emitted as «redacted», which quietly gutted the M2.6
+#: vault-access audit: the record could say *that* a credential was opened but not *what kind*.
+#: Caught by the release audit, because the unit test observed the event before this processor ran.
+_NEVER_SECRET_KEYS = frozenset({"credential_type"})
+
+
 def _is_secret_key(key: str) -> bool:
     lowered = key.lower()
+    if lowered in _NEVER_SECRET_KEYS:
+        return False
     return any(marker in lowered for marker in _SECRET_KEY_MARKERS)
 
 

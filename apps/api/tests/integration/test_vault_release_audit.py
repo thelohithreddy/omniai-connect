@@ -38,7 +38,7 @@ from tests.conftest import SeededWorkspace
 from tests.integration.test_vault_key_rotation import read_row, seed_credential
 
 #: Distinctive enough that a match cannot be coincidence, and shaped like a real key.
-CANARY = "sk-live-M26-REDTEAM-CANARY-0f3a9d7c"  # noqa: S105 (synthetic test secret)
+CANARY = "M2_6_REDTEAM_CANARY_0f3a9d7c"  # noqa: S105 (synthetic test secret)
 
 
 @pytest.fixture

@@ -144,7 +144,11 @@ Defense-in-depth so a bug cannot leak a secret through observability:
 - **Reference identifiers survive redaction.** A key ending in `_id` whose value is a UUID is kept:
   `credential_id` contains "credential" and `api_token_id` contains "token", so the broad marker
   match was rendering audit records as *"someone opened «redacted»"*. Both conditions are required,
-  so `token_id="sk-live-…"` is still redacted.
+  so `token_id="sk-live-…"` is still redacted. A second, tiny **exact-name allowlist** covers
+  fields that contain a marker but never hold a secret — currently only `credential_type`, a
+  six-value discriminator that was otherwise emitted as «redacted», leaving an audit record that
+  could not say what kind of credential was opened. Exact names rather than a suffix rule, so the
+  carve-out cannot widen by accident.
 - Sentry is **not deployed**; when it is, `before_send` must run the same scrubber over event
   payloads and breadcrumbs. Do not treat this bullet as coverage until that process exists.
 - API response serialization goes through Pydantic schemas that simply do not contain
