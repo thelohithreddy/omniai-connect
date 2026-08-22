@@ -99,8 +99,12 @@ class WorkspaceNotificationUpdate(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    # `max_length` matches the column exactly. Without it an over-long address passes validation,
+    # reaches `VARCHAR(320)`, and raises a database error — a 500 for what is plainly bad input.
     notification_email: str | None = Field(
-        description="Where Connection Health failure notifications are sent; null disables them."
+        ...,
+        max_length=320,
+        description="Where Connection Health failure notifications are sent; null disables them.",
     )
 
     @field_validator("notification_email")

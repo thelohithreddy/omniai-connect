@@ -37,7 +37,7 @@ from app.workers.celery_app import (
     RUNTIME_QUEUE,
     celery_app,
 )
-from app.workers.context import validate_workspace_id, worker_tenant_uow
+from app.workers.context import WorkerContextError, validate_workspace_id, worker_tenant_uow
 
 log = structlog.get_logger(__name__)
 
@@ -79,7 +79,10 @@ def send_health_notification(
     try:
         workspace = validate_workspace_id(workspace_id)
         connection = uuid.UUID(connection_id)
-    except (ValueError, TypeError):
+    except (WorkerContextError, ValueError, TypeError):
+        # `validate_workspace_id` raises WorkerContextError, not ValueError. Catching only the
+        # latter let a crafted queue entry crash the task into Celery's retry ladder instead of
+        # being refused once — found by the malformed-argument test.
         log.warning("notification.rejected_bad_identifier")
         return REJECTED
 

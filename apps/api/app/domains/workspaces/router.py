@@ -188,7 +188,7 @@ async def get_notification_settings(
     responses={
         403: {"description": "The caller does not hold workspace:manage (OWNER only)."},
         404: {"description": "Workspace not found."},
-        422: {"description": "The destination is not a valid email address."},
+        400: {"description": "The destination is not a valid email address."},
     },
 )
 async def update_current_workspace(
