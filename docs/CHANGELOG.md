@@ -13,6 +13,22 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Connection Health core (M2.7-A, ADR-0040).** `POST /v1/connections/{id}/test` runs a health
+  check as an **ordinary Tool Call** through `RuntimeService` — a thin door, not a second execution
+  engine, so rate limits, quota, credential decrypt-at-use, SSRF, timeout and the audit write are
+  all inherited unchanged (canon: AI_RUNTIME §2 stage 1 already describes the dashboard "test call"
+  as a Member-authenticated Tool Call). The probe Tool is chosen fail-closed and deterministically —
+  enabled, live, `annotations.readonly is True`, and requiring no arguments — so a destructive or
+  parameterised Tool can never be executed unattended; a Connector with no eligible Tool returns
+  `health_check_unavailable` with **zero egress**. `ConnectionRead` gains derived `health`
+  (`unknown|healthy|unhealthy|needs_reauth`) and `needs_reauth`, and `last_health_check_at` is now
+  actually written — both had shipped as permanently-null or docstring-only contracts. The released
+  `connections.status` CHECK is untouched and a failed probe never changes it. Authorization reuses
+  `tools:execute` (Viewer denied, machine tokens admitted); gated by `CONNECTION_HEALTH_ENABLED`.
+  **No migration.** **Failure notifications (Resend) are DEFERRED**: resolving Owner/Admin email
+  addresses requires identity data ADR-0014 deliberately keeps unreachable in both directions, so
+  that clause of ROADMAP §58 awaits an owner decision rather than a weakened boundary.
+
 - **Credential vault hardening (M2.6, ADR-0039).** *Released to `main` as `84646f0`.* Key rotation, derived per-Workspace data keys,
   redaction across every deployed log sink, and a vault access audit — the four ROADMAP §56 vault
   deliverables. The KEK becomes a **versioned keyring** (`CREDENTIAL_MASTER_KEY` is version 1

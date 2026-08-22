@@ -35,9 +35,24 @@ images build, 36 mutations (35 killed, 1 empirically proven inert), Gitleaks **0
 M2.6 range** (5 findings remain from pre-M2.6 history, unchanged), and a live stack smoke in which
 an M1-era credential and a v2 credential each survive seal → read → rotate → read.
 
+**M2.7-A (Connection Health core, ADR-0040) is implemented on `feat/m27-connection-health`** —
+health checks execute as ordinary Tool Calls through the Runtime (no second execution engine, no
+new audit ledger, **no migration**), with fail-closed deterministic probe-Tool selection, a derived
+`unknown|healthy|unhealthy|needs_reauth` projection, and the first actual writes to
+`last_health_check_at`. It also closes two long-standing debts: `needs_reauth` (ratified in M2.5,
+surfaced nowhere) and that permanently-null timestamp. 1587 tests, 26-mutation audit with 0
+survivors, all gates green. Not promoted to `main`.
+
+**Connection Health is NOT complete.** ROADMAP §58's *failure notifications (Resend)* clause is
+**DEFERRED and BLOCKED BY ADR-0014**: Owner/Admin email addresses live in `identity.user`, which
+ADR-0014 keeps unreachable from the application role — symmetrically and on purpose — and both
+possible SECURITY DEFINER shapes breach it (one needs the reverse grant, the other creates a
+user-enumeration primitive). ADR-0014 was **not** amended; the notification architecture awaits an
+owner decision.
+
 **M2 completion tracker.** MCP tools/list DONE · MCP tools/call DONE · rate limits & quotas DONE ·
 OAuth auth-code + PKCE DONE · OAuth refresh DONE · OAuth runtime injection DONE · vault hardening
-DONE · **Connection Health NOT STARTED** · MCP streaming DEFERRED · MCP `listChanged` DEFERRED ·
+DONE · **Connection Health core DONE, notifications DEFERRED (ADR-0014)** · MCP streaming DEFERRED · MCP `listChanged` DEFERRED ·
 OAuth `client_credentials` DEFERRED · M3 NOT STARTED. **M2 is therefore NOT COMPLETE.**
 
 **M2.5 (OAuth 2.0) is RELEASED to `main`** as the `--no-ff` merge `82cd651` (2026-08-21; implementation `f3d7e35`, audited tree

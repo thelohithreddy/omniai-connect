@@ -82,6 +82,13 @@ class ConnectionRead(BaseModel):
     config_overrides: dict[str, Any]
     credential_id: uuid.UUID | None
     last_health_check_at: datetime | None
+    #: Derived health (M2.7-A). Never a stored column and never part of the `status` CHECK: the
+    #: released lifecycle domain (`pending_auth|active|error|revoked`) is untouched, exactly as
+    #: M2.5 derived `needs_reauth` rather than adding a fifth status (ADR-0038 D5).
+    health: str
+    #: Derived from `status == 'error'` AND an oauth2 credential. Ratified in M2.5 as
+    #: "derived, never stored" and surfaced here for the first time.
+    needs_reauth: bool
     created_at: datetime
 
 
@@ -96,3 +103,29 @@ class ConnectionList(BaseModel):
 
 
 __all__ = ["ConnectionCreate", "ConnectionList", "ConnectionRead", "ConnectionUpdate"]
+
+
+class ConnectionHealthRead(BaseModel):
+    """The result of one health check — classified metadata only.
+
+    Deliberately narrow. It carries no provider response body, no headers, no credential, no
+    upstream URL, no resolved address and no exception text; `reason` is a canonical Runtime error
+    code from a closed vocabulary, so a hostile provider cannot use our own error path to smuggle
+    content into an operator's console.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    status: str = Field(description="Derived health: healthy | unhealthy | unknown | needs_reauth.")
+    reason: str | None = Field(
+        default=None,
+        description="Canonical failure code when the check failed, or `health_check_unavailable` "
+        "when the Connector exposes no Tool that is safe to run unattended.",
+    )
+    checked_at: datetime | None = Field(
+        default=None,
+        description="When the check completed (RFC 3339 UTC). Null when nothing was executed.",
+    )
+    tool_call_id: uuid.UUID | None = Field(
+        default=None, description="The audit row this check produced, for correlation."
+    )

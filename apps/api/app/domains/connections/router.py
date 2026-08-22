@@ -22,14 +22,17 @@ from app.core.exceptions import ValidationFailedError
 from app.core.pagination import DEFAULT_LIMIT, MAX_LIMIT
 from app.core.security import WorkspaceContext
 from app.domains.connections import idempotency
+from app.domains.connections.health_service import ConnectionHealthService
 from app.domains.connections.repository import ConnectionRepository
 from app.domains.connections.schemas import (
     ConnectionCreate,
+    ConnectionHealthRead,
     ConnectionList,
     ConnectionRead,
     ConnectionUpdate,
 )
 from app.domains.connections.service import ConnectionService
+from app.domains.runtime.policy import require_tool_execution
 
 connections_router = APIRouter(prefix="/v1/connections", tags=["connections"])
 
@@ -108,7 +111,7 @@ async def create_connection(
         name=payload.name,
         config_overrides=payload.config_overrides,
     )
-    body = ConnectionRead.model_validate(connection).model_dump(mode="json")
+    body = (await service.read_model(connection)).model_dump(mode="json")
     if idem_key is not None:
         await idempotency.complete(
             ctx.workspace_id, idem_key, digest, status.HTTP_201_CREATED, body
@@ -140,7 +143,7 @@ async def list_connections(
     this API can express."""
     page = await service.list_page(limit=limit, cursor=cursor)
     return ConnectionList(
-        data=[ConnectionRead.model_validate(c) for c in page.connections],
+        data=await service.read_models(list(page.connections)),
         next_cursor=page.next_cursor,
         has_more=page.has_more,
     )
@@ -163,7 +166,7 @@ async def get_connection(
 ) -> ConnectionRead:
     """One Connection by id. Workspace-scoped: a foreign or revoked id is a uniform 404, byte-
     identical to one that never existed, so the endpoint is not a cross-tenant oracle."""
-    return ConnectionRead.model_validate(await service.get(connection_id))
+    return await service.read_model(await service.get(connection_id))
 
 
 @connections_router.patch(
@@ -191,7 +194,7 @@ async def update_connection(
     connection = await service.update(
         connection_id, name=payload.name, config_overrides=payload.config_overrides
     )
-    return ConnectionRead.model_validate(connection)
+    return await service.read_model(connection)
 
 
 @connections_router.delete(
@@ -216,3 +219,59 @@ async def revoke_connection(
 
 
 __all__ = ["connections_router"]
+
+
+# --------------------------------------------------------------------- health (M2.7-A, §58)
+
+
+def get_connection_health_service(
+    uow: Annotated[UnitOfWork, Depends(get_uow)],
+    ctx: Annotated[WorkspaceContext, Depends(require_tool_execution)],
+) -> ConnectionHealthService:
+    """Composition root for the health endpoint.
+
+    Gated by `require_tool_execution`, not by `connections:manage`. A health check *is* a Tool Call
+    — it executes a real Tool against a real third-party API with the Connection's real credential
+    — so it must carry exactly the authority a Tool Call carries, no more and no less. Gating it on
+    the connection-administration permission instead would let a role that may not execute Tools
+    cause authenticated outbound requests, and would deny a MEMBER who legitimately may.
+    """
+    return ConnectionHealthService(uow, ctx)
+
+
+@connections_router.post(
+    "/{connection_id}/test",
+    response_model=ConnectionHealthRead,
+    status_code=status.HTTP_200_OK,
+    summary="Test a Connection's health",
+    responses={
+        200: {"description": "The check completed; classified health metadata."},
+        401: {"description": "Missing or invalid credentials."},
+        403: {"description": "Caller may not execute Tools in this Workspace."},
+        404: {"description": "No such live Connection in this Workspace."},
+        409: {"description": "Connection health checks are disabled."},
+    },
+)
+async def test_connection(
+    connection_id: uuid.UUID,
+    service: Annotated[ConnectionHealthService, Depends(get_connection_health_service)],
+) -> ConnectionHealthRead:
+    """Execute one health check against a Connection and return its classified outcome.
+
+    A thin door onto the Execution Runtime (AI_RUNTIME §4): this handler performs no HTTP, decrypts
+    nothing, validates no egress, enforces no limits and writes no audit row. It picks a Tool that
+    is safe to run unattended and hands a canonical Tool Call to the Runtime, which applies the
+    identical pipeline — rate limits and quota, argument validation, credential decrypt-at-use,
+    SSRF and timeout, audit — that every other Tool Call gets.
+
+    The response is **200 for an unhealthy Connection**. The check itself succeeded; what it found
+    is reported in `status`/`reason`. Mapping a provider's 500 onto our own 5xx would tell the
+    caller our API failed, which is a different and much less useful fact.
+    """
+    result = await service.check(connection_id)
+    return ConnectionHealthRead(
+        status=result.status.value,
+        reason=result.reason,
+        checked_at=result.checked_at,
+        tool_call_id=result.tool_call_id,
+    )
