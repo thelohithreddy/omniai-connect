@@ -21,11 +21,13 @@ mutation that stops the sweep scheduling anything kills these tests.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import httpx
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -118,6 +120,31 @@ def open_secret(row: Any, connection_id: uuid.UUID) -> dict[str, Any]:
     return json.loads(plaintext)
 
 
+async def run_sweep() -> dict[str, int]:
+    """Invoke the **real** `sweep_refreshes` Celery task, not its inner coroutine.
+
+    The task body calls `asyncio.run`, which cannot nest inside the test's running loop, so it is
+    executed in a worker thread with a loop of its own. That keeps the production entry point — the
+    kill-switch check and all — inside the evidence instead of testing one layer beneath it.
+    """
+    return await asyncio.to_thread(oauth_tasks.sweep_refreshes)
+
+
+async def run_refresh(args: list[str]) -> str:
+    """Execute the **real** `refresh_oauth_credential` task object with the arguments discovery
+    produced, via Celery's local synchronous `.apply()`.
+
+    `.apply()` runs the full task wrapper — `bind=True` self, the retry ladder, result handling —
+    rather than the inner `_refresh_one`, so what is proven is the task a worker would actually run.
+    """
+    result = await asyncio.to_thread(lambda: oauth_tasks.refresh_oauth_credential.apply(args=args))
+    if not result.successful():
+        # A retryable outcome makes the real wrapper raise `Retry` — machinery the inner coroutine
+        # does not have. Surfaced as a state marker so a test can assert the ladder engaged.
+        return f"<{result.state}>"
+    return str(result.result)
+
+
 # ============================================================== EC2, the automatic chain
 
 
@@ -151,7 +178,7 @@ async def test_ec2_a_due_credential_is_discovered_and_refreshed_with_no_user_act
     before = await credential_row(admin_engine, due["connection_id"])
 
     # 1–5. THE PRODUCTION SWEEP. Real session, real `auth.due_oauth_refreshes`, real fan-out.
-    result = await oauth_tasks._sweep()
+    result = await run_sweep()
 
     discovered = [tuple(call["args"]) for call in dispatched]
     assert (str(workspace_a.id), str(due["connection_id"])) in discovered, (
@@ -174,8 +201,7 @@ async def test_ec2_a_due_credential_is_discovered_and_refreshed_with_no_user_act
 
     # 6. The worker leg, with exactly the arguments discovery produced — never hand-authored.
     args = next(c["args"] for c in dispatched if c["args"][1] == str(due["connection_id"]))
-    outcome = await oauth_tasks._refresh_one(*args)
-    assert outcome is RefreshOutcome.REFRESHED, outcome
+    assert await run_refresh(args) == RefreshOutcome.REFRESHED.value
 
     # 7. Exactly one provider exchange, and it presented the OLD refresh token.
     assert len(provider.exchanges) == 1, provider.exchanges
@@ -199,7 +225,7 @@ async def test_ec2_a_due_credential_is_discovered_and_refreshed_with_no_user_act
     # 15. A second sweep must not refresh it again — the extended expiry removes it from the
     # due set, which is what stops a scheduled job re-burning a provider's rate limit.
     dispatched.clear()
-    await oauth_tasks._sweep()
+    await run_sweep()
     assert (str(workspace_a.id), str(due["connection_id"])) not in [
         tuple(c["args"]) for c in dispatched
     ], "a freshly refreshed credential was rediscovered as due"
@@ -224,9 +250,9 @@ async def test_ec2_refresh_token_rotation_survives_the_scheduled_path(
         refresh_token=OLD_REFRESH,
         expires_at=due_soon(),
     )
-    await oauth_tasks._sweep()
+    await run_sweep()
     args = next(c["args"] for c in dispatched if c["args"][1] == str(due["connection_id"]))
-    assert await oauth_tasks._refresh_one(*args) is RefreshOutcome.REFRESHED
+    assert await run_refresh(args) == RefreshOutcome.REFRESHED.value
 
     secret = open_secret(
         await credential_row(admin_engine, due["connection_id"]), due["connection_id"]
@@ -237,16 +263,21 @@ async def test_ec2_refresh_token_rotation_survives_the_scheduled_path(
 
 
 @pytest.mark.asyncio
-async def test_ec2_a_terminal_provider_failure_is_handled_without_leaking_or_looping(
+async def test_ec2_a_persistent_provider_failure_exhausts_retries_and_deactivates(
     admin_engine: AsyncEngine,
     workspace_a: SeededWorkspace,
     provider: FakeOAuthProvider,
     dispatched: list[dict[str, Any]],
 ) -> None:
-    """The automatic path's failure branch: discovered, attempted, refused terminally.
+    """The automatic path's failure branch, through the REAL task wrapper.
 
-    Asserts the canonical outcome rather than redesigning it — the Connection transitions to
-    `error` (ADR-0038 D2), the credential is left decryptable, and no provider text escapes.
+    Driving `refresh_oauth_credential` itself rather than its inner coroutine is what makes this
+    meaningful: the wrapper owns the bounded retry ladder and the terminal hand-off. A persistent
+    transport failure therefore exhausts the budget and transitions the Connection to `error`
+    (ADR-0038 D2) — behaviour no test of the inner function can reach.
+
+    The credential must survive intact: a refresh that cannot complete must never destroy the
+    token it failed to replace.
     """
     due = await seed_oauth_tool(
         admin_engine,
@@ -256,19 +287,30 @@ async def test_ec2_a_terminal_provider_failure_is_handled_without_leaking_or_loo
         refresh_token=OLD_REFRESH,
         expires_at=due_soon(),
     )
-    provider.next_response = (400, b'{"error":"invalid_grant","error_description":"revoked"}')
-
-    await oauth_tasks._sweep()
+    await run_sweep()
     args = next(c["args"] for c in dispatched if c["args"][1] == str(due["connection_id"]))
-    outcome = await oauth_tasks._refresh_one(*args)
-    assert outcome in (RefreshOutcome.TERMINAL, RefreshOutcome.RETRYABLE), outcome
+
+    # Persistent, not one-shot: `raise_error` is never cleared, so every attempt fails. A
+    # `TimeoutException` is what the provider client classifies as a transport failure
+    # (`provider.py` catches it explicitly), so this drives the canonical retryable path rather
+    # than an unhandled error.
+    provider.raise_error = httpx.TimeoutException("provider unreachable")
+    outcome = await run_refresh(args)
+    assert outcome == RefreshOutcome.TERMINAL.value, outcome
 
     row = await credential_row(admin_engine, due["connection_id"])
-    # Whatever the classification, the stored credential must remain intact and readable — a
-    # failed refresh must never corrupt what is already there.
+    assert row.status == "error", "an exhausted refresh must deactivate the Connection"
     secret = open_secret(row, due["connection_id"])
-    assert secret["access_token"] == OLD_ACCESS
+    assert secret["access_token"] == OLD_ACCESS, "a failed refresh destroyed the stored token"
     assert secret["refresh_token"] == OLD_REFRESH
+
+    # A later sweep must not resurrect it: the Connection is no longer active, so discovery's
+    # `n.status = 'active'` predicate excludes it.
+    dispatched.clear()
+    await run_sweep()
+    assert (str(workspace_a.id), str(due["connection_id"])) not in [
+        tuple(c["args"]) for c in dispatched
+    ], "a terminally failed Connection was rediscovered by the sweep"
 
 
 @pytest.mark.asyncio
@@ -302,7 +344,7 @@ async def test_ec2_discovery_is_platform_wide_but_refresh_is_tenant_bound(
         refresh_token=B_REFRESH,
         expires_at=due_soon(),
     )
-    await oauth_tasks._sweep()
+    await run_sweep()
     pairs = [tuple(c["args"]) for c in dispatched]
 
     # Each due credential is scheduled under its OWN workspace id — never another's.
@@ -313,8 +355,8 @@ async def test_ec2_discovery_is_platform_wide_but_refresh_is_tenant_bound(
 
     # Cross-tenant execution: B's context, A's connection id. Nothing happens, no exchange.
     provider.exchanges.clear()
-    outcome = await oauth_tasks._refresh_one(str(workspace_b.id), str(a["connection_id"]))
-    assert outcome is RefreshOutcome.SKIPPED, outcome
+    outcome = await run_refresh([str(workspace_b.id), str(a["connection_id"])])
+    assert outcome == RefreshOutcome.SKIPPED.value, outcome
     assert provider.exchanges == [], "a cross-tenant refresh reached the provider"
     assert (
         open_secret(await credential_row(admin_engine, a["connection_id"]), a["connection_id"])[
@@ -381,14 +423,14 @@ async def test_ec2_a_stale_queued_refresh_does_not_re_exchange(
         refresh_token=OLD_REFRESH,
         expires_at=due_soon(),
     )
-    await oauth_tasks._sweep()
+    await run_sweep()
     args = next(c["args"] for c in dispatched if c["args"][1] == str(due["connection_id"]))
 
-    assert await oauth_tasks._refresh_one(*args) is RefreshOutcome.REFRESHED
+    assert await run_refresh(args) == RefreshOutcome.REFRESHED.value
     assert len(provider.exchanges) == 1
 
     # The identical task is redelivered — same arguments discovery produced, nothing else changed.
-    assert await oauth_tasks._refresh_one(*args) is RefreshOutcome.NOT_DUE
+    assert await run_refresh(args) == RefreshOutcome.NOT_DUE.value
     assert len(provider.exchanges) == 1, "a stale queued task re-exchanged with the provider"
 
     secret = open_secret(
