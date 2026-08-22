@@ -13,6 +13,17 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **EC2 acceptance evidence (M2 exit criterion).** ROADMAP §64 asks that OAuth tokens refresh
+  *automatically* across expiry without user action. The refresh mechanics were already covered, but
+  every test invoked `refresh_connection` directly, leaving the scheduled chain unproven — the M2
+  reconciliation therefore downgraded EC2 from "MET". It is now evidenced from database state
+  through the production entry point: a genuinely due credential is discovered by the real
+  `auth.due_oauth_refreshes` function, fanned out with identifier-only arguments, exchanged exactly
+  once, rotated and persisted, still decryptable, with a not-due control untouched, a stale
+  redelivered task declining to re-exchange, and cross-tenant execution refused. Nothing in the
+  discovery path is mocked. **No production code changed** — the automatic path already worked; only
+  its proof was missing.
+
 - **EC1 acceptance evidence (M2 exit criterion).** *Released to `main` as `037e9de`.* One literal integration scenario proving
   ROADMAP §63: a Workspace with two Connectors — one `api_key`, one `oauth2` — driven by a real MCP
   client through `initialize`, `tools/list` and two `tools/call`s. It asserts the consequences, not
