@@ -13,7 +13,7 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
-- **EC2 acceptance evidence (M2 exit criterion).** ROADMAP §64 asks that OAuth tokens refresh
+- **EC2 acceptance evidence (M2 exit criterion).** *Released to `main` as `bccf571`.* ROADMAP §64 asks that OAuth tokens refresh
   *automatically* across expiry without user action. The refresh mechanics were already covered, but
   every test invoked `refresh_connection` directly, leaving the scheduled chain unproven — the M2
   reconciliation therefore downgraded EC2 from "MET". It is now evidenced from database state
