@@ -13,7 +13,7 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
-- **Connection Health failure notifications (M2.10, ADR-0042).** ROADMAP §58's last unimplemented
+- **Connection Health failure notifications (M2.10, ADR-0042).** *Released to `main` as `18cd48d`.* ROADMAP §58's last unimplemented
   clause. Migration `0015` adds one nullable `workspaces.notification_email VARCHAR(320)` — no FK, no
   default, no identity access, and no mention of the `identity` schema, so **ADR-0014 is unchanged**.
   The address is one a human typed, reusing the pattern ADR-0017 already ratified for
@@ -43,6 +43,14 @@ entries move into a versioned section at release tag time (ADR-0005).
   so every event published inside a task dispatched to an empty handler map — harmless for MCP cache
   eviction, whose TTL bounds a lost eviction by design, but fatal for the unattended OAuth path, which
   is published in the worker. Registration is now performed in both roots and is idempotent.
+
+  **Release audit finding F1, fixed before promotion.** Celery does not retry a task merely because it
+  raised — it needs an explicit `self.retry` or `autoretry_for`. A mail-provider failure therefore died
+  on its first attempt while the 24-hour dedup claim stayed held, losing the notification and leaving
+  the same-task re-entry design unreachable in production. Fixed with
+  `autoretry_for=(httpx.HTTPError,)` — narrow on purpose, so a template bug surfaces instead of
+  retrying five times. Delivery remains best-effort: the bus is at-most-once and Redis dedup is not
+  durable exactly-once, so a flush permits one duplicate. Durable delivery is M3's `webhooks_outbox`.
 
 - **EC2 acceptance evidence (M2 exit criterion).** *Released to `main` as `bccf571`.* ROADMAP §64 asks that OAuth tokens refresh
   *automatically* across expiry without user action. The refresh mechanics were already covered, but

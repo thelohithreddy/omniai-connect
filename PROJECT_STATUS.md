@@ -78,8 +78,9 @@ discovery function itself**. The production scheduler wrapper, the real discover
 
 **EC1 does not make M2 complete.** Connection Health notifications remain DEFERRED and BLOCKED BY ADR-0014; MCP streaming and `listChanged` remain DEFERRED; OAuth `client_credentials` remains DEFERRED; dashboard/UI is M3; F2 (Tool-name resolution) stays a pre-existing Runtime hardening item; M3 is NOT STARTED.
 
-**M2.10 (Connection Health failure notifications, ADR-0042) is IMPLEMENTED on
-`feat/m210-health-notifications` — NOT audited, NOT promoted.** ROADMAP §58's last unimplemented
+**M2.10 (Connection Health failure notifications, ADR-0042) is RELEASED to `main`** as the
+`--no-ff` merge `18cd48d` (2026-08-23; audited candidate `f40cbcc`, audit-fixed candidate
+`8e5798f`, merged tree byte-identical to `8e5798f^{tree}`), after an independent release audit. ROADMAP §58's last unimplemented
 clause. Migration `0015` adds one nullable `workspaces.notification_email VARCHAR(320)`; **ADR-0014 is
 unchanged** — no identity access, no SECURITY DEFINER function, no `user_id → email` primitive. The
 address is one a human typed, reusing ADR-0017's ratified `invitations.invited_email` pattern, and the
@@ -93,7 +94,26 @@ re-enters its own window while another worker is refused. It also closed a laten
 worker had **no event-bus composition root**, so every event published in a task dispatched to nobody.
 1717 tests green, 37-mutation audit, two defects found and fixed by the tests (an unbounded
 destination reaching `VARCHAR(320)` as a 500, and a malformed identifier crashing into the retry
-ladder). Awaiting independent release audit.
+ladder). An **independent release audit** re-derived every claim from code, database, Redis and runtime
+behaviour rather than from the implementation report, and found **one NEW release-blocking defect**
+(F1): Celery does not retry a task merely because it raised, so a mail-provider failure died on its
+first attempt *while the 24-hour dedup claim stayed held* — losing the notification and making the
+same-task re-entry design, the entire justification for claiming with `NX GET`, unreachable in
+production. Proven empirically (`STATE: FAILURE`, 1 send attempt, `ttl 86400`) and fixed before
+promotion with `autoretry_for=(httpx.HTTPError,)` plus regression coverage for non-2xx, timeout and
+connect errors, a bounded-budget test, and a `TypeError`-is-not-retried test. The audit independently
+reproduced worker event registration (without importing `app.main`), post-commit dispatch, the exact
+Redis `NX GET` semantics including TTL non-extension, 8-way concurrency for both events, RLS-independent
+tenant scoping, and a log-stream sweep showing no credential, no address and no `@` at all. Final:
+**1728 tests green**, 41 mutations / 41 killed / 0 survivors / 0 unapplied, both production images
+build, Gitleaks clean over the release range, migration reversible head→base→head.
+
+Delivery is **best-effort by ratified design**: the event bus is at-most-once, so a crash between
+COMMIT and dispatch can lose a notification, and Redis dedup is **not** durable exactly-once — a flush
+permits one duplicate. The **Celery broker transport remains an external infrastructure boundary**, as
+it has since EC2. **F2** (Tool-name uniqueness) and **F3** (Redis + external HTTP inside an existing
+worker transaction — a pattern `refresh_connection` already establishes while holding `FOR UPDATE`)
+remain **pre-existing debt, deliberately untouched** by this release.
 
 **M2 completion tracker.** MCP tools/list DONE · MCP tools/call DONE · rate limits & quotas DONE ·
 OAuth auth-code + PKCE DONE · OAuth refresh DONE · OAuth runtime injection DONE · vault hardening
