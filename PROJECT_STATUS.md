@@ -35,7 +35,7 @@ images build, 36 mutations (35 killed, 1 empirically proven inert), Gitleaks **0
 M2.6 range** (5 findings remain from pre-M2.6 history, unchanged), and a live stack smoke in which
 an M1-era credential and a v2 credential each survive seal → read → rotate → read.
 
-**M2.7-A (Connection Health core, ADR-0040) is implemented on `feat/m27-connection-health`** —
+**M2.7-A (Connection Health core, ADR-0040) is RELEASED and PUBLISHED to `main`** as the `--no-ff` merge `c326be5` (2026-08-22; implementation `4d1d3a2`, audit fix `42e2f7f`, merged tree byte-identical to the audited candidate) —
 health checks execute as ordinary Tool Calls through the Runtime (no second execution engine, no
 new audit ledger, **no migration**), with fail-closed deterministic probe-Tool selection, a derived
 `unknown|healthy|unhealthy|needs_reauth` projection, and the first actual writes to
@@ -49,6 +49,22 @@ ADR-0014 keeps unreachable from the application role — symmetrically and on pu
 possible SECURITY DEFINER shapes breach it (one needs the reverse grant, the other creates a
 user-enumeration primitive). ADR-0014 was **not** amended; the notification architecture awaits an
 owner decision.
+
+**Owner decisions (2026-08-22).** D1: Connection Health notifications remain **BLOCKED by
+ADR-0014** — no identity access, no SECURITY DEFINER function, no email denormalization, no Resend.
+D2: the ADR-0035 **FastMCP re-evaluation** is a separate research task that must precede MCP
+streaming. D3: **product dashboard/UI work is reassigned to M3** — the OAuth dashboard dance and the
+Connection Health test-call *button* are M3, so M2 must not invent frontend work to satisfy a
+wording ambiguity. D4: OAuth `client_credentials` needs a ratified home for the client secret before
+any implementation. D5: **F2** (Tool-name uniqueness is documented Workspace-scoped but enforced
+`UNIQUE (connector_version_id, name)`) is classified **pre-existing Runtime correctness/hardening**,
+not an M2 blocker.
+
+**EC1 is now EVIDENCED** by `tests/integration/test_ec1_mcp_cross_connection.py`: one Workspace,
+two Connectors (api_key + oauth2), a real MCP client running `initialize` → `tools/list` → two
+`tools/call`s, asserting distinct Connections, distinct injected credentials at the egress seam, one
+audit row per call, and no credential in any response, log or audit row. An 11-mutation audit
+against that test has **0 meaningful survivors**.
 
 **M2 completion tracker.** MCP tools/list DONE · MCP tools/call DONE · rate limits & quotas DONE ·
 OAuth auth-code + PKCE DONE · OAuth refresh DONE · OAuth runtime injection DONE · vault hardening

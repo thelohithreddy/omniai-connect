@@ -96,6 +96,7 @@ async def seed_tool(
     with_credential: bool = True,
     tool_name: str = "demo_op",
     base_url: str = "https://api.example.com",
+    connection_name: str = "Demo conn",
 ) -> dict[str, uuid.UUID]:
     """Seed a full executable Tool (connector → version → tool → connection → credential) as the
     superuser admin engine, bypassing RLS. Returns the ids the test needs."""
@@ -164,9 +165,17 @@ async def seed_tool(
         await conn.execute(
             text(
                 "INSERT INTO connections (id, workspace_id, connector_id, name, status, "
-                "config_overrides) VALUES (:id, :ws, :cid, 'Demo conn', :status, '{}')"
+                "config_overrides) VALUES (:id, :ws, :cid, :name, :status, '{}')"
             ),
-            {"id": connection_id, "ws": workspace_id, "cid": connector_id, "status": status},
+            {
+                "id": connection_id,
+                "ws": workspace_id,
+                "cid": connector_id,
+                # Overridable because `(workspace_id, name)` is unique: a scenario seeding two
+                # Connectors into one Workspace (EC1) needs distinct Connection names.
+                "name": connection_name,
+                "status": status,
+            },
         )
         if with_credential:
             sealed = seal(
@@ -540,3 +549,73 @@ async def test_tool_call_completed_event_is_published(
     assert event.workspace_id == workspace_a.id  # type: ignore[attr-defined]
     assert event.payload["status"] == "succeeded"  # type: ignore[attr-defined]
     assert "evt-secret" not in str(event.payload)  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_connection_from_another_connector_is_refused(
+    client: httpx.AsyncClient,
+    admin_engine: AsyncEngine,
+    workspace_a: SeededWorkspace,
+    egress: _Egress,
+) -> None:
+    """A Connection may only be bound to a Tool of its **own** Connector.
+
+    Found by the EC1 mutation audit: deleting the connector-match check from `_bind_connection`
+    broke no test. It should have broken this one. Without it, a caller who legitimately owns two
+    Connectors can name Tool X and pass Connector Y's `connection_id`, and the Runtime will send
+    **Y's credential to X's provider** — a same-tenant credential disclosure to the wrong third
+    party, entirely inside the caller's own Workspace, so no tenant boundary is crossed to catch it.
+
+    The refusal is also a uniform 404: a mismatched Connection is indistinguishable from a missing
+    one, so this cannot be used to enumerate which Connections exist.
+    """
+    alpha = await seed_tool(
+        admin_engine,
+        workspace_a.id,
+        tool_name="alpha_only_op",
+        secret={"value": "alpha-secret"},
+        auth_config={"type": "api_key", "key_name": "X-Alpha", "location": "header"},
+        base_url="https://alpha.example.com",
+        connection_name="Mismatch Alpha",
+    )
+    beta = await seed_tool(
+        admin_engine,
+        workspace_a.id,
+        tool_name="beta_only_op",
+        secret={"value": "beta-secret"},
+        auth_config={"type": "api_key", "key_name": "X-Beta", "location": "header"},
+        base_url="https://beta.example.com",
+        connection_name="Mismatch Beta",
+    )
+    egress.calls.clear()
+
+    # Alpha's Tool, Beta's Connection — both owned by this Workspace.
+    response = await client.post(
+        "/v1/tool-calls",
+        headers={"Authorization": f"Bearer {workspace_a.token.plaintext}"},
+        json={"tool_name": "alpha_only_op", "connection_id": str(beta["connection_id"])},
+    )
+    assert response.status_code == 404, response.text
+    assert response.json()["error"]["code"] == "not_found"
+
+    # Nothing was sent, so no credential reached the wrong provider.
+    assert egress.calls == [], "a mismatched Connection produced an outbound call"
+    assert "beta-secret" not in response.text
+
+    # Uniform with a Connection that does not exist at all — no existence oracle.
+    missing = await client.post(
+        "/v1/tool-calls",
+        headers={"Authorization": f"Bearer {workspace_a.token.plaintext}"},
+        json={"tool_name": "alpha_only_op", "connection_id": str(uuid.uuid4())},
+    )
+    assert missing.json()["error"] == response.json()["error"] | {
+        "request_id": missing.json()["error"]["request_id"]
+    }
+
+    # And the correct pairing still works, so the check filters rather than simply blocking.
+    ok = await client.post(
+        "/v1/tool-calls",
+        headers={"Authorization": f"Bearer {workspace_a.token.plaintext}"},
+        json={"tool_name": "alpha_only_op", "connection_id": str(alpha["connection_id"])},
+    )
+    assert ok.status_code == 200, ok.text
