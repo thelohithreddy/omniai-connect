@@ -13,7 +13,18 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
-- **Connection Health core (M2.7-A, ADR-0040).** `POST /v1/connections/{id}/test` runs a health
+- **EC1 acceptance evidence (M2 exit criterion).** One literal integration scenario proving
+  ROADMAP §63: a Workspace with two Connectors — one `api_key`, one `oauth2` — driven by a real MCP
+  client through `initialize`, `tools/list` and two `tools/call`s. It asserts the consequences, not
+  just the responses: two distinct Connections bound, two distinct credentials each reaching only
+  its own provider at the egress seam, exactly one `tool_calls` row per call, and neither credential
+  present in any MCP response, log or audit row. Cross-tenant discovery and execution are refused
+  with the uniform phrase, byte-identical to a Tool that never existed. Also closes a pre-existing
+  coverage gap the mutation audit exposed: the Runtime's connector-match check — which stops a
+  caller pairing Tool X with another Connector's Connection, and so stops that Connector's
+  credential being sent to the wrong provider inside the caller's own Workspace — was untested.
+
+- **Connection Health core (M2.7-A, ADR-0040).** *Released to `main` as `c326be5`.* `POST /v1/connections/{id}/test` runs a health
   check as an **ordinary Tool Call** through `RuntimeService` — a thin door, not a second execution
   engine, so rate limits, quota, credential decrypt-at-use, SSRF, timeout and the audit write are
   all inherited unchanged (canon: AI_RUNTIME §2 stage 1 already describes the dashboard "test call"
