@@ -13,7 +13,7 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
-- **EC1 acceptance evidence (M2 exit criterion).** One literal integration scenario proving
+- **EC1 acceptance evidence (M2 exit criterion).** *Released to `main` as `037e9de`.* One literal integration scenario proving
   ROADMAP §63: a Workspace with two Connectors — one `api_key`, one `oauth2` — driven by a real MCP
   client through `initialize`, `tools/list` and two `tools/call`s. It asserts the consequences, not
   just the responses: two distinct Connections bound, two distinct credentials each reaching only

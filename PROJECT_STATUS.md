@@ -60,11 +60,13 @@ any implementation. D5: **F2** (Tool-name uniqueness is documented Workspace-sco
 `UNIQUE (connector_version_id, name)`) is classified **pre-existing Runtime correctness/hardening**,
 not an M2 blocker.
 
-**EC1 is now EVIDENCED** by `tests/integration/test_ec1_mcp_cross_connection.py`: one Workspace,
+**EC1 is EVIDENCED and RELEASED to `main`** as the `--no-ff` merge `037e9de` (2026-08-22; audited feature `473b9fa`, merged tree byte-identical to the audited candidate; independent release audit verdict: RELEASE-READY). Evidence lives in `tests/integration/test_ec1_mcp_cross_connection.py`: one Workspace,
 two Connectors (api_key + oauth2), a real MCP client running `initialize` → `tools/list` → two
 `tools/call`s, asserting distinct Connections, distinct injected credentials at the egress seam, one
 audit row per call, and no credential in any response, log or audit row. An 11-mutation audit
-against that test has **0 meaningful survivors**.
+against that test has **0 meaningful survivors**. The independent audit re-derived every claim with its own canaries and seeding — credential isolation at both provider seams, cross-wiring refusal, tenant isolation, stale-discovery refusal, the real SSRF guard, audit integrity, 8-way concurrency without credential crossover, and a DB/Redis secret sweep with a validated positive control — at 1601 tests, all gates green, zero production files and zero migrations changed.
+
+**EC1 does not make M2 complete.** Connection Health notifications remain DEFERRED and BLOCKED BY ADR-0014; MCP streaming and `listChanged` remain DEFERRED; OAuth `client_credentials` remains DEFERRED; dashboard/UI is M3; F2 (Tool-name resolution) stays a pre-existing Runtime hardening item; M3 is NOT STARTED.
 
 **M2 completion tracker.** MCP tools/list DONE · MCP tools/call DONE · rate limits & quotas DONE ·
 OAuth auth-code + PKCE DONE · OAuth refresh DONE · OAuth runtime injection DONE · vault hardening
