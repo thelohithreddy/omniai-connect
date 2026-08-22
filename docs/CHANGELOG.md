@@ -13,6 +13,37 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **Connection Health failure notifications (M2.10, ADR-0042).** ROADMAP §58's last unimplemented
+  clause. Migration `0015` adds one nullable `workspaces.notification_email VARCHAR(320)` — no FK, no
+  default, no identity access, and no mention of the `identity` schema, so **ADR-0014 is unchanged**.
+  The address is one a human typed, reusing the pattern ADR-0017 already ratified for
+  `invitations.invited_email`. The recipient contract is therefore explicitly *"the Workspace's
+  declared notification destination"*, **not** "Owners and Admins" — the two are not equivalent and
+  the substitution is deliberate. Configuration is OWNER-only via `workspace:manage`
+  (`PATCH /v1/workspaces/me`, `GET /v1/workspaces/me/notification-settings`), which is that
+  permission's first enforcement anywhere; the field is kept off `WorkspaceRead` because
+  `GET /v1/workspaces/me` is satisfied by any machine token.
+
+  Two triggers converge on one service: a completed health check that finds the Connection unhealthy,
+  and the OAuth refresh worker's existing `connection.deactivated` filtered on `status == "error"` —
+  a mandatory discriminator, since the same event means "a user revoked their own credential" when it
+  carries `pending_auth`. Platform refusals (`rate_limited`, `quota_exceeded`, a fail-closed Redis)
+  report `unknown` and never notify, so an exhausted quota cannot email a Workspace. There is no
+  recovery email. Delivery is post-commit over the existing event bus — no outbox is invented — and a
+  notification failure never alters a health verdict, its timestamp, or the audit ledger.
+
+  Deduplication is one atomic round trip,
+  `SET ws:{ws}:health-notify:{conn}:{event} <task-id> NX GET EX 86400`, giving **exactly one
+  notification winner within the TTL window** — *not* durable exactly-once delivery. The task id owns
+  the claim so a Celery retry re-enters its own window (the provider raises on non-2xx, so a claim can
+  outlive a failed send) while a different worker is still refused. Redis being unreachable means "do
+  not send", never "assume we won". Durable delivery remains M3's `webhooks_outbox`.
+
+  Also fixes a latent gap this work exposed: the Celery worker had **no event-bus composition root**,
+  so every event published inside a task dispatched to an empty handler map — harmless for MCP cache
+  eviction, whose TTL bounds a lost eviction by design, but fatal for the unattended OAuth path, which
+  is published in the worker. Registration is now performed in both roots and is idempotent.
+
 - **EC2 acceptance evidence (M2 exit criterion).** *Released to `main` as `bccf571`.* ROADMAP §64 asks that OAuth tokens refresh
   *automatically* across expiry without user action. The refresh mechanics were already covered, but
   every test invoked `refresh_connection` directly, leaving the scheduled chain unproven — the M2

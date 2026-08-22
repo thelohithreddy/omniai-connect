@@ -1005,3 +1005,184 @@ async def test_the_kill_switch_stops_delivery_without_touching_health(
 
     assert result.result == "disabled"
     assert mailbox.sent == []
+
+
+# ======================================== RLS-independent repository scoping (mutation-audit gaps)
+#
+# The cross-tenant tests above pass on RLS alone: deleting a repository's explicit `workspace_id`
+# predicate does not fail them, which the M2.10 mutation audit confirmed (M21/M22 survived). Two
+# independent controls are only two controls if each is tested with the other absent, so these ask
+# the same questions on an **admin connection RLS does not constrain**, leaving the repository
+# filter as the only thing standing. Same pattern as the M2.6 vault suite (P-14, defense in depth).
+
+
+def _platform_context(workspace_id: uuid.UUID) -> Any:
+    from app.core.security import CallerIdentity, WorkspaceContext
+
+    return WorkspaceContext(
+        workspace_id=workspace_id,
+        caller=CallerIdentity(kind="api_token", api_token_id=None),
+        request_id="m210-rls-independent",
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_destination_lookup_is_scoped_by_the_repository_alone(
+    admin_engine: AsyncEngine, workspace_a: SeededWorkspace, workspace_b: SeededWorkspace
+) -> None:
+    """Without this, dropping the tenant predicate would let a task read another Workspace's
+    address — and mail one tenant's failure to another tenant's inbox."""
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from app.domains.notifications.repository import NotificationRepository
+
+    await set_destination(admin_engine, workspace_b.id, OTHER_DESTINATION)
+    await set_destination(admin_engine, workspace_a.id, None)
+
+    async with AsyncSession(admin_engine) as session:
+        visible = (
+            await session.execute(
+                text("SELECT notification_email FROM workspaces WHERE id = :i"),
+                {"i": workspace_b.id},
+            )
+        ).scalar()
+        assert visible == OTHER_DESTINATION, "premise failed: the admin connection cannot see B"
+
+        repository = NotificationRepository(session, _platform_context(workspace_a.id))
+        assert await repository.destination() is None
+
+
+@pytest.mark.asyncio
+async def test_the_connection_lookup_is_scoped_by_the_repository_alone(
+    admin_engine: AsyncEngine, workspace_a: SeededWorkspace, workspace_b: SeededWorkspace
+) -> None:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from app.domains.notifications.repository import NotificationRepository
+
+    b_ids = await seed(admin_engine, workspace_b.id)
+
+    async with AsyncSession(admin_engine) as session:
+        visible = (
+            await session.execute(
+                text("SELECT count(*) FROM connections WHERE id = :i"),
+                {"i": b_ids["connection_id"]},
+            )
+        ).scalar_one()
+        assert visible == 1, "premise failed: the admin connection cannot see B's Connection"
+
+        repository = NotificationRepository(session, _platform_context(workspace_a.id))
+        assert await repository.connection(b_ids["connection_id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_the_destination_update_is_scoped_by_the_repository_alone(
+    admin_engine: AsyncEngine, workspace_a: SeededWorkspace, workspace_b: SeededWorkspace
+) -> None:
+    """An UPDATE whose tenant predicate was dropped writes every row in the table. RLS hides that
+    at the HTTP edge, so the predicate is asserted here with RLS out of the way."""
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from app.domains.workspaces.repository import WorkspaceRepository
+
+    await set_destination(admin_engine, workspace_b.id, OTHER_DESTINATION)
+
+    async with AsyncSession(admin_engine) as session:
+        matched, stored = await WorkspaceRepository(
+            session, _platform_context(workspace_a.id)
+        ).set_notification_email(DESTINATION)
+        await session.commit()
+
+    assert (matched, stored) == (True, DESTINATION)
+    async with admin_engine.connect() as conn:
+        untouched = (
+            await conn.execute(
+                text("SELECT notification_email FROM workspaces WHERE id = :i"),
+                {"i": workspace_b.id},
+            )
+        ).scalar()
+    assert untouched == OTHER_DESTINATION, "B's destination was overwritten"
+
+
+# ================================================ remaining mutation-audit gaps (M15, M20, M25)
+
+
+@pytest.mark.asyncio
+async def test_the_published_failure_reason_is_the_stable_code_not_provider_text(
+    human_client: tuple[AsyncClient, FakeJWKSEndpoint],
+    admin_engine: AsyncEngine,
+    workspace_a: SeededWorkspace,
+    authority: SigningAuthority,
+    egress: _Egress,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The event payload rides the bus and can reach logs, so its `reason` must be the enumerated
+    Runtime code — never `str(exception)`, which for an upstream failure carries provider text."""
+    from app.domains.notifications import subscribers as subs
+
+    seen: list[Any] = []
+    monkeypatch.setattr(subs, "_enqueue", lambda event, notification: seen.append(event))
+
+    http, _ = human_client
+    ids = await seed(admin_engine, workspace_a.id)
+    egress.status = 500
+
+    await http.post(
+        f"/v1/connections/{ids['connection_id']}/test",
+        headers=await owner_headers(admin_engine, workspace_a, authority),
+    )
+
+    assert len(seen) == 1, seen
+    reason = seen[0].payload["reason"]
+    assert reason.islower() and " " not in reason, f"not an enumerated code: {reason!r}"
+    assert "api.example.com" not in reason
+    assert set(seen[0].payload) == {"connection_id", "reason"}
+
+
+@pytest.mark.asyncio
+async def test_a_missing_destination_does_not_burn_the_dedup_window(
+    admin_engine: AsyncEngine, workspace_a: SeededWorkspace, mailbox: _Mailbox
+) -> None:
+    """Order matters: claiming before resolving the destination would consume a 24-hour window for
+    a Workspace that could not be mailed, silently suppressing the next real notification."""
+    ids = await seed(admin_engine, workspace_a.id)
+
+    first = await asyncio.to_thread(run_task, workspace_a.id, ids["connection_id"], "unhealthy")
+    assert first.result == "no_destination"
+
+    await set_destination(admin_engine, workspace_a.id, DESTINATION)
+    second = await asyncio.to_thread(run_task, workspace_a.id, ids["connection_id"], "unhealthy")
+
+    assert second.result == "sent", "the earlier no-destination run consumed the window"
+    assert len(mailbox.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_payload_supplied_workspace_id_is_ignored_in_favour_of_the_envelope(
+    workspace_a: SeededWorkspace, workspace_b: SeededWorkspace, dispatches: _Dispatches
+) -> None:
+    """The envelope's tenant was already fail-closed-matched against the publishing transaction
+    (ADR-0022). A payload field is never a tenant selector, so a domain that puts `workspace_id` in
+    a payload — the envelope forbids extras, the payload does not — cannot redirect a
+    notification."""
+    from app.core.events import Event
+    from app.domains.connections.events import CONNECTION_DEACTIVATED
+
+    await event_bus.dispatch(
+        [
+            Event(
+                event_type=CONNECTION_DEACTIVATED,
+                workspace_id=workspace_a.id,
+                payload={
+                    "connection_id": str(uuid.uuid4()),
+                    "connector_id": str(uuid.uuid4()),
+                    "status": "error",
+                    "workspace_id": str(workspace_b.id),
+                },
+            )
+        ]
+    )
+
+    assert len(dispatches.calls) == 1, dispatches.calls
+    assert dispatches.calls[0]["args"][0] == str(workspace_a.id)
+    assert str(workspace_b.id) not in json.dumps(dispatches.calls, default=str)

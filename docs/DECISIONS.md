@@ -2160,3 +2160,157 @@ dashboard test-call button (`apps/web` has no product dashboard), the per-Connec
 breaker (CONNECTOR_SPECIFICATION §254, canonically specified but outside ROADMAP's M2 scope), and
 scheduled health checks (no canonical source requires them). **Connection Health is NOT complete,
 and M2 is NOT complete.**
+
+---
+
+## ADR-0042 — Connection Health failure notifications: a workspace destination, a Redis window, one delivery path (M2.10)
+
+**Status:** Accepted · **Date:** 2026-08-22 · **Relates to:** ADR-0014 (unchanged), ADR-0017,
+ADR-0023, ADR-0034, ADR-0040 (completes its deferred clause 6) · **Depends on:** the M2 owner
+ratification recorded on `docs/adr-0041-m2-owner-ratification` — this ADR implements decisions taken
+there, and takes number 0042 rather than 0041 so the two branches cannot collide.
+
+**Context.** ROADMAP §58's *"failure notifications (Resend)"* was the last unimplemented M2 clause.
+ADR-0040 clause 6 deferred it correctly: notifying Workspace Owners and Admins needs their email
+addresses, which live in `identity.user`, and ADR-0014 grants the two roles nothing on each other's
+data — symmetrically and on purpose. The owner ratified the recipient substitution and the
+architecture; this records what implementing it actually decided.
+
+**Decision.**
+
+1. **The destination is a Workspace column, and that is a reuse rather than an invention.** Migration
+   `0015` adds one nullable `workspaces.notification_email VARCHAR(320)` — no FK, no default, no
+   identity access, and no mention of the `identity` schema (ADR-0014 clause 1 keeps rollback safety
+   structural by requiring exactly that). ADR-0017 already faced this problem and the founder already
+   answered it: *"an invitation addresses a person by email before they are a user, but the API cannot
+   map an email to a Better Auth subject."* The ratified answer was that a human supplies the address
+   and it lives in `public`, which `invitations.invited_email` has done since M1.3-F. Same width, same
+   `strip().lower()` normalization, so the two email columns cannot disagree about what the "same"
+   address is. `workspaces` already carries RLS `ENABLE`+`FORCE`, so the column inherits tenant
+   protection without this migration touching RLS at all.
+
+2. **The recipient contract changed, deliberately, and is recorded as changed.** From *"notify
+   workspace Owners and Admins"* to *"notify the Workspace's declared notification destination."*
+   These are **not** equivalent and nothing downstream may describe them as such. `members` stores
+   `user_id` only, deliberately (*"a FK is not merely unnecessary, it is unsatisfiable"*), and
+   `HumanIdentity.email` is fenced by ADR-0017 §3 as the one narrow exception to ADR-0015's
+   claims-confer-nothing rule — request-scoped, describing only the calling human, and therefore
+   unavailable to a Celery worker that holds no JWT. Per-member preferences remain an additive M3
+   extension.
+
+3. **Configuration is OWNER-only, and this is `workspace:manage`'s first enforcement anywhere.**
+   `PATCH /v1/workspaces/me` writes it; `GET /v1/workspaces/me/notification-settings` reads it. Both
+   resolve the permission *before* the service, so authorization cannot be forgotten in a handler.
+   Neither accepts a workspace id, so neither is aimable at another tenant, and the repository carries
+   the tenant predicate inside the `UPDATE` rather than trusting whatever was loaded. `extra="forbid"`
+   keeps `PATCH /me` from becoming a general workspace mutator — accepting-and-ignoring a `plan` field
+   would look to the caller like a working billing change.
+
+4. **`notification_email` is deliberately absent from `WorkspaceRead`.** `GET /v1/workspaces/me`
+   authenticates with `CurrentWorkspace`, which every **machine token** satisfies — a token has no
+   membership and therefore no permissions (ADR-0002). A field added there is a field handed to every
+   MCP client holding a workspace token, so the destination gets its own OWNER-gated endpoint instead.
+
+5. **Two triggers, one service.** A completed health check that finds the Connection unhealthy
+   publishes `connection.health_check_failed`; the OAuth refresh worker's existing
+   `connection.deactivated` is consumed with a **mandatory** `status == "error"` filter. That
+   discriminator is not defensive: the same event is emitted with `pending_auth` when a user revokes
+   their own credential, and notifying on it would email people for their own deliberate actions. The
+   two paths share one service, one Redis key space, and one email template — a second implementation
+   is how two triggers drift into two products.
+
+6. **Notification is derived from the state entered, not from a state comparison.** Every "notify" row
+   of the ratified matrix depends only on the state being entered and every "no" row likewise, so no
+   prior state is derived: deduplication is the anti-spam mechanism, not edge detection. `unknown`
+   never notifies, and that is load-bearing — it is exactly what a **platform** refusal reports
+   (`rate_limited`, `quota_exceeded`, a fail-closed Redis), which says nothing about the Connection
+   (ADR-0040 §5). Treating it as a failure would email a whole Workspace the moment a weekly quota ran
+   out. There is no recovery email; canon requires none.
+
+7. **Delivery is post-commit, over the existing bus — no outbox is invented.** The health service
+   publishes a fact and stops: it sends nothing, knows no address, touches no Redis, and does not
+   import the notifications domain. Events buffer on the `UnitOfWork` and dispatch only after COMMIT
+   (ADR-0023), so a rolled-back check notifies nobody, and the bus isolates handler failures, so a
+   notification problem can never surface as a failed health check or a failed token refresh.
+
+8. **The worker gained its own event-bus composition root, and it had none.** `app/main.py` registered
+   subscribers for the **API** process only — verified empirically: a worker-like import shows an empty
+   handler map. Every event published inside a Celery task therefore dispatched to nobody. That is
+   invisible for MCP cache eviction, whose TTL bounds a lost eviction by design (ADR-0035 §5), but it
+   would have been fatal here, because `connection.deactivated` is published *in the worker* and is the
+   unattended failure this feature exists for. `workers/celery_app.py` now registers the notification
+   subscribers, and registration is idempotent (`EventBus.is_subscribed`) because a single process
+   importing both roots would otherwise enqueue two tasks per failure — invisible in behaviour, since
+   dedup still delivers one, while doubling broker traffic. **Deliberately scoped:** MCP's eviction
+   handler is *not* registered in the worker here; that would change caching behaviour in a process
+   that has never had it, which is outside M2.10. The gap is recorded rather than quietly fixed.
+
+9. **Dedup is one atomic Redis round trip, and its guarantee is stated precisely.**
+   `SET ws:{workspace_id}:health-notify:{connection_id}:{event} <task-id> NX GET EX 86400`. The key is
+   scoped three ways on purpose: **workspace** so one tenant cannot suppress another, **connection** so
+   one failing Connection does not silence the rest, and **event** so `unhealthy` and `needs_reauth`
+   are separate windows — a Connection already reporting a provider failure must still be able to
+   report that it now needs re-authorization. What this buys:
+
+   > **exactly one notification winner within the TTL window**
+
+   and **not** durable exactly-once email delivery. Both are stated because the second is what a
+   reader will otherwise assume.
+
+10. **`NX GET` rather than `SET NX` then `GET`, and the reason is a defect it prevents.** Plain `SET
+    NX` gives mutual exclusion but cannot distinguish a *losing worker* from *this same task
+    retrying*. `ResendEmailSender` raises on a non-2xx, so an attempt can claim the window and then
+    fail to send; a retry blocked by its own claim would silently drop the very email dedup exists to
+    protect. Celery preserves the task id across `self.retry` and the claim stores that id, so a retry
+    re-enters its own window while a genuinely different worker is still refused — deduplication
+    discriminates between *workers*, not between *attempts*. Reading the owner in the same atomic
+    operation avoids the window a two-command version would open. Requires Redis ≥ 7.0 for `NX`+`GET`
+    together; the deployment pins `redis:7-alpine`. The held path does not rewrite the key, so a loser
+    cannot slide the window forward and a busy Connection cannot postpone its own next notification.
+
+11. **Redis unreachable means "do not send", not "assume we won".** Ownership of the window is unknown,
+    and sending anyway would convert a Redis outage into one message per worker per retry. The task
+    raises and Celery retries; the health verdict, its timestamp, and the audit row are untouched.
+
+12. **The destination is never a task argument.** Celery serializes arguments as JSON into the Redis
+    broker, so an address there would be PII at rest — the same rule the OAuth and vault tasks apply to
+    secrets. Arguments are two UUIDs and one member of a closed vocabulary, *validated* rather than
+    trusted, because a crafted queue entry would otherwise reach a dedup key or a template. Reading the
+    destination server-side from the Workspace row is also what makes the task structurally incapable
+    of mailing an arbitrary address: there is no parameter through which one could be supplied.
+
+13. **Email content is allowlisted and hostile to its own inputs.** Constants plus the Connection name
+    — the one free-text value, which a user typed — HTML-escaped and length-capped. A failure is
+    described by the Runtime's **stable enumerated error code**, never `str(exception)`, which for an
+    upstream failure can carry provider text and with it a leaked secret. No credential, header, token,
+    provider body, traceback, or third-party URL is representable in a message.
+
+**Consequences.** One additive migration (`0015`), reversible, dropping only the column it added; no
+existing migration touched and nothing in the `identity` schema mentioned. Three new settings, all with
+safe defaults, so an unconfigured deployment behaves exactly as M2.7-A did: no destination means no mail.
+One new domain package, one new Celery task on the existing `runtime` queue, and no new dependency,
+queue, table, or Redis infrastructure. **ADR-0014 is unchanged**, and no SECURITY DEFINER function and no
+`user_id → email` primitive were created.
+
+Proven by 1717 passing tests — 41 domain units, 26 destination-API integration tests, and 42
+real-Postgres+RLS+Redis+Runtime end-to-end tests covering both triggers, the platform-refusal row driven
+through the real stage-3 enforcement seam, 2/4/8-worker concurrency, TTL and window non-extension, the
+accepted Redis-flush duplicate, same-task retry re-entry with a different-worker negative control, Redis
+outage, and a canary sweep of the email body, Redis and the Celery arguments with a validated positive
+control — plus a 37-mutation audit.
+
+Two defects the tests found and closed before release: an unbounded `notification_email` reached
+`VARCHAR(320)` and raised a 500 rather than a validation error, and the task caught only `ValueError`
+while `validate_workspace_id` raises `WorkerContextError`, so a malformed identifier crashed into the
+retry ladder instead of being refused once.
+
+**Accepted, and stated rather than discovered later:** delivery is best-effort. The bus is at-most-once
+(ADR-0023), so a crash between COMMIT and dispatch loses a notification; Redis dedup is not durable, so a
+flush or eviction permits one duplicate. Both are acceptable because a missed or duplicated notification
+grants no capability — the opposite posture from rate limits and quota, which fail closed because they
+are policy. Durable exactly-once delivery is `webhooks_outbox`, which remains **M3**.
+
+**Deferred:** `webhooks_outbox` and durable delivery, per-member notification preferences, scheduled
+health checks (no canonical source requires them), the dashboard surface for configuring the destination
+(`apps/web` has no product dashboard — M3), and notification channels other than email.
+**M2 is NOT complete until this slice is independently audited and promoted.**

@@ -526,6 +526,44 @@ one place:
 - Rate limits and quotas checked in Redis before every call; circuit breaker per
   Connection; quota checks **fail closed** if Redis is unavailable (Architecture §7).
 
+### 6.1 First-party platform mail and the notification destination (M2.10, ADR-0042)
+
+Email the platform sends on its own behalf — invitations (ADR-0017 §10), Connection Health failure
+notifications — is **not tenant egress** and does not go through the Execution Runtime. That rule
+governs calls made *on a tenant's behalf with a tenant's credential*; Resend is our own vendor,
+called with our own key, the same class as the JWKS fetch (ADR-0015 §6). It is confined to
+`app/core/email.py`, and no domain builds an HTTP client of its own to send mail.
+
+The **notification destination** is PII rather than a secret, and is treated accordingly:
+
+- It is a value a human typed, stored on `workspaces.notification_email` — never a Member's address
+  and never derived from `identity.user`, which ADR-0014 keeps unreachable from `omniai_app` in both
+  directions. Notifying a Workspace requires no identity access at all.
+- **OWNER-only** on read *and* write (`workspace:manage`). It is deliberately absent from
+  `WorkspaceRead`, because `GET /v1/workspaces/me` is satisfied by any machine token — a token holds
+  no membership and therefore no permissions (ADR-0002) — so a field there would disclose the address
+  to every MCP client holding a workspace token.
+- It never enters a Celery argument (JSON at rest in the Redis broker), never enters a Redis key or
+  value, and is not repeated into application logs: the transport already records the recipient once,
+  at the boundary where it is operationally necessary.
+- Notification tasks carry identifiers and one closed-vocabulary word, validated rather than trusted,
+  and load the destination server-side. The task is therefore structurally incapable of being used to
+  mail an arbitrary address.
+
+Message bodies are allowlisted: constants plus the Connection's name, HTML-escaped and length-capped
+because a user typed it. A failure is named by the Runtime's **stable enumerated error code**, never
+`str(exception)` — an upstream failure's text is attacker-influenced and may itself carry a leaked
+secret. No credential, `Authorization` header, token, provider response body, traceback, or
+third-party URL may appear in a message.
+
+Delivery is **best-effort and deliberately so**. Dedup (`SET NX GET EX`, 24 h) provides *exactly one
+notification winner within the TTL window* — **not** durable exactly-once delivery: a Redis flush or
+eviction permits one duplicate, and a crash between COMMIT and event dispatch can lose one entirely.
+Both are acceptable because a missed or duplicated notification grants no capability, which is the
+opposite posture from rate limits and quota — those fail **closed** because they are policy. A
+notification failure never alters a health verdict, its timestamp, or the audit ledger. Durable
+delivery is `webhooks_outbox` (M3).
+
 ## 7. Dependency and supply chain
 
 - Lockfiles are mandatory and committed: `pnpm-lock.yaml` (web) and `uv.lock` (api,
