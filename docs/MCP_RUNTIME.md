@@ -11,9 +11,13 @@
 The MCP server is one adapter in `apps/api/app/interfaces/mcp/`, alongside REST
 tool-invocation, OpenAPI manifests, and framework SDK exporters. It translates MCP
 protocol messages to `ToolCallRequest`/`ToolCallResult` and nothing more. *(M2.2,
-ADR-0035: the adapter is currently a minimal in-house JSON-RPC/Streamable-HTTP layer
-rather than FastMCP — founder-ratified for the discovery surface; FastMCP is
-re-evaluated when tools/call lands, M2.3.)* Per Bible
+ADR-0035: the adapter is a minimal in-house JSON-RPC/Streamable-HTTP layer rather than
+FastMCP — founder-ratified for the discovery surface. The FastMCP re-evaluation ADR-0035
+scheduled for M2.3 was **performed and closed by ADR-0041**: the in-house adapter remains
+authoritative, no MCP dependency is added, and the protocol-version allowlist stays under
+this repository's explicit control per §7. FastMCP is reconsidered only if a canonical
+requirement introduces server→client streaming, elicitation, resources, prompts, or
+long-running/pending Tool execution.)* Per Bible
 tenet 4: **if an MCP handler contains an `if`, ask whether it belongs in the
 runtime.** Policy, rate limits, quotas, credential handling, audit — all happen in
 the Execution Runtime; the adapter owns only protocol translation and transport.
@@ -30,11 +34,14 @@ Authorization: Bearer <workspace-scoped api token>
 - **Authentication** uses the workspace-scoped api tokens issued by the API
   (ADR-0002 — machine identity, never human sessions). The token both authenticates
   and selects the Workspace; a token/slug mismatch is rejected before any listing.
-- One FastMCP application serves all workspaces (the API is stateless,
+- One application serves all workspaces (the API is stateless,
   SYSTEM_ARCHITECTURE.md §6); "server-per-workspace" is a routing and scoping model,
-  not a process-per-tenant model. Every session is bound to exactly one
-  `WorkspaceContext` at connect time, and no MCP message can escape it (Bible
-  tenet 1).
+  not a process-per-tenant model. Every MCP message is bound to exactly one
+  `WorkspaceContext` and none can escape it (Bible tenet 1). *(ADR-0035/ADR-0041: the
+  shipped adapter is **sessionless** — the workspace is derived per request from the
+  token and the path slug, and `RuntimeService.execute` re-authorizes every call. That
+  satisfies this invariant more strongly than a connect-time binding would, since there
+  is no session whose context could outlive a revocation.)*
 - Token scopes can narrow a server further (e.g. a token exposing only read-only
   Tools) — enforcement is the runtime's policy stage, but listing honors scopes too,
   so clients never see Tools they cannot call.
@@ -81,6 +88,10 @@ retries). Audit rows are tagged `caller.interface="mcp"`. `confirmation_required
 
 - **Streamable HTTP** is the primary transport — it is what remote clients (ChatGPT,
   Claude, Cursor) speak, it works through Cloudflare, and it fits the stateless API.
+  *(ADR-0041 ratifies this bullet as the meaning of ROADMAP §55's "streaming transport",
+  which shipped in M2.2. It does **not** activate a server→client SSE stream, server→client
+  notifications, `listChanged`, or long-running/incremental Tool output — see §3, §4 and §6
+  for where each of those stands.)*
 - **stdio** is supported for local development only, via a small launcher
   (`omniai-mcp --workspace <slug> --token <token>`) that proxies to the same adapter
   code path. It exists so engineers can test against MCP Inspector and local clients
@@ -111,8 +122,11 @@ The MCP specification still evolves quickly (auth in particular). Mitigations:
   FastMCP dependency bump (uv lockfile, ADR-0006, keeps this deterministic).
   *Current pin (founder-ratified 2026-08-18, ADR-0035): allowlist
   `{2025-06-18, 2025-11-25}`, advertising `2025-11-25`; `2026-07-28` (stateless core,
-  beta SDKs) is deliberately excluded until reconciled with this document's session
-  model — adopting it is a normal upgrade PR with contract tests.*
+  beta SDKs) is deliberately excluded until it is evaluated against the shipped
+  sessionless model in §2 — adopting it is a normal upgrade PR with contract tests.
+  ADR-0041 closed the FastMCP re-evaluation and kept the adapter in-house **for this
+  bullet's reason**: the allowlist stays a literal in our own code rather than a property
+  of a dependency whose supported-version set moves on its own release cadence.*
 - **The adapter isolates churn**: because MCP touches nothing but
   `interfaces/mcp/`, a breaking spec change is an adapter-sized diff. The runtime
   contract (`ToolCallRequest`/`ToolCallResult`) does not move when MCP does.

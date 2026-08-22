@@ -4,7 +4,7 @@
 > AI engineers: read this at session start (per CLAUDE.md). Detail lives in the linked
 > docs — this file is the dashboard, not the archive.
 >
-> **Last updated:** 2026-08-18 · **Updated by:** CTO Agent
+> **Last updated:** 2026-08-22 · **Updated by:** CTO Agent
 
 ## Current phase
 
@@ -119,8 +119,60 @@ ADR-0038; its own D1–D5 ratified 2026-08-21) is implemented on `feat/m25-oauth
 vault hardening, ADR-0039; A1/A2/A3/P1/P2 ratified 2026-08-22) is implemented on
 `feat/m26-vault-hardening`.
 
-**M2 is NOT complete after M2.6.** Remaining: Connection Health (test-call, status states, Resend
-notifications), MCP streaming transport + `listChanged`, and `client_credentials` (P1).
+**M2 owner decision gate — ratified 2026-08-22, recorded as ADR-0041.** Documentation and decisions
+only: **zero production files, zero migrations, zero dependency changes.** The final M2 learning
+review found three gates that were unrecorded decisions rather than missing implementation, and all
+three are now closed on the record.
+
+**EC3 (ROADMAP §65) — CLOSED.** §65 requires *"security checklist in SECURITY.md for the vault is
+fully checked"*, and no such checklist had ever existed in that document — the criterion named an
+absent artifact, which ADR-0039 and this file had both worked around by reporting only §65's
+red-team clause. Option B was ratified: create the artifact rather than reinterpret the prose or
+amend the roadmap. `docs/SECURITY.md` §2.4 is now a **one-time M2 vault-hardening acceptance
+checklist** — envelope encryption, KEK/key-version handling, HKDF per-workspace derivation, AAD
+binding, v1 compatibility, rotation, retirement gating, the vault access audit, the plaintext
+boundary, structlog and stdlib redaction across all four deployed processes, Celery payload
+discipline, the red-team pass and its positive control — every item checked against evidence already
+in the repository and cited by test path, plus an explicit list of what it does *not* cover (Sentry
+undeployed, external KMS ratified out, no live Redis keyspace scan). **ROADMAP §65 is unchanged and
+ADR-0039 was not rewritten**; the earlier narrowing is recorded as historical context in ADR-0041.
+
+**ROADMAP §55 "streaming transport" — CLOSED by interpretation.** Ratified to mean the Streamable
+HTTP transport that shipped in M2.2, per MCP_RUNTIME §5. It does **not** activate server→client SSE,
+MCP notifications, `listChanged`, or incremental/long-running Tool output — all still deferred, and
+consistent with canon (§3 requires `listChanged` only "on transports that support them"; §4 defers
+async/`pending` because the Runtime has no such status). ROADMAP wording is unchanged. This corrects
+the learning review's earlier "PARTIAL" reading of §55.
+
+**FastMCP re-evaluation — PERFORMED AND CLOSED.** ADR-0035 and MCP_RUNTIME §1 promised this "at
+M2.3"; M2.3 shipped in `93d9a72` and it was never done — an untracked dependency under every future
+MCP decision. Outcome: **keep the in-house adapter.** 604 lines across six files, zero MCP
+dependencies, mutation-audited, EC1-validated, with `RuntimeService.execute` still the sole execution
+authority. The decisive reason is canon's own: MCP_RUNTIME §7 requires the protocol-version allowlist
+to be upgraded deliberately and *never implicitly through a dependency bump*, and adopting an SDK
+would move exactly that control into a dependency. `MCP_RUNTIME.md` §1/§2/§5/§7 were reconciled with
+the shipped sessionless architecture.
+
+**Connection Health notifications — ARCHITECTURALLY RATIFIED, NOT IMPLEMENTED.** ROADMAP §58's Resend
+clause was blocked by ADR-0014, which ADR-0040 rightly refused to amend on its own authority. The
+ratified path leaves **ADR-0014 byte-for-byte unchanged**: a workspace-level notification destination
+stored in `public`, human-supplied — the pattern ADR-0017 already ratified for
+`invitations.invited_email` — delivered through the existing first-party `EmailSender`/Resend path,
+deduplicated with Redis `SET NX` + TTL. No `identity.user` access, no SECURITY DEFINER identity
+function, no `user_id → email` enumeration primitive. Recorded explicitly as a **product decision
+changing the recipient semantics** from "notify workspace Owners and Admins" to "notify the
+workspace's declared notification destination" — these are *not* equivalent. Redis dedup gives
+**exactly one notification winner within the TTL window**, *not* durable exactly-once delivery; a
+flush or eviction can send a duplicate email, accepted because a dedup miss grants no capability.
+**No notification code, migration, template, Celery hook or dedup exists** — it awaits a separate
+M2.10 implementation directive.
+
+**M2 is NOT complete.** Remaining implementation: **ROADMAP §58 failure notifications (M2.10)** — now
+the only substantive M2 blocker, architecture decided, implementation not authorized. Deferred, not
+blocking: `client_credentials` (P1, secret-home undecided), `listChanged`, server→client streaming,
+elicitation, resources/prompts, async/`pending` execution. Moved to M3: the OAuth dashboard dance UI,
+the Connection Health test-call button, all dashboard/UI, `webhooks_outbox` and durable
+exactly-once notification delivery, and per-member notification preferences.
 
 <details><summary>M1 phase summary (historical)</summary>
 
@@ -209,7 +261,7 @@ Full records: docs/DECISIONS.md.
 ## Open questions
 
 1. Product name/domain availability check for "OmniAI Connect" (trademark + .com) — before public launch.
-2. MCP protocol version pinning policy: which spec revisions do we commit to at M2? (docs/MCP_RUNTIME.md flags churn risk.)
+2. **[RESOLVED 2026-08-22 — ADR-0035, ADR-0041]** ~~MCP protocol version pinning policy: which spec revisions do we commit to at M2? (docs/MCP_RUNTIME.md flags churn risk.)~~ Decided: allowlist `{2025-06-18, 2025-11-25}` advertising `2025-11-25` (founder-ratified 2026-08-18, ADR-0035), with `2026-07-28` deliberately excluded. ADR-0041 closed the FastMCP re-evaluation and kept the adapter in-house specifically so this allowlist stays a literal in our own code — MCP_RUNTIME §7 requires protocol revisions to be upgraded deliberately and never implicitly through a dependency bump.
 3. Free-tier limits: which quota (Tool Calls/week) balances evaluation value vs egress cost? (RISKS.md R-cost.)
 4. Neon vs Railway Postgres for staging parity — validate Neon branching workflow in Sprint 1.
 5. **[RESOLVED 2026-08-15 — ADR-0016]** ~~Human workspace-selection mechanism (raised M1.3-B).~~ Decided: the `X-Workspace-Id` header, a selection verified against membership. Implemented in M1.3-C.  

@@ -2160,3 +2160,175 @@ dashboard test-call button (`apps/web` has no product dashboard), the per-Connec
 breaker (CONNECTOR_SPECIFICATION §254, canonically specified but outside ROADMAP's M2 scope), and
 scheduled health checks (no canonical source requires them). **Connection Health is NOT complete,
 and M2 is NOT complete.**
+
+---
+
+## ADR-0041 — M2 owner ratification: EC3's missing checklist, a workspace notification destination, and the FastMCP re-evaluation closed
+
+**Status:** Accepted · **Date:** 2026-08-22 · **Relates to:** ADR-0014 (unchanged), ADR-0017,
+ADR-0035, ADR-0039 (clarified, not amended), ADR-0040 (supersedes its clause 6 deferral rationale
+only insofar as the owner decision it required is now taken)
+
+**Context.** The M2 final learning review found three gates standing between M2 and acceptance, and
+none of them was an implementation problem — each was a decision nobody had recorded. A read-only
+owner decision gate reconstructed all three from canon; this ADR records the founder's rulings. It
+changes no code, no schema, and no dependency.
+
+The three gates: (1) ROADMAP §65 requires *"security checklist in SECURITY.md for the vault is
+fully checked"*, and `docs/SECURITY.md` contained **zero checkbox lines and never used the word
+"checklist"** — the criterion named an artifact that had never existed at any commit; (2) ROADMAP
+§58's Resend failure notifications were blocked by ADR-0014, which ADR-0040 clause 6 correctly
+declined to amend on its own authority; (3) ADR-0035 and MCP_RUNTIME §1 both promised a FastMCP
+re-evaluation *"at M2.3"*. M2.3 shipped in `93d9a72` and the re-evaluation was never performed or
+tracked — an untracked dependency sitting under every future MCP decision.
+
+**Decision.**
+
+1. **EC3's checklist is created, not reinterpreted and not amended away.** `docs/SECURITY.md` gains
+   §2.4, a **one-time M2 vault-hardening acceptance checklist**, every item checked against evidence
+   already in the repository and cited by test path. Three options were weighed: read §2's prose as
+   the checklist (rejected — "fully checked" would denote nothing observable, making the criterion
+   unfalsifiable), amend ROADMAP §65 (rejected — the only clean amendment deletes a requirement, and
+   redefining the roadmap to make M2 appear complete is precisely the move the review forbade), or
+   supply the artifact §65 names. The third satisfies the criterion **as written** at the cost of one
+   documentation change, and it *raises* the documentation bar rather than lowering the criterion.
+   **ROADMAP §65 is unchanged.** §2.4 is explicitly an acceptance record, not a recurring gate:
+   `CLAUDE.md`'s "Security checklist" remains the authority for per-PR review, and §2.4 names what it
+   does **not** cover (Sentry is not deployed; external KMS was ratified out by ADR-0039 A1; Celery
+   payload discipline is proven structurally and by captured dispatch, not by scanning a live broker).
+
+2. **Historical context on ADR-0039 — recorded, not rewritten.** ADR-0039's context paragraph states
+   *"EC3 additionally requires a deliberate red-team pass finding zero plaintext"*, and
+   `PROJECT_STATUS.md` reported EC3 the same way. Both describe only §65's **second** clause. That
+   was an accurate description of the work M2.6 did and an incomplete description of the criterion,
+   and because no checklist existed the omission was invisible. ADR-0039 is **not** edited — ADRs are
+   append-only — and its technical decisions stand unchanged. This clause exists so the narrowing is
+   on the record rather than inherited silently.
+
+3. **Connection Health notifications: a workspace-level notification destination.** Recipients are
+   resolved from a destination stored in `public` and supplied by a human, never from identity data.
+   Concretely ratified: the destination lives on a tenant-scoped, RLS-covered row in the application
+   schema; delivery reuses the existing first-party `EmailSender` / Resend path (`app/core/email.py`);
+   deduplication is Redis `SET NX` + TTL. **No access to `identity.user`. No change to ADR-0014. No
+   SECURITY DEFINER identity function. No `user_id → email` enumeration primitive.**
+
+4. **ADR-0014 remains unchanged, and this is the reason.** ADR-0014 clause 2 grants the two roles
+   nothing on each other's data and says so symmetrically; clause 4 states the API never reads those
+   tables; clause 1 makes rollback safety structural by ensuring no Alembic migration mentions the
+   schema (still zero). ADR-0040 clause 6 established that both possible SECURITY DEFINER shapes
+   breach it — one needs `omniai_identity` to read `public.members`, the reverse grant clause 2
+   forbids; the other hands `omniai_app` a `user_id → email` **user-enumeration primitive**. That
+   primitive is the disqualifying one: `identity.user` is *global*, not tenant-scoped, so the
+   capability would not stop at the workspace that triggered the notification. A feature that emails
+   people is not worth a cross-tenant enumeration oracle.
+
+5. **Why a workspace notification destination is acceptable — it is not a new architecture.**
+   ADR-0017 already faced this exact problem and the founder already ratified the answer: *"an
+   invitation addresses a person by email before they are a user, but the API cannot map an email to a
+   Better Auth subject — it has no access to the `identity` schema (ADR-0014)."* The ratified
+   resolution was for a human to supply the address and for it to live in `public`, which is what
+   `invitations.invited_email` (migration `0006`, `String(320)`) has done in production since M1.3-F.
+   Notifications reuse that pattern rather than inventing one. The PII class is unchanged — a
+   self-declared address on a tenant-scoped row — and it is workspace-scoped where identity data is
+   global.
+
+6. **The recipient semantics change, and the change is deliberate.** ROADMAP §58 and ADR-0040
+   clause 6 both speak of notifying **workspace Owners and Admins**. This is ratified as an explicit
+   product decision:
+
+   > **From:** "Notify workspace Owners and Admins."
+   > **To:** "Notify the workspace's declared notification destination."
+
+   These are **not equivalent**, and nothing downstream may describe them as equivalent. The API
+   cannot enumerate Owners and Admins by email without the identity access clause 4 forbids;
+   `members` stores `user_id` only, deliberately (*"the identity it names lives in a different
+   service… a FK is not merely unnecessary, it is unsatisfiable"*). `HumanIdentity.email` exists but
+   is fenced by ADR-0017 §3 as the one narrow exception to ADR-0015's "claims confer nothing" rule,
+   is request-scoped, and describes only the *calling* human — a Celery health worker holds no JWT
+   and can never use it. A declared destination is therefore a **substitution of the recipient
+   model**, not a resolution of it. Per-member notification preferences remain an additive M3
+   extension on top of this.
+
+7. **First-party email classification is settled and unchanged.** Notification mail is *platform*
+   mail sent by the API, the same class as invitation mail and the JWKS fetch (ADR-0017 §10,
+   ADR-0015 §6) — **not** tenant egress, and therefore not a violation of "the Execution Runtime is
+   the only egress". That rule governs calls made *on a tenant's behalf with a tenant's credential*;
+   Resend is our own vendor called with our own key.
+
+8. **Deduplication is Redis `SET NX` + TTL, and its guarantee is stated precisely.** The same
+   primitive already used by `domains/runtime/idempotency.py` and `domains/connections/idempotency.py`.
+   The key is workspace-scoped and must include the Connection **and** the health-state transition, so
+   `healthy → unhealthy` and a later `needs_reauth` are distinct events rather than one suppressing
+   the other. The TTL is the notification cadence — a *stated* bound, like ADR-0035's 300 s cache TTL,
+   not an accident. What this buys:
+
+   > **Exactly one notification winner within the TTL window.**
+
+   It is **not** durable exactly-once email delivery, and must never be described as such.
+
+9. **The duplicate-email trade is accepted.** Redis is not durable here: eviction, failover or a
+   flush re-arms the key and a duplicate notification can be sent. This is acceptable for health
+   notifications specifically, on a distinction the codebase already draws — rate limits and quotas
+   are **fail-closed** because they are policy, and failing open would grant unauthorized capability;
+   a notification dedup miss grants **no capability**, and its worst outcome is a redundant email.
+   Two constraints follow and are binding on the implementation: Redis unavailability must never
+   block or alter the health verdict itself, and a send failure must never fail the health check.
+   Durable exactly-once delivery requires `webhooks_outbox` (BACKEND_SPEC §94), which remains
+   deferred — that is M3, not a gap in this decision.
+
+10. **The FastMCP re-evaluation promised by ADR-0035 and MCP_RUNTIME §1 is hereby performed and
+    closed. Outcome: keep the in-house adapter.** The re-evaluation was scheduled for the moment
+    `tools/call` landed and was motivated by *streaming and elicitation*. `tools/call` shipped needing
+    neither, and clause 12 below establishes that canon does not currently require either. No MCP
+    dependency is added; the adapter is not migrated.
+
+11. **Why the in-house adapter remains authoritative.** The decisive argument is canon's own:
+    MCP_RUNTIME §7 prescribes that protocol versions be *"upgraded deliberately — **never implicitly
+    by a FastMCP dependency bump**"*. Under the in-house adapter the allowlist
+    `{2025-06-18, 2025-11-25}` is a literal in our code; under an SDK it becomes a property of a
+    dependency whose supported-version set moves on its own release cadence, re-imposed through
+    extension points. Adopting FastMCP would move the one control §7 exists to protect into the one
+    place §7 says it must not live, in exchange for capabilities nothing currently asks for. The
+    existing implementation is 604 lines across six files with **zero MCP dependencies**, is
+    mutation-audited, and preserves every boundary that matters: `RuntimeService.execute` remains the
+    sole execution authority, and the adapter performs no credential decrypt, holds no HTTP client,
+    owns no egress, implements no rate limiting, and writes no audit row (a duplicate audit row is
+    empirically detected — EC1 mutation `E10` is killed). MCP remains a thin adapter. A hybrid —
+    FastMCP for transport only — was rejected outright as strictly worse than either alternative:
+    two protocol implementations means split version-negotiation authority and a doubled auth surface.
+
+12. **ROADMAP §55's "streaming transport" means the Streamable HTTP transport already shipped.**
+    The phrase is four words with no elaboration; it resolves to the domain spec it defers to,
+    MCP_RUNTIME §5: *"**Streamable HTTP** is the primary transport — it is what remote clients
+    (ChatGPT, Claude, Cursor) speak, it works through Cloudflare, and it fits the stateless API."*
+    That transport shipped in M2.2. This interpretation is ratified for M2 roadmap purposes and
+    **ROADMAP §55 is not reworded.** It does **not** activate server→client SSE streaming,
+    long-running or incremental Tool output, server→client MCP notifications, or `listChanged`; those
+    remain deferred until a canonical requirement explicitly calls for them. Two supporting facts,
+    both already canon: MCP_RUNTIME §3 requires `listChanged` only *"on transports that support
+    them"*, which a sessionless POST-only transport does not, so ADR-0035's `listChanged: false` is
+    consistent rather than delinquent; and MCP_RUNTIME §4 states that *"`confirmation_required` and
+    async/`pending` streaming remain deferred (no such Runtime status exists yet)"* — the Runtime has
+    no `pending` status to stream. MCP_RUNTIME §2's session invariant ("every session is bound to
+    exactly one `WorkspaceContext` at connect time") is satisfied more strongly by the sessionless
+    model, which binds every *request*.
+
+**Consequences.** **Documentation only.** No production code, no migration, no schema change, no
+dependency change, no test change. `docs/SECURITY.md` gains §2.4; `docs/MCP_RUNTIME.md` §1/§2/§5/§7
+are reconciled with the ratified architecture (stale prose implying a FastMCP application and a
+connect-time session model); CHANGELOG and PROJECT_STATUS record the rulings. ADR-0014 is byte-for-
+byte unchanged, ROADMAP is unchanged, and ADR-0039 is untouched.
+
+EC3 is closed by clause 1. ROADMAP §55 is closed by clause 12. **ROADMAP §58 is not closed:** clauses
+3–9 ratify an architecture, and the notification implementation — a migration for the destination, the
+service, the Celery hook on the health transition, the email template, and the dedup — is **not
+authorized by this ADR** and awaits a separate M2.10 directive. Until it lands, Connection Health
+remains incomplete for the reason ADR-0040 gave, now with a decided path rather than a blocker.
+
+**Deferred:** the notification implementation itself (M2.10); per-member notification preferences and
+`webhooks_outbox`-backed durable delivery (M3); server→client streaming, MCP notifications,
+`listChanged`, elicitation, resources and prompts (MCP_RUNTIME §6), async/`pending` Tool execution,
+and protocol revision `2026-07-28` — all unchanged from ADR-0035 and ADR-0040. **FastMCP may be
+reconsidered** if a canonical requirement later introduces server→client streaming, elicitation,
+resources, prompts, or long-running/pending Tool execution; at that point it is a deliberate upgrade
+PR with contract tests, never a dependency bump. **M2 remains NOT COMPLETE.**
