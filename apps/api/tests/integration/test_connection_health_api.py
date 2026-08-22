@@ -884,7 +884,9 @@ async def test_a_redis_outage_fails_closed_with_zero_egress(
     response = await client.post(
         f"/v1/connections/{ids['connection_id']}/test", headers=token_headers(workspace_a)
     )
-    assert response.json()["status"] == "unhealthy", response.text
+    # Fail-closed, and — the audit finding — reported as `unknown`, not `unhealthy`: the platform
+    # refused before the Connection was evaluated, so it is not evidence the Connection is broken.
+    assert response.json()["status"] == "unknown", response.text
     assert egress.calls == [], "health reached the network while the rate limiter was unavailable"
 
 
@@ -910,7 +912,182 @@ async def test_rate_limit_denial_stops_the_probe_before_egress(
         f"/v1/connections/{ids['connection_id']}/test", headers=token_headers(workspace_a)
     )
     assert response.status_code == 200
-    assert response.json()["status"] == "unhealthy"
+    # `unknown`, not `unhealthy`: the Connection was never reached. The denial is still audited —
+    # the Runtime owns that record — it simply is not a health verdict.
+    assert response.json()["status"] == "unknown"
+    assert response.json()["reason"] == "rate_limited"
     assert egress.calls == [], "a rate-limited health check still called the provider"
     rows = await audit_rows(admin_engine, ids["connection_id"])
     assert [r[0] for r in rows] == ["denied"]
+
+
+@pytest.mark.asyncio
+async def test_a_platform_denial_does_not_overwrite_a_known_good_health_verdict(
+    client: AsyncClient,
+    admin_engine: AsyncEngine,
+    workspace_a: SeededWorkspace,
+    egress: _Egress,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for the defect the release audit found (ADR-0040 §5).
+
+    A Workspace exhausting its weekly quota — or a Redis outage failing closed down the same path —
+    used to flip **every** Connection to `unhealthy` and overwrite its `last_health_check_at`,
+    even though nothing about the Connection had changed and no request reached the provider. The
+    bad verdict then outlived the incident, because only a fresh successful check could clear it.
+
+    A stage-3 policy refusal must therefore leave the previous verdict and its timestamp exactly
+    as they were.
+    """
+    from app.core.exceptions import QuotaExceededError
+
+    ids = await seed(admin_engine, workspace_a.id)
+    await client.post(
+        f"/v1/connections/{ids['connection_id']}/test", headers=token_headers(workspace_a)
+    )
+    good_stamp = (await connection_row(admin_engine, ids["connection_id"])).last_health_check_at
+    assert good_stamp is not None
+
+    async def _quota(**_: object) -> None:
+        raise QuotaExceededError("The workspace's weekly Tool Call quota is exhausted.")
+
+    monkeypatch.setattr("app.domains.runtime.service.enforce_tool_call_limits", _quota)
+    denied = await client.post(
+        f"/v1/connections/{ids['connection_id']}/test", headers=token_headers(workspace_a)
+    )
+
+    assert denied.json()["status"] == "unknown"
+    assert denied.json()["reason"] == "quota_exceeded"
+    assert denied.json()["checked_at"] is None, "a refusal must not claim a check time"
+    after = (await connection_row(admin_engine, ids["connection_id"])).last_health_check_at
+    assert after == good_stamp, "a platform denial overwrote a known-good health timestamp"
+    # The denial is still audited — audit integrity is the Runtime's, and it is unchanged.
+    assert [r[0] for r in await audit_rows(admin_engine, ids["connection_id"])] == [
+        "succeeded",
+        "denied",
+    ]
+
+
+# ============================== release-audit additions: the REAL egress guard, not a fake
+#
+# The suite above fakes `net.request` and raises `SSRFError` from it, which proves the endpoint
+# *handles* a refusal but not that a refusal actually happens. These tests use the genuine
+# `core/net` stack — no monkeypatch on egress at all — so the DNS resolution, IP classification and
+# refusal are the real implementation. If the health path ever grew its own HTTP client, or reached
+# the network before validation, these are the tests that would notice.
+
+
+@pytest.mark.parametrize(
+    ("label", "base_url"),
+    [
+        ("loopback", "https://127.0.0.1"),
+        ("ipv6 loopback", "https://[::1]"),
+        ("cloud metadata", "https://169.254.169.254"),
+        ("RFC1918", "https://10.0.0.1"),
+        ("link-local", "https://169.254.1.1"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_the_real_ssrf_guard_refuses_private_targets_through_the_health_path(
+    client: AsyncClient,
+    admin_engine: AsyncEngine,
+    workspace_a: SeededWorkspace,
+    label: str,
+    base_url: str,
+) -> None:
+    """No egress monkeypatch — the actual guarded client validates and refuses."""
+    ids = await seed(admin_engine, workspace_a.id)
+    async with admin_engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE connectors SET base_url=:u WHERE id=:i"),
+            {"u": base_url, "i": ids["connector_id"]},
+        )
+    response = await client.post(
+        f"/v1/connections/{ids['connection_id']}/test", headers=token_headers(workspace_a)
+    )
+    assert response.status_code == 200, label
+    body = response.json()
+    assert body["status"] == "unhealthy", f"{label}: a private target was not refused"
+    assert body["reason"] == "ssrf_blocked", f"{label}: got {body['reason']}"
+    # The refusal must not disclose what was resolved or attempted.
+    for leak in ("127.0.0.1", "169.254", "10.0.0.1", "::1", "blocked-", "resolve"):
+        assert leak not in response.text, f"{label}: response leaked {leak!r}"
+    # A refused egress is a Connection fact, so it *is* a completed health check.
+    assert [r[0] for r in await audit_rows(admin_engine, ids["connection_id"])] == ["denied"]
+    assert (
+        await connection_row(admin_engine, ids["connection_id"])
+    ).last_health_check_at is not None
+
+
+@pytest.mark.asyncio
+async def test_an_unresolvable_host_is_refused_by_the_real_guard(
+    client: AsyncClient, admin_engine: AsyncEngine, workspace_a: SeededWorkspace
+) -> None:
+    ids = await seed(admin_engine, workspace_a.id)
+    async with admin_engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE connectors SET base_url=:u WHERE id=:i"),
+            {"u": f"https://{uuid.uuid4().hex}.invalid", "i": ids["connector_id"]},
+        )
+    body = (
+        await client.post(
+            f"/v1/connections/{ids['connection_id']}/test", headers=token_headers(workspace_a)
+        )
+    ).json()
+    assert body["status"] == "unhealthy"
+    assert body["reason"] == "ssrf_blocked"
+    assert ".invalid" not in json.dumps(body)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_health_checks_each_produce_their_own_audited_outcome(
+    client: AsyncClient, admin_engine: AsyncEngine, workspace_a: SeededWorkspace, egress: _Egress
+) -> None:
+    """Concurrency semantics, asserted rather than assumed.
+
+    No canonical source requires health checks to serialize, and none is invented here: a health
+    check is an ordinary Tool Call, and concurrent Tool Calls are normal and already bounded by the
+    M2.4 rate limiter. What must hold is that concurrency stays *coherent* — every invocation is
+    independently audited, and the Connection ends on a real verdict with a timestamp that matches
+    one of the rows actually written, never a blend of two.
+    """
+    import asyncio
+
+    ids = await seed(admin_engine, workspace_a.id)
+    responses = await asyncio.gather(
+        *(
+            client.post(
+                f"/v1/connections/{ids['connection_id']}/test", headers=token_headers(workspace_a)
+            )
+            for _ in range(8)
+        )
+    )
+    assert all(r.status_code == 200 for r in responses)
+    assert all(r.json()["status"] == "healthy" for r in responses)
+
+    rows = await audit_rows(admin_engine, ids["connection_id"])
+    assert len(rows) == 8, f"expected one audit row per invocation, got {len(rows)}"
+    assert len(egress.calls) == 8
+
+    stamp = (await connection_row(admin_engine, ids["connection_id"])).last_health_check_at
+    assert stamp in {created_at for _, created_at in rows}, (
+        "the stored timestamp does not correspond to any audit row actually written"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_identical_request_replayed_is_a_fresh_independent_check(
+    client: AsyncClient, admin_engine: AsyncEngine, workspace_a: SeededWorkspace, egress: _Egress
+) -> None:
+    """Replay is not deduplicated, and should not be: a health check is a point-in-time probe, so
+    asking twice must genuinely ask twice. Each replay is separately audited."""
+    ids = await seed(admin_engine, workspace_a.id)
+    first = await client.post(
+        f"/v1/connections/{ids['connection_id']}/test", headers=token_headers(workspace_a)
+    )
+    second = await client.post(
+        f"/v1/connections/{ids['connection_id']}/test", headers=token_headers(workspace_a)
+    )
+    assert first.json()["tool_call_id"] != second.json()["tool_call_id"]
+    assert len(await audit_rows(admin_engine, ids["connection_id"])) == 2
+    assert len(egress.calls) == 2

@@ -2114,8 +2114,16 @@ path, a new audit ledger, and any change to `tool_calls`.
    present only in docstrings — is finally surfaced, and `last_health_check_at`, a column that
    shipped in M1 and had never been written, is finally populated.
 
-5. **"Completed check" is defined by the Runtime's own audited/pre-audit boundary.** An
-   `ExecutionOutcome` exists only when an audit row was written, so that is exactly when
+5. **"Completed check" means the Connection was actually evaluated.** An `ExecutionOutcome`
+   exists only when an audit row was written, and that is the starting point — with one exception
+   the release audit found and corrected: the **M2.4 stage-3 policy refusals** (`rate_limited`,
+   `quota_exceeded`) are platform decisions taken before any Connection-specific work, so they say
+   nothing about the Connection. They are still audited, but they report `unknown` and leave the
+   previous verdict and timestamp untouched. Treating them as verdicts let an exhausted weekly
+   quota — or a Redis outage failing closed down the same path — flip every Connection in a
+   Workspace to `unhealthy` and destroy a known-good timestamp, a verdict that then outlived the
+   incident. `EgressBlockedError` and `ConflictError` remain health facts (the Connector's own base
+   URL is forbidden; the Connection is inactive or has no credential). Otherwise
    `last_health_check_at` is stamped — from the audit row's **own** `created_at`, which lets the
    projection join back to that specific check. Pre-audit failures raise and correctly leave the
    timestamp alone. A failed probe never changes `connection.status`: health is an observation, and

@@ -28,7 +28,12 @@ import structlog
 
 from app.core.config import settings
 from app.core.db import UnitOfWork
-from app.core.exceptions import ConflictError, NotFoundError
+from app.core.exceptions import (
+    ConflictError,
+    NotFoundError,
+    QuotaExceededError,
+    RateLimitedError,
+)
 from app.core.security import WorkspaceContext
 from app.domains.connections.health import HealthState, select_probe_tool
 from app.domains.connections.repository import ConnectionRepository
@@ -41,6 +46,19 @@ log = structlog.get_logger(__name__)
 #: outcome, not an error: refusing to probe is the correct behaviour, and the caller needs to be
 #: able to tell it apart from a provider failure.
 UNAVAILABLE_REASON = "health_check_unavailable"
+
+#: Stage-3 policy refusals (M2.4). These are **platform** decisions taken before any
+#: Connection-specific work happens — no credential is decrypted and nothing is sent upstream — so
+#: they say nothing whatsoever about whether the Connection is usable. They are audited (the denial
+#: really occurred and the Runtime owns that record), but they are deliberately **not** treated as
+#: a completed health check: doing so let an exhausted weekly quota, or a Redis outage failing
+#: closed, flip every Connection in a Workspace to `unhealthy` and overwrite a known-good
+#: `last_health_check_at` — a verdict that then outlived the incident until someone re-checked.
+#:
+#: Note the contrast with the denials that *are* health facts: `EgressBlockedError` means this
+#: Connector's own base URL resolves somewhere forbidden, and `ConflictError` means the Connection
+#: is inactive or has no credential. Both are properties of the Connection and stay `unhealthy`.
+_POLICY_REFUSALS = (RateLimitedError, QuotaExceededError)
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +121,23 @@ class ConnectionHealthService:
         # wrote exactly one `tool_calls` row. That is the canonical definition of "a health check
         # completed" — pre-audit failures (unknown Tool, unbindable Connection) raise instead, and
         # correctly leave the timestamp alone because nothing was actually attempted upstream.
+        if outcome.error is not None and isinstance(outcome.error, _POLICY_REFUSALS):
+            # The Connection was never evaluated. Report that honestly and leave the previous
+            # verdict — and its timestamp — untouched.
+            log.info(
+                "connection.health_check_not_evaluated",
+                workspace_id=str(self._ctx.workspace_id),
+                connection_id=str(connection_id),
+                reason=outcome.error.code,
+                tool_call_id=str(outcome.tool_call_id),
+            )
+            return HealthCheckResult(
+                status=HealthState.UNKNOWN,
+                checked_at=None,
+                reason=outcome.error.code,
+                tool_call_id=outcome.tool_call_id,
+            )
+
         row = await self._repository.audit_row(outcome.tool_call_id)
         checked_at = row.created_at if row is not None else None
         if checked_at is not None:
