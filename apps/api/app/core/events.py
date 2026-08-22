@@ -179,6 +179,17 @@ class EventBus:
         """
         self._handlers.setdefault(event_type, []).append(handler)
 
+    def is_subscribed(self, event_type: str, handler: Handler) -> bool:
+        """Whether this exact handler is already registered for `event_type`.
+
+        Exists so a domain whose subscribers are registered from more than one composition root
+        (M2.10: the API process *and* the Celery worker) can make its registration idempotent
+        without reaching into the handler map. `subscribe` deliberately appends — multiple distinct
+        handlers per type is a supported shape — so "already registered" is a question only the
+        caller can decide is relevant.
+        """
+        return handler in self._handlers.get(event_type, ())
+
     def publish(self, event: Event) -> None:
         """Buffer an event on the ambient transaction (canon `bus.publish(event)`).
 

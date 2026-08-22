@@ -11,11 +11,16 @@ What that buys, concretely: a health check cannot become a privileged probe. It 
 endpoint a Tool Call could not reach, cannot skip a quota a Tool Call would pay, and cannot
 produce a result that never appeared in the audit ledger.
 
-**Notifications are deliberately absent.** ROADMAP §58 also asks for Resend failure notifications;
-resolving Owner/Admin email addresses requires identity data that ADR-0014 keeps unreachable from
-the application role, in both directions and on purpose. That half is deferred pending an owner
-decision on the identity boundary — see the M2.7 ADR. Nothing here should be extended to send mail
-without that decision.
+**Notifications (M2.10, ADR-0041).** ROADMAP §58's Resend clause is delivered, and this module's
+part in it is one line: when a completed check finds the Connection unhealthy, it publishes
+`connection.health_check_failed` on the internal bus. It sends nothing. It does not know an address,
+does not touch Redis, and does not import the notifications domain — the event is a fact about
+committed state, and everything downstream of it (destination lookup, deduplication, delivery,
+retry) belongs to a subscriber and a Celery task.
+
+Publishing rather than sending is what keeps the two concerns separable: the bus buffers on the
+UnitOfWork and dispatches only after COMMIT, so a rolled-back check notifies nobody, and a failing
+mail provider cannot reach back into a health verdict that has already been written.
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ import structlog
 
 from app.core.config import settings
 from app.core.db import UnitOfWork
+from app.core.events import event_bus
 from app.core.exceptions import (
     ConflictError,
     NotFoundError,
@@ -35,6 +41,7 @@ from app.core.exceptions import (
     RateLimitedError,
 )
 from app.core.security import WorkspaceContext
+from app.domains.connections.events import connection_health_check_failed
 from app.domains.connections.health import HealthState, select_probe_tool
 from app.domains.connections.repository import ConnectionRepository
 from app.domains.runtime.schemas import ToolCallCreate
@@ -150,6 +157,23 @@ class ConnectionHealthService:
                 connection_id=str(connection_id),
                 reason=outcome.error.code,
                 tool_call_id=str(outcome.tool_call_id),
+            )
+            # M2.10: the notifiable fact. Buffered on the UnitOfWork and dispatched only after this
+            # request's transaction commits, so a rolled-back check emits nothing and the
+            # notification can never observe a health verdict that was not durably written.
+            #
+            # Reached only on this branch, which is the whole ratified matrix for the health path:
+            # a policy refusal returned `unknown` above without stamping, a refused probe returned
+            # `unknown` earlier still, and success falls through below. `needs_reauth` is not
+            # produced here at all — it arrives on the OAuth worker's `connection.deactivated`.
+            event_bus.publish(
+                connection_health_check_failed(
+                    self._ctx.workspace_id,
+                    connection_id=connection.id,
+                    # The stable, enumerated Runtime code. Never `str(exception)`, which for an
+                    # upstream failure can carry a provider message and with it a leaked secret.
+                    reason=outcome.error.code,
+                )
             )
             return HealthCheckResult(
                 status=HealthState.UNHEALTHY,
