@@ -1,4 +1,6 @@
-"""Workspace notification destination (M2.10, ROADMAP §58; architecture ratified in ADR-0041).
+"""Workspace notification destination (M2.10, ROADMAP §58; ADR-0042).
+
+Architecture ratified in ADR-0041 (owner decision gate); ADR-0042 records this implementation.
 
 One nullable column and nothing else. ROADMAP §58 asks for Connection Health *failure
 notifications*, and notifying anyone requires an address the API is allowed to know. Member email
