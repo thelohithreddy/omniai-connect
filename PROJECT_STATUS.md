@@ -9,8 +9,9 @@
 ## Current phase
 
 **M2 — MCP Interface, credential vault, OAuth: IN PROGRESS.** **M2.6 (Credential Vault Hardening,
-ADR-0039; A1/A2/A3/P1/P2 founder-ratified 2026-08-22) is implemented on
-`feat/m26-vault-hardening`** — the four ROADMAP §56 vault deliverables: a multi-version local KEK
+ADR-0039; A1/A2/A3/P1/P2 founder-ratified 2026-08-22) is RELEASED to `main`** as the `--no-ff`
+merge `84646f0` (2026-08-22; implementation `92eb1c7`, audit fixes `c3d6760`, merged tree
+byte-identical to the independently audited tree `5f452d9^{tree}`) — the four ROADMAP §56 vault deliverables: a multi-version local KEK
 keyring behind a stable `KeyProvider` seam (no KMS, per ratified A1), HKDF-derived per-workspace
 data keys with **version 1 preserved as M1's direct-KEK wrapping forever** (so the hierarchy
 arrives *as* a rotation instead of orphaning every stored credential), the five-step rotation
@@ -20,8 +21,24 @@ four deployed processes — a gap verified leaking `api_key=…` from `celery.wo
 Migration 0014 is additive (two SECURITY DEFINER functions + a `key_version` index; no table, no
 column). 1516 tests green, 24-mutation audit (23 killed, 1 empirically-proven inert, 0 meaningful
 survivors), EC3 red-team pass finding **zero** plaintext across every table, the log stream, and
-Celery arguments. Default configuration is behaviourally identical to M2.5. Not yet promoted to
-`main`.
+Celery arguments. Default configuration is behaviourally identical to M2.5.
+
+An **independent release audit** re-derived every claim from code, database and running
+infrastructure, and closed three defects the implementation missed: `credential_type` was shipping
+as «redacted» (gutting the very audit A2 ratified — the tests observed the event *before* the
+redaction processor, so they could not see it); a generated `celerybeat-schedule` artifact had been
+committed; and a key-shaped test canary would have failed CI's secret scan. It also added the
+rotation concurrency coverage (2/4/8 workers, plus rotation racing a concurrent re-seal) without
+which removing the `FOR UPDATE` claim went undetected. Post-merge on `main`: 1524 tests, ruff /
+format / mypy / `alembic check` clean, migration reversible head→base→head, both production Docker
+images build, 36 mutations (35 killed, 1 empirically proven inert), Gitleaks **0 findings in the
+M2.6 range** (5 findings remain from pre-M2.6 history, unchanged), and a live stack smoke in which
+an M1-era credential and a v2 credential each survive seal → read → rotate → read.
+
+**M2 completion tracker.** MCP tools/list DONE · MCP tools/call DONE · rate limits & quotas DONE ·
+OAuth auth-code + PKCE DONE · OAuth refresh DONE · OAuth runtime injection DONE · vault hardening
+DONE · **Connection Health NOT STARTED** · MCP streaming DEFERRED · MCP `listChanged` DEFERRED ·
+OAuth `client_credentials` DEFERRED · M3 NOT STARTED. **M2 is therefore NOT COMPLETE.**
 
 **M2.5 (OAuth 2.0) is RELEASED to `main`** as the `--no-ff` merge `82cd651` (2026-08-21; implementation `f3d7e35`, audited tree
 `d568022`, tree byte-identical to the audited SHA), after an independent adversarial release audit:

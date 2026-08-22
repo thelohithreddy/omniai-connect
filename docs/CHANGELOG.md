@@ -13,7 +13,7 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
-- **Credential vault hardening (M2.6, ADR-0039).** Key rotation, derived per-Workspace data keys,
+- **Credential vault hardening (M2.6, ADR-0039).** *Released to `main` as `84646f0`.* Key rotation, derived per-Workspace data keys,
   redaction across every deployed log sink, and a vault access audit — the four ROADMAP §56 vault
   deliverables. The KEK becomes a **versioned keyring** (`CREDENTIAL_MASTER_KEY` is version 1
   permanently; `CREDENTIAL_MASTER_KEYS` supplies 2+) behind a stable `KeyProvider` seam, so a future
