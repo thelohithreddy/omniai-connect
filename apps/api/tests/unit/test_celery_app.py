@@ -83,6 +83,7 @@ def test_the_registered_tasks_are_exactly_the_declared_set() -> None:
     Celery registers a task at import time, so an implicit import elsewhere in the suite would
     otherwise make this assertion order-dependent.
     """
+    import app.workers.notification_tasks  # noqa: F401
     import app.workers.oauth_tasks  # noqa: F401
     import app.workers.tasks  # noqa: F401
     import app.workers.vault_tasks  # noqa: F401
@@ -98,6 +99,8 @@ def test_the_registered_tasks_are_exactly_the_declared_set() -> None:
         "workers.oauth.refresh_credential",  # M2.5 per-credential refresh (runtime queue)
         "workers.vault.sweep_key_rotations",  # M2.6 re-wrap discovery (runtime queue)
         "workers.vault.rewrap_credential_key",  # M2.6 per-credential re-wrap (runtime queue)
+        # M2.10 Connection Health failure notifications (runtime queue)
+        "workers.notifications.send_health_notification",
     }
 
 
@@ -109,6 +112,7 @@ def test_the_worker_autodiscovers_tasks_via_include() -> None:
         "app.workers.tasks",
         "app.workers.oauth_tasks",
         "app.workers.vault_tasks",
+        "app.workers.notification_tasks",
     ]
 
 

@@ -63,7 +63,12 @@ plugins = ["pydantic.mypy"]
 # Celery's `@app.task` decorator is untyped in the library, which strict mode flags on every
 # task. The task bodies themselves are fully typed and checked; only the decorator is exempt.
 [[tool.mypy.overrides]]
-module = ["app.workers.tasks", "app.workers.oauth_tasks", "app.workers.vault_tasks"]
+module = [
+    "app.workers.tasks",
+    "app.workers.oauth_tasks",
+    "app.workers.vault_tasks",
+    "app.workers.notification_tasks",
+]
 disallow_untyped_decorators = false
 
 # Celery and Kombu ship no type stubs / py.typed marker; our own code stays fully typed.
