@@ -66,6 +66,16 @@ two Connectors (api_key + oauth2), a real MCP client running `initialize` → `t
 audit row per call, and no credential in any response, log or audit row. An 11-mutation audit
 against that test has **0 meaningful survivors**. The independent audit re-derived every claim with its own canaries and seeding — credential isolation at both provider seams, cross-wiring refusal, tenant isolation, stale-discovery refusal, the real SSRF guard, audit integrity, 8-way concurrency without credential crossover, and a DB/Redis secret sweep with a validated positive control — at 1601 tests, all gates green, zero production files and zero migrations changed.
 
+**EC2 is now EVIDENCED** on `feat/m29-ec2-auto-refresh-evidence`. The M2 reconciliation
+downgraded EC2 from "MET": the refresh *mechanics* were well tested, but every test called
+`refresh_connection` directly, so the word the criterion turns on — *automatically* — was unproven.
+`tests/integration/test_ec2_automatic_refresh.py` now drives the chain from database state through
+the production sweep: a genuinely due credential is discovered by the real `auth.due_oauth_refreshes`
+SECURITY DEFINER function, fanned out with identifier-only arguments, refreshed, rotated and
+persisted, with a not-due control in the same Workspace left untouched and a second sweep declining
+to rediscover it. A 12-mutation audit has 0 survivors, including a **live mutation of the SQL
+discovery function itself**. Zero production files and zero migrations changed. Not promoted.
+
 **EC1 does not make M2 complete.** Connection Health notifications remain DEFERRED and BLOCKED BY ADR-0014; MCP streaming and `listChanged` remain DEFERRED; OAuth `client_credentials` remains DEFERRED; dashboard/UI is M3; F2 (Tool-name resolution) stays a pre-existing Runtime hardening item; M3 is NOT STARTED.
 
 **M2 completion tracker.** MCP tools/list DONE · MCP tools/call DONE · rate limits & quotas DONE ·
