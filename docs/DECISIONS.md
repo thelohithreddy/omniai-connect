@@ -2073,3 +2073,82 @@ concurrent re-seal), without which removing the `FOR UPDATE` claim went undetect
 **Deferred:** external KMS/HSM (Team/Enterprise), Sentry `before_send`, automatic key generation,
 per-Connector credential field-name registration in the redactor, a metrics exporter (the counter is
 a hook with a bound, not a backend). **M2 is NOT complete after M2.6.**
+
+---
+
+## ADR-0040 — Connection Health: a Tool Call through the Runtime; notifications blocked by ADR-0014 (M2.7-A)
+
+**Status:** Accepted · **Date:** 2026-08-22 · **Relates to:** ADR-0014 (unchanged), ADR-0038
+
+**Context.** ROADMAP §58 is one sentence: *"Connection health: test-call button, status states,
+failure notifications (Resend)."* Discovery found that canon already answers the central design
+question. AI_RUNTIME §2 stage 1 authenticates *"the workspace-scoped api token **or the session
+Member for dashboard 'test call'**"*, and stage 2 resolves Tool + Connection — so a test call is an
+ordinary Tool Call, not a Tool-less probe. That single fact removes the need for a new execution
+path, a new audit ledger, and any change to `tool_calls`.
+
+**Decision.**
+
+1. **A health check is an ordinary Tool Call.** The endpoint `POST /v1/connections/{id}/test` is a
+   thin door onto `RuntimeService.execute` (AI_RUNTIME §4, "one runtime, many doors"). It performs
+   no HTTP, decrypts nothing, validates no egress, enforces no limits and writes no audit row.
+   Consequently rate limits, quota, argument validation, credential decrypt-at-use, SSRF, timeout
+   and the audit write are inherited unchanged, and a health check can never reach somewhere a
+   Tool Call could not.
+
+2. **Authorization is `tools:execute`, not `connections:manage`.** A health check executes a real
+   Tool against a real third-party API with the Connection's real credential, so it must carry
+   exactly Tool Call authority. Gating it on connection administration would let a role that may
+   not execute Tools cause authenticated egress, and would deny a MEMBER who legitimately may.
+
+3. **Probe selection is fail-closed and deterministic.** A Tool is eligible only when it is
+   enabled, live, annotated `readonly: true`, **and** requires no arguments; missing annotations
+   (the `'{}'` column default) mean *unsafe*. Eligible Tools are ordered by canonical name and the
+   first is taken, so the same Connector probes the same endpoint on every check. Zero eligible
+   Tools is the first-class outcome `health_check_unavailable` — refusing is correct, and the only
+   alternative would be fabricating a request against a customer's live API.
+
+4. **Health is derived; the released `status` CHECK is untouched.** `unknown | healthy | unhealthy
+   | needs_reauth`, computed from authoritative state, exactly as M2.5 derived `needs_reauth`
+   rather than adding a fifth status (ADR-0038 D5). `needs_reauth` — ratified in M2.5 and until now
+   present only in docstrings — is finally surfaced, and `last_health_check_at`, a column that
+   shipped in M1 and had never been written, is finally populated.
+
+5. **"Completed check" is defined by the Runtime's own audited/pre-audit boundary.** An
+   `ExecutionOutcome` exists only when an audit row was written, so that is exactly when
+   `last_health_check_at` is stamped — from the audit row's **own** `created_at`, which lets the
+   projection join back to that specific check. Pre-audit failures raise and correctly leave the
+   timestamp alone. A failed probe never changes `connection.status`: health is an observation, and
+   letting it transition the lifecycle would hand anyone with `tools:execute` a way to deactivate a
+   Connection by pointing it at a flaky endpoint.
+
+6. **Failure notifications are DEFERRED — blocked by ADR-0014.** ROADMAP §58's Resend clause is
+   *not* delivered. Notifying Workspace Owners and Admins requires their email addresses, which
+   live in `identity.user`. ADR-0014 clause 2 grants the two roles **nothing on each other's data**
+   and says so symmetrically; clause 4 states **"the API never reads these tables"**; clause 1
+   makes rollback safety structural by ensuring **no Alembic migration mentions the schema**
+   (verified: still zero). Both possible SECURITY DEFINER shapes breach it — one needs
+   `omniai_identity` to read `public.members` (the reverse grant clause 2 forbids), the other hands
+   `omniai_app` a `user_id → email` **user-enumeration primitive**. ADR-0014 is **not** amended
+   here; the notification architecture requires a separate owner decision.
+
+**Consequences.** **No migration** — `last_health_check_at` already existed and `tool_calls` is
+unchanged (`alembic check` clean, zero migration files touched). One new setting
+(`CONNECTION_HEALTH_ENABLED`); no new dependency, no new queue, no scheduled work, no MCP change
+(zero files under `app/interfaces` touched). `ConnectionRead` gains `health` and `needs_reauth`
+additively.
+
+Proven by 1587 passing tests, including 33 domain-rule units over a hostile Tool inventory and 31
+real-Postgres+RLS+Runtime integration tests (audit-exactly-once, zero-egress refusal, both flag
+states, the full RBAC matrix, cross-tenant indistinguishability, OAuth injection reuse, SSRF,
+timeout, rate-limit denial and Redis-outage fail-closed **through the health door**), plus a
+26-mutation audit with **0 survivors**. Four mutations survived the first pass and were closed with
+tests rather than explained away: a prose failure reason, an RLS-masked repository predicate, an
+untested SQL liveness filter, and — the substantive one — a projection that would have let ordinary
+Tool Call traffic flip a Connection's health.
+
+**Deferred:** failure notifications (Resend) and recipient resolution, `webhooks_outbox`, the
+dashboard test-call button (`apps/web` has no product dashboard), the per-Connection circuit
+breaker (CONNECTOR_SPECIFICATION §254, canonically specified but outside ROADMAP's M2 scope), and
+scheduled health checks (no canonical source requires them). **Connection Health is NOT complete,
+and M2 is NOT complete.**
