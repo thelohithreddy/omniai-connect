@@ -24,8 +24,10 @@ from app.core.pagination import (
     resolve_limit,
 )
 from app.domains.connections.events import connection_revoked
+from app.domains.connections.health import needs_reauth, project_health
 from app.domains.connections.models import Connection
 from app.domains.connections.repository import ConnectionRepository
+from app.domains.connections.schemas import ConnectionRead
 from app.domains.connectors.service import validate_base_url
 
 
@@ -56,6 +58,53 @@ class ConnectionPage:
 class ConnectionService:
     def __init__(self, repository: ConnectionRepository) -> None:
         self._repository = repository
+
+    async def read_models(self, connections: list[Connection]) -> list[ConnectionRead]:
+        """Render Connections with their derived health, batching the projection inputs.
+
+        The projection lives here rather than in the schema because it needs authoritative
+        database state (the credential's type, and the audit status of the row that Connection's
+        own last health check wrote). Deriving it in the read model would either mean a schema
+        that queries — which it must not — or a field that silently reports `unknown` forever,
+        which is the dead-field problem this slice exists to end.
+        """
+        inputs = await self._repository.health_inputs([c.id for c in connections])
+        rendered: list[ConnectionRead] = []
+        for connection in connections:
+            credential_type, last_check_status = inputs.get(connection.id, (None, None))
+            rendered.append(
+                ConnectionRead.model_validate(
+                    {
+                        **{
+                            field: getattr(connection, field)
+                            for field in (
+                                "id",
+                                "connector_id",
+                                "name",
+                                "status",
+                                "config_overrides",
+                                "credential_id",
+                                "last_health_check_at",
+                                "created_at",
+                            )
+                        },
+                        "health": project_health(
+                            connection_status=connection.status,
+                            credential_type=credential_type,
+                            last_health_check_at=connection.last_health_check_at,
+                            last_check_status=last_check_status,
+                        ).value,
+                        "needs_reauth": needs_reauth(
+                            connection_status=connection.status, credential_type=credential_type
+                        ),
+                    }
+                )
+            )
+        return rendered
+
+    async def read_model(self, connection: Connection) -> ConnectionRead:
+        """One Connection rendered with its derived health."""
+        return (await self.read_models([connection]))[0]
 
     async def create(
         self, *, connector_id: uuid.UUID, name: str, config_overrides: dict[str, Any]

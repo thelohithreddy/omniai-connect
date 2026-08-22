@@ -100,6 +100,12 @@ class Settings(BaseSettings):
     # Bounded retry for a failing refresh before the Connection is transitioned to `error`.
     oauth_refresh_max_attempts: int = 5
 
+    # --- Connection Health (M2.7-A, ROADMAP §58) ---
+    # Kill switch: an operational rollback lever. False makes the health endpoint refuse before any
+    # lookup, execution, credential access or state mutation. It cannot weaken an existing
+    # Connection — health is a read-only observation plus one timestamp.
+    connection_health_enabled: bool = True
+
     # --- Auth (Better Auth — provider in apps/web per ADR-0002/0014; verified here per
     # ADR-0015) ---
     better_auth_secret: SecretStr = SecretStr("change-me-32-chars-minimum")
