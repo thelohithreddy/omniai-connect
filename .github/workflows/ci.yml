@@ -130,6 +130,20 @@ jobs:
       # runs *after* the build because it scans `.next/static`, and it refuses to pass when it
       # finds zero artifacts rather than reporting a vacuous clean result. Its scanner proves
       # itself against a planted canary first.
+      # Re-runs the one Vitest file that needs build output (MC1.3). The main `test:unit` step
+      # deliberately runs before the build for fast feedback, and this file skips loudly when
+      # `.next/prerender-manifest.json` is absent — so without this step it would skip on every
+      # CI run and the invariant it guards would be silently unenforced.
+      #
+      # What it guards is not cosmetic: that no authenticated or workspace-scoped route is
+      # statically prerendered (a prerendered authenticated page is built once, with no session,
+      # then served to everyone), and that the set of static routes stays exactly the reviewed
+      # allowlist — every entry on it being a route F6 will break when MC1.8 enforces CSP.
+      - name: Rendering-mode invariants (needs build output)
+        env:
+          NEXT_PUBLIC_APP_URL: http://localhost:3000
+        run: pnpm --filter web exec vitest run src/app/rendering-mode.test.ts
+
       - name: Browser artifact secret scan
         env:
           NEXT_PUBLIC_APP_URL: http://localhost:3000
