@@ -51,6 +51,43 @@ entries move into a versioned section at release tag time (ADR-0005).
   `autoretry_for=(httpx.HTTPError,)` — narrow on purpose, so a template bug surfaces instead of
   retrying five times. Delivery remains best-effort: the bus is at-most-once and Redis dedup is not
   durable exactly-once, so a flush permits one duplicate. Durable delivery is M3's `webhooks_outbox`.
+- **M2 owner ratification — EC3 acceptance checklist, notification architecture, FastMCP closed
+  (ADR-0041).** Documentation and decisions only: **no production code, no migration, no schema
+  change, no dependency change, no test change.** Three M2 gates that were decisions rather than
+  implementation problems are now recorded. **EC3:** ROADMAP §65 requires a vault security checklist
+  in `SECURITY.md`, and none existed — the criterion named an artifact absent at every commit, which
+  ADR-0039 and PROJECT_STATUS had quietly worked around by reporting only §65's red-team clause.
+  `SECURITY.md` gains §2.4, a one-time M2 vault-hardening acceptance checklist whose every item is
+  checked against evidence already in the repository and cited by test path (envelope encryption, KEK
+  and key-version handling, HKDF per-workspace derivation, AAD binding, v1 compatibility, rotation,
+  retirement gating, vault access audit, the plaintext boundary, structlog and stdlib redaction across
+  all four deployed processes, Celery payload discipline, the red-team pass, and its positive control),
+  and which names what it does *not* cover. §65 is **not** reworded and ADR-0039 is **not** rewritten.
+  **Streaming:** ROADMAP §55's "streaming transport" is ratified to mean the Streamable HTTP transport
+  that shipped in M2.2 (MCP_RUNTIME §5) — it does not activate server→client SSE, `listChanged`, MCP
+  notifications, or incremental/long-running Tool output, all of which stay deferred. **FastMCP:** the
+  re-evaluation ADR-0035 scheduled for M2.3 and never tracked is performed and closed — the in-house
+  adapter remains authoritative (604 lines, zero MCP dependencies, mutation-audited,
+  `RuntimeService.execute` still the sole execution authority), because MCP_RUNTIME §7 requires the
+  protocol-version allowlist to be upgraded deliberately and never implicitly through a dependency
+  bump. `MCP_RUNTIME.md` §1/§2/§5/§7 are reconciled with the shipped sessionless architecture.
+
+- **Connection Health notification architecture ratified — NOT implemented (ADR-0041).** ROADMAP
+  §58's Resend clause was blocked by ADR-0014, which ADR-0040 rightly declined to amend on its own
+  authority. The ratified path leaves **ADR-0014 byte-for-byte unchanged**: a workspace-level
+  notification destination stored in `public` and supplied by a human — the pattern ADR-0017 already
+  ratified for `invitations.invited_email` — delivered through the existing first-party
+  `EmailSender`/Resend path, deduplicated with Redis `SET NX` + TTL. No access to `identity.user`, no
+  SECURITY DEFINER identity function, and no `user_id → email` enumeration primitive. Recorded
+  explicitly as a **product decision that changes the recipient semantics** from "notify workspace
+  Owners and Admins" to "notify the workspace's declared notification destination" — the two are *not*
+  equivalent and must not be described as such. Redis dedup provides **exactly one notification winner
+  within the TTL window**, *not* durable exactly-once delivery; a flush or eviction can produce a
+  duplicate email, which is accepted because a dedup miss grants no capability. **The notification
+  implementation is not authorized by this change and does not exist** — no migration, no service, no
+  Celery hook, no template, no dedup code. It awaited a separate M2.10 directive.
+  *(Superseded by the M2.10 entry above: the implementation landed as `18cd48d` and ROADMAP §58 is
+  now delivered. This entry records the ratification as it stood on 2026-08-22.)*
 
 - **EC2 acceptance evidence (M2 exit criterion).** *Released to `main` as `bccf571`.* ROADMAP §64 asks that OAuth tokens refresh
   *automatically* across expiry without user action. The refresh mechanics were already covered, but

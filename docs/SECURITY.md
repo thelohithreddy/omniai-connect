@@ -156,6 +156,137 @@ Defense-in-depth so a bug cannot leak a secret through observability:
 - Tool Call audit rows store request/response *metadata* (status, latency, sizes, tool,
   workspace) and sanitized payload snapshots with credential headers stripped.
 
+### 2.4 M2 vault-hardening acceptance checklist (EC3, ADR-0041)
+
+ROADMAP §65 makes *"security checklist in SECURITY.md for the vault is fully checked"* an M2 exit
+criterion. Until ADR-0041 this document carried no such checklist, so the criterion named an
+artifact that had never existed — an ambiguity ADR-0039 and PROJECT_STATUS had quietly resolved by
+reporting only §65's second clause (the red-team pass). This section is the missing artifact. §65
+itself is unchanged.
+
+**Read this as an acceptance record, not a routine.** It records the state the vault reached at
+M2.6 and the evidence that proved each item, **once**. It is deliberately *not* a recurring per-PR
+list: `CLAUDE.md`'s "Security checklist" remains the authority for routine security review, and
+nothing here replaces it. Every box is checked against evidence already in the repository — no box
+is checked on intent. A future change to the vault (adopting a KMS, retiring version 1, adding a
+credential type) re-opens the affected items and re-proves them in that PR.
+
+- [x] **Envelope encryption (§2.1).** AES-256-GCM from `cryptography`, never hand-rolled; one
+      random 256-bit data key per Credential; random nonce per encryption; auth tag verified on
+      every decrypt. — `tests/unit/test_credential_vault.py::test_seal_then_unseal_round_trips`,
+      `::test_two_seals_of_the_same_secret_differ_everywhere`,
+      `::test_each_credential_gets_a_distinct_random_dek`, `::test_tampered_ciphertext_fails`,
+      `::test_tampered_encrypted_dek_fails`.
+- [x] **KEK and key-version handling (§2.1).** A versioned keyring, not a single env key:
+      `CREDENTIAL_MASTER_KEY` is version 1 permanently, `CREDENTIAL_MASTER_KEYS` supplies versions
+      ≥ 2, `CREDENTIAL_KEY_VERSION` selects the sealing version, and every version still decrypts.
+      Boot fails closed on a missing, default, malformed, wrong-length, duplicated or unknown
+      active version. — `::test_key_version_is_one`, `::test_an_invalid_master_key_is_rejected`,
+      `::test_a_valid_master_key_is_accepted`, `::test_a_different_master_key_cannot_unseal`.
+- [x] **HKDF-derived per-workspace wrapping keys (§2.1).** Data keys at version ≥ 2 are wrapped by
+      a per-workspace key derived with HKDF-Expand (RFC 5869), domain-separated by a fixed label,
+      the key version and the workspace UUID. The derived key is never stored and never logged. —
+      `::test_derived_workspace_keys_are_deterministic_and_separated`,
+      `::test_derived_keys_are_separated_by_key_version`,
+      `::test_version_2_does_not_wrap_with_the_raw_kek`.
+- [x] **AAD binding.** Every seal is bound to `workspace_id ‖ connection_id`; a payload moved
+      between workspaces or connections fails to open. Proven *independently* of AAD as well: a
+      wrapped data key from one workspace is useless in another **even when the AAD is made to
+      match**, so tenant isolation survives an application-layer bug. —
+      `::test_wrong_workspace_aad_fails`, `::test_wrong_connection_aad_fails`,
+      `::test_a_wrapped_dek_is_useless_in_another_workspace_even_with_matching_aad`.
+- [x] **Version 1 backward compatibility.** Rows written by M1 keep direct-KEK wrapping forever, so
+      introducing the hierarchy arrived *as a rotation* rather than orphaning stored credentials. —
+      `::test_version_1_ciphertext_written_by_m1_still_decrypts`,
+      `::test_version_1_wraps_with_the_kek_itself_not_a_derived_key`.
+- [x] **Key rotation (§2.1 runbook).** Re-wrap unwraps under the row's own version and re-wraps
+      under the target under a row lock; **the payload is never decrypted and never rewritten** —
+      `ciphertext` and `nonce` are byte-identical afterwards. Idempotent, tenant-scoped, and
+      serialized under contention (2/4/8 workers, plus rotation racing a concurrent re-seal). —
+      `tests/integration/test_vault_key_rotation.py::test_rotation_preserves_the_payload_and_the_secret`,
+      `::test_the_credential_still_decrypts_after_rotation`,
+      `::test_an_unrotated_credential_keeps_working_during_the_overlap`,
+      `::test_rewrap_is_idempotent_across_repeated_runs`,
+      `::test_rewrap_cannot_reach_another_tenants_credential`,
+      `::test_concurrent_rewraps_produce_exactly_one_effective_rotation`,
+      `::test_rotation_and_a_concurrent_reseal_cannot_orphan_the_ciphertext`.
+- [x] **Retirement gating (§2.1 runbook steps 3–5).** A key version is retired only when the
+      **database** reports `count_credentials_below_key_version(target) = 0` — never because a
+      timer elapsed or a scheduler reported success — followed by a 7-day overlap. Both overlap
+      readability and post-retirement fail-closed behaviour are proven. —
+      `test_vault_key_rotation.py::test_the_retirement_gate_reaches_zero_only_when_the_work_is_done`,
+      `test_credential_vault.py::test_both_versions_decrypt_during_the_overlap_window`,
+      `::test_reading_a_row_whose_key_was_retired_fails_closed`,
+      `::test_rewrap_to_an_unconfigured_version_fails_closed`.
+- [x] **Vault access audit (§2.1).** Every decrypt — success **and** each distinct failure class —
+      is recorded at the single decrypt boundary, with a retired key audited distinctly from
+      tampering (the two demand opposite responses). The record carries no plaintext, ciphertext or
+      key material, and the accompanying counter's labels are drawn from closed sets so cardinality
+      cannot grow with tenants. — `tests/unit/test_vault_audit.py::test_a_successful_open_is_audited`,
+      `::test_a_failed_open_is_audited_not_silently_dropped`,
+      `::test_a_retired_key_is_audited_distinctly_from_tampering`,
+      `::test_a_malformed_payload_is_audited`, `::test_the_audit_record_never_contains_the_secret`,
+      `::test_the_audit_record_never_contains_ciphertext_or_key_material`,
+      `::test_metric_cardinality_is_bounded_by_construction`,
+      `::test_undeclared_metrics_and_labels_are_refused`.
+- [x] **Credential plaintext boundary (§2.2).** The private recovery function is referenced by
+      exactly two modules — `domains/credentials/vault.py` and `domains/runtime/secrets.py`.
+      Rotation re-wraps; it does not unseal. Asserted by walking every `.py` file under `app/`, so
+      a third module learning to decrypt fails the suite rather than review. —
+      `tests/integration/test_vault_release_audit.py::test_the_decrypt_boundary_did_not_widen`.
+- [x] **structlog redaction (§2.3).** Secret-named keys, nested structures, exception text and
+      `marker=value` patterns inside free strings are scrubbed before emission. Both carve-outs are
+      bounded: the `_id` exemption requires the value to be a UUID *and* the key to end `_id`, and
+      the exact-name allowlist is exact names only, so neither can widen by accident. —
+      `tests/unit/test_logging_redaction.py::test_secret_named_keys_are_redacted`,
+      `::test_nested_structures_are_redacted`, `::test_exception_text_is_redacted`,
+      `::test_secret_patterns_inside_free_text_are_redacted`,
+      `::test_uuid_reference_ids_are_kept_so_the_audit_can_name_what_was_accessed`,
+      `::test_an_id_shaped_key_holding_a_non_uuid_is_still_redacted`,
+      `::test_secret_keys_that_are_not_ids_are_unaffected_by_the_exemption`,
+      `tests/unit/test_vault_audit.py::test_the_rendered_audit_line_still_carries_no_secret`,
+      `::test_a_secret_named_field_is_still_redacted_after_the_exemption`.
+- [x] **stdlib logging redaction (§2.3).** Redaction is installed at `Logger.makeRecord` — the only
+      hook that sees the rendered message, the exception text *and* `extra={...}`, and which covers
+      loggers a library configures with `propagate = False`. Idempotent, and it does not rewrite
+      reserved record attributes. — `test_logging_redaction.py::test_stdlib_message_is_redacted`,
+      `::test_stdlib_percent_interpolation_is_redacted`, `::test_stdlib_traceback_is_redacted`,
+      `::test_stdlib_extra_fields_are_redacted_by_key`, `::test_the_stdlib_hook_is_idempotent`,
+      `::test_reserved_record_attributes_are_not_rewritten`.
+- [x] **Coverage across every deployed process (§2.3).** `configure_logging()` is called at import
+      by `app/main.py` (API) and by `app/workers/celery_app.py`, which is the entry point for the
+      **worker, worker-runtime and scheduler** containers alike — so no deployed process logs
+      through an unscrubbed stdlib tree. M2.6 found this gap empirically, observing `celery.worker`
+      emit `api_key=…` before the fix; the stdlib tests above are its regression guard.
+- [x] **Celery / task-payload secret discipline.** Task arguments are JSON at rest in the Redis
+      broker, so key material in a signature would be a plaintext secret in Redis. Proven twice
+      over: structurally (the task signature accepts identifiers only, and no `dek=`, `kek=`,
+      `ciphertext=`, `plaintext=`, `secret=` or `master_key=` appears anywhere in the task module)
+      and behaviourally (the sweep's real dispatch is captured and **every** argument must parse as
+      a UUID). — `test_vault_release_audit.py::test_rotation_task_signatures_accept_only_identifiers`,
+      `::test_the_sweep_enqueues_identifiers_and_nothing_else`.
+- [x] **Deliberate red-team pass (§65 clause 2).** A canary secret is driven through a credential's
+      **entire** life — sealed, executed, key-rotated, re-read — and then hunted everywhere it could
+      plausibly have escaped: every column of every table (enumerated from `information_schema`, not
+      a hand-written list that would go stale), the rendered structured-log stream, and the
+      arguments handed to Celery. Zero hits, everywhere. —
+      `test_vault_release_audit.py::test_no_plaintext_anywhere_after_a_full_lifecycle`.
+- [x] **Positive control on the scanner.** A negative result is worthless without evidence the
+      instrument works. The canary is planted in a real column, the sweep is required to find it,
+      and it is then removed and the sweep required to come back clean — so `assert hits == []`
+      cannot pass merely because the scan is broken. —
+      `test_vault_release_audit.py::test_the_scan_would_actually_catch_a_leak`.
+
+**Explicitly not covered by this acceptance**, and not to be read as checked:
+
+- **Sentry** is not deployed. When it is, `before_send` must run the same scrubber over event
+  payloads and breadcrumbs (§2.3). Do not treat that bullet as coverage until the process exists.
+- **External KMS** (AWS/GCP/Azure, HSM) was ratified **out** of M2.6 (ADR-0039 A1). The
+  `KeyProvider` seam exists so adopting one is a new implementation plus a re-wrap pass; that work
+  re-opens the KEK and rotation items above.
+- **Live Redis keyspace scanning.** Celery payload discipline is proven structurally and by
+  capturing real dispatch (above), not by scanning a running broker's keys.
+
 ## 3. Tenant isolation
 
 Per Bible §6.1 and ADR-0004:
