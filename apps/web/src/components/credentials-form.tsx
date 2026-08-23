@@ -7,7 +7,7 @@ import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Field } from "@/components/ui/field";
 import { Stack } from "@/components/ui/layout";
-import { signIn, signUp } from "@/lib/auth/client";
+import { signIn, signUp } from "@/lib/auth-client";
 
 /**
  * Sign-in / sign-up form (MC1.3, ADR-0002).

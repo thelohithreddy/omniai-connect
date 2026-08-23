@@ -6,7 +6,7 @@ import { AcceptInvitation } from "@/components/accept-invitation";
 import { Alert } from "@/components/ui/alert";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Container, Stack } from "@/components/ui/layout";
-import { getSessionOrNull } from "@/lib/auth/session";
+import { getSessionOrNull } from "@/lib/session";
 import { INVITE_COOKIE } from "@/lib/invitations/token";
 
 /**

@@ -25,7 +25,7 @@ function source(relativePath: string): string {
 const MUST_BE_SERVER_ONLY = [
   "lib/api/transport.ts",
   "lib/api/client.ts",
-  "lib/auth/session.ts",
+  "lib/session.ts",
   "lib/workspace/context.ts",
 ];
 

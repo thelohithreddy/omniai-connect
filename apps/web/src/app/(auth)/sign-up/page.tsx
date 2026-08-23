@@ -3,7 +3,7 @@ import { redirect } from "next/navigation";
 
 import { CredentialsForm } from "@/components/credentials-form";
 import { Stack } from "@/components/ui/layout";
-import { getSessionOrNull, safeNextPath } from "@/lib/auth/session";
+import { getSessionOrNull, safeNextPath } from "@/lib/session";
 
 /**
  * Create an account (MC1.3, ADR-0002).

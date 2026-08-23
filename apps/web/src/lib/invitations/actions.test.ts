@@ -45,7 +45,7 @@ vi.mock("next/headers", () => ({
 vi.mock("@/lib/api/client", () => ({
   acceptInvitation: (...args: unknown[]) => acceptInvitation(...args),
 }));
-vi.mock("@/lib/auth/session", () => ({ getSessionOrNull: () => getSessionOrNull() }));
+vi.mock("@/lib/session", () => ({ getSessionOrNull: () => getSessionOrNull() }));
 
 const { acceptPendingInvitation, discardPendingInvitation } = await import("./actions");
 const { INVITE_COOKIE } = await import("./token");

@@ -35,7 +35,7 @@ vi.mock("next/headers", () => ({
   }),
 }));
 
-vi.mock("@/lib/auth/session", () => ({ getSessionOrNull: () => getSessionOrNull() }));
+vi.mock("@/lib/session", () => ({ getSessionOrNull: () => getSessionOrNull() }));
 vi.mock("@/lib/workspace/context", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./context")>()),
   isMemberOf: (id: string) => isMemberOf(id),

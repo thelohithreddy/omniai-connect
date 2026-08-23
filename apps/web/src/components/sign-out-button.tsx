@@ -4,7 +4,7 @@ import { useRouter } from "next/navigation";
 import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
-import { signOut } from "@/lib/auth/client";
+import { signOut } from "@/lib/auth-client";
 import { clearWorkspaceSelection } from "@/lib/workspace/actions";
 
 /**

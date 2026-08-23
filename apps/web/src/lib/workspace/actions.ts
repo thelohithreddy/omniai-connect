@@ -3,7 +3,7 @@
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 
-import { getSessionOrNull } from "@/lib/auth/session";
+import { getSessionOrNull } from "@/lib/session";
 import { isMemberOf, WORKSPACE_COOKIE } from "@/lib/workspace/context";
 
 /**

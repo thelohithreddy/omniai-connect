@@ -4,7 +4,7 @@ import { WorkspaceSwitcher } from "@/components/workspace-switcher";
 import { SignOutButton } from "@/components/sign-out-button";
 import { Alert } from "@/components/ui/alert";
 import { Container, Stack } from "@/components/ui/layout";
-import { requireSession } from "@/lib/auth/session";
+import { requireSession } from "@/lib/session";
 import { resolveWorkspace } from "@/lib/workspace/context";
 
 /**

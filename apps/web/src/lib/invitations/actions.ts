@@ -4,7 +4,7 @@ import { cookies, headers } from "next/headers";
 
 import { acceptInvitation } from "@/lib/api/client";
 import { ApiFailure } from "@/lib/api/errors";
-import { getSessionOrNull } from "@/lib/auth/session";
+import { getSessionOrNull } from "@/lib/session";
 import { INVITE_COOKIE } from "@/lib/invitations/token";
 import { WORKSPACE_COOKIE } from "@/lib/workspace/context";
 
