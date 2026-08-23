@@ -8,6 +8,33 @@
 
 ## Current phase
 
+**MC1 — Control Plane v1: ARCHITECTURE DECIDED (ADR-0044, 2026-08-23), IMPLEMENTATION NOT
+STARTED.** Five decisions taken before any code, all documentation-only: **D1** the OAuth callback
+keeps its terminal page and gains a return link built server-side from the existing
+`next_public_app_url` — no redirect, so open-redirect stays structurally impossible and the
+no-oracle/state-consumed properties survive; **D2** types generated from `/openapi.json` with a
+hand-written **server-only** transport, so importing the API client into a client component is a
+build error and the backend JWT cannot reach the browser; **D3** keep the existing `tsx --test`
+contract suite, add Vitest + RTL for components and Playwright for cross-origin OAuth E2E, a11y and
+a browser-artifact secret scan **with a positive control**; **D4** nonce-based CSP with
+`connect-src 'self'` chosen so the browser-never-calls-the-API rule is *enforced* rather than
+reviewed, report-only first and enforced before external customers, with `style-src 'unsafe-inline'`
+documented as the one exception; **D5** the audit route renders an explicit "requires Owner or Admin"
+state rather than hiding navigation, with the API's 403 remaining the boundary.
+
+The release-critical invariant is recorded: every workspace-sensitive cache entry is keyed by
+**user + workspace + resource + parameters**, `(dashboard)` routes are dynamic, Zustand holds client
+state only, and a workspace switch clears client stores.
+
+**A fifth missing surface was discovered during this gate.** `InvitationService` already emails
+`{next_public_app_url}/accept-invite?token=…`, and `apps/web` has **no such route** — invitations
+have been shipping recipients a 404 since M1.3-F. MC1 owns it (slice MC1.3) and MC1 is not complete
+without it.
+
+**Production readiness:** F5 (M1 p95 never measured) and Upstash `SET NX GET` compatibility are
+**P1 — before external customer**; CSP, the typed client and `/accept-invite` are **P2 — MC1**; F4,
+F2 and F3 remain **P3 — future hardening**. Nothing was fixed, measured or claimed here.
+
 **M2 — MCP Interface, credential vault, OAuth: IN PROGRESS.** **M2.6 (Credential Vault Hardening,
 ADR-0039; A1/A2/A3/P1/P2 founder-ratified 2026-08-22) is RELEASED to `main`** as the `--no-ff`
 merge `84646f0` (2026-08-22; implementation `92eb1c7`, audit fixes `c3d6760`, merged tree

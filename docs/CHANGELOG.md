@@ -13,6 +13,19 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **MC1 Control Plane v1 architecture decisions (ADR-0044).** Decisions and documentation only:
+  **no production code, no frontend source, no tests, no migration, no dependency, no generated
+  code.** Five architecture rulings taken before implementation — OAuth callback return link (no
+  redirect, so open-redirect stays structurally impossible), generated types with a **server-only**
+  hand-written transport (importing it client-side is a build error), a three-lane test architecture
+  that keeps the existing `tsx --test` suite and adds Vitest/RTL plus Playwright, a nonce-based CSP
+  whose `connect-src 'self'` *enforces* the browser-never-calls-the-API invariant, and an audit route
+  that renders an explicit authorization state rather than hiding navigation. The workspace cache
+  invariant (`user + workspace + resource + parameters`) is recorded as release-critical.
+
+  Also records a **live broken flow found during the gate**: the invitation email has linked to
+  `/accept-invite` since M1.3-F and that route has never existed. MC1 owns it.
+
 - **M2 closure ruling (ADR-0043).** Decisions and documentation only: **no production code, no
   tests, no migration, no dependency, no UI.** The M2.12 system audit found no technical blocker — all
   three exit criteria pass, 16/16 cross-cutting mutations killed, tenant/credential/SSRF/MCP/OAuth/

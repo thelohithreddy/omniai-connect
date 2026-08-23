@@ -2627,3 +2627,304 @@ durable exactly-once delivery, per-member notification preferences, scheduled he
 server→client MCP streaming, `listChanged`, elicitation, resources/prompts, async/`pending` execution,
 protocol revision `2026-07-28`, the per-Connection circuit breaker, **F2** (Tool-name uniqueness) and
 **F3** (external I/O inside a worker transaction).
+
+---
+
+## ADR-0044 — Control Plane v1 architecture: OAuth return, typed client, test lane, CSP, audit RBAC UX, and the workspace cache invariant (MC1)
+
+**Status:** Accepted · **Date:** 2026-08-23 · **Relates to:** ADR-0002, ADR-0015, ADR-0016,
+ADR-0017, ADR-0018, ADR-0038, ADR-0042, ADR-0043 (establishes MC1) · **Governed by:**
+`docs/FRONTEND_SPEC.md` v1.0, which this ADR executes rather than reinterprets
+
+**Context.** ADR-0043 created `MC1 — Control Plane v1` and moved four surfaces into it. MC1 is the
+first customer-facing control plane over an already-audited backend, so the decisions below are made
+once, before implementation, and are evaluated for tenant isolation, credential custody, AI-safety
+headroom and M3/M4 compatibility rather than for speed of getting a UI on screen.
+
+Three properties of the existing system dominate every decision and were re-verified for this ADR:
+
+- **There is no CORS middleware on the API.** A browser therefore *cannot* call FastAPI
+  cross-origin. FRONTEND_SPEC §3's server-side fetching is not a preference, it is the only thing
+  that works — and that is what keeps the backend JWT out of the browser.
+- **The session→JWT bridge already exists and is contract-tested.** Better Auth's `jwt()` plugin
+  serves `/api/auth/token` and `/api/auth/jwks`; the API verifies EdDSA against JWKS (ADR-0015) and
+  selects the tenant from `X-Workspace-Id`, which is a *selection signal, never authority*
+  (ADR-0016).
+- **`audit:read` is OWNER/ADMIN only**, so two of five roles cannot see the audit log at all.
+
+**A fifth missing surface, discovered while writing this ADR.** `InvitationService._deliver`
+already emails `{next_public_app_url}/accept-invite?token=…`, and `apps/web` has **no
+`/accept-invite` route**. Invitations shipped in M1.3-F (ADR-0017) and have been sending recipients
+to a 404 ever since. This is not new scope — it is an already-shipped backend flow whose frontend
+half was never built, exactly like the four ADR-0043 surfaces. **MC1 owns it**, and MC1 is not
+complete without it.
+
+---
+
+### 1. D1 — OAuth callback stays a terminal page and gains a server-configured return link
+
+> **OLD:** `GET /v1/oauth/callback` renders `_SUCCESS_HTML` / `_FAILURE_HTML` with
+> `Cache-Control: no-store` and `robots: noindex`, and offers the user no route back to the
+> control plane.
+> **NEW:** the same terminal page, plus a link whose `href` is built **server-side from
+> `settings.next_public_app_url`** and from nothing else. No redirect is introduced.
+> **AUTHORITY:** ADR-0038 owns the flow; this decides only the terminal presentation. The
+> precedent already exists — `InvitationService` builds `{next_public_app_url}/accept-invite`
+> from the same setting, so **no new configuration is required**.
+> **IMPLEMENTATION:** **Not implemented by ADR-0044.**
+
+**Rationale, and why not a redirect.** The callback's current shape protects three subtle properties
+that a 302 would put at risk, all of them already audited:
+
+1. **No oracle.** Every failure — provider error, missing parameters, unknown, expired or replayed
+   state, refused exchange — renders one identical page. A redirect carrying an outcome would begin
+   to differentiate them.
+2. **The deliberate `DomainError` swallow.** The handler catches and returns 400 *so the request
+   transaction still commits and the state row stays CONSUMED*. Propagating would roll the consume
+   back and hand an attacker a replay window on a state that has already been presented. Any
+   redesign must preserve this, and the smallest change preserves it for free.
+3. **Zero redirect surface.** Authority is the state row alone (`auth.consume_oauth_state` returns
+   `workspace_id` and `connection_id`); `code` and `state` are attacker-influencable and are never
+   trusted for routing. Adding no redirect keeps open-redirect **structurally impossible** rather
+   than merely guarded.
+
+A 302 would also couple the API's response contract to the frontend's deployment and would tempt a
+`connection_id` into the URL, putting a tenant identifier into browser history and the `Referer`.
+
+**Security analysis.** The link is a server constant: it is not derived from `code`, `state`, any
+query parameter, or the state row, so no attacker-controlled value can reach `href`. `no-store` and
+`noindex` remain. The page stays unauthenticated by necessity and still discloses nothing about
+which states exist.
+
+**Failure modes.** Provider denies consent → failure page + link. Expired/replayed state → identical
+failure page. Duplicate callback → second attempt finds the state consumed → identical failure page.
+Misconfigured `next_public_app_url` → a broken link on a terminal page; it can never redirect a user
+somewhere hostile because the value is operator-set, not request-set.
+
+**Testing.** Assert the rendered `href` equals the configured URL exactly; assert it is byte-identical
+across success and failure and does not vary with any query parameter (an anti-reflection test with a
+hostile `state`/`code`); assert `Cache-Control: no-store` survives; keep the existing uniform-failure
+tests unchanged.
+
+**Rollback.** Revert one template constant. No schema, no contract, no config change.
+
+**Future impact.** When M4 adds human-in-the-loop approval, approvals must not be granted by
+following a provider redirect either — this keeps "the browser navigates, the server decides".
+
+---
+
+### 2. D2 — Generated types, hand-written server-only transport
+
+> **OLD:** `@omniai/types` is 17 hand-written lines exporting a single `ApiError`, is **not a
+> dependency of `apps/web`**, and has no generation pipeline. FRONTEND_SPEC §3 nevertheless mandates
+> "the typed client from `@omniai/types` (generated from the API's OpenAPI schema)".
+> **NEW:** **types are generated from `/openapi.json`; the transport is hand-written, small, and
+> server-only.**
+> **AUTHORITY:** FRONTEND_SPEC §3 and Bible tenet 5 (schema-first).
+> **IMPLEMENTATION:** **Not implemented by ADR-0044.** No generator is run and no dependency added.
+
+**Why not fully generated, and why not fully hand-written.** A fully generated *client* pulls a large
+runtime, hides the auth path inside vendor code, and makes the server-only guarantee hard to enforce.
+A fully hand-written *type* layer drifts from the API silently, which is the exact failure Bible
+tenet 5 exists to prevent. Splitting them puts each half where it is strongest: schema is generated
+(no drift), transport is ours (auditable, ~100 lines, one place where the JWT is attached).
+
+**Binding requirements on the transport.**
+- It **must** be server-only, enforced structurally so that importing it from a client component is a
+  **build error**, not a review comment. That is the mechanism that keeps the backend JWT and the
+  `Authorization` header out of the browser bundle.
+- It attaches the JWT obtained server-side from `/api/auth/token` and the `X-Workspace-Id` header
+  resolved from the server-side session — never from client input.
+- It parses the canonical error envelope `{error:{code,message,details?,request_id}}`, surfaces
+  `message`, drives behaviour from `code`, and preserves `request_id` for support (FRONTEND_SPEC §8).
+- It carries cursor pagination verbatim; cursors are opaque and are never constructed client-side.
+- **CI must detect drift**: regenerate types from the running API's `/openapi.json` and fail on a
+  diff. A generated file that is edited by hand is a defect.
+
+**Security impact.** One audited place where credentials are attached, and a compile-time barrier
+against that place reaching the browser. **Future impact.** M4's AI-execution surfaces get the same
+typed, server-only path for free; user-supplied AI provider keys will flow through the existing
+Credential/Connection model and must never be typed into a client component.
+
+---
+
+### 3. D3 — `tsx --test` stays; add Vitest + RTL for components and Playwright for the browser
+
+> **OLD:** one Node `tsx --test` contract suite driving real Better Auth against real Postgres in CI.
+> No component or browser capability.
+> **NEW:** three lanes, each with a job it is actually good at.
+> **AUTHORITY:** BACKEND_SPEC's testing pyramid, applied to the web tier.
+> **IMPLEMENTATION:** **Not implemented by ADR-0044.** Nothing installed.
+
+| Lane | Tool | Location | CI job | Data | Failure policy |
+|---|---|---|---|---|---|
+| Auth/API contract (Node) | **existing `tsx --test`** | `apps/web/tests/*.test.mts` | existing Web job | real Postgres | blocking |
+| Unit + component | **Vitest + React Testing Library** | `apps/web/src/**/*.test.tsx` | Web job | fixtures | blocking |
+| Browser E2E + a11y + artifact scan | **Playwright** | `apps/web/e2e/` | new job | seeded workspaces | blocking |
+
+**The existing `tsx --test` suite is kept, not replaced.** It already proves things that matter
+(sign-out deletes a session; a wrong password is refused) against the real library and a real
+database, and it costs nothing. Replacing it would trade proven coverage for uniformity.
+
+**Vitest over Jest:** native ESM/TS and far less configuration friction with Next 15 + React 19.
+**Playwright over Cypress:** OAuth is a **cross-origin, multi-tab navigation**, which is precisely
+where Playwright is strong and Cypress is weakest; it also gives multi-browser runs and traces.
+
+**The lane must detect, by construction:** cross-workspace data leakage after switching; stale cache
+leakage; unauthorized audit access (all five roles); OAuth state replay; **token/credential exposure
+in browser artifacts**; notification PII exposure to non-OWNERs; **any direct browser→API call**;
+incorrect health-state rendering; and missing error boundaries.
+
+**Browser-artifact secret scanning is a first-class test, with a positive control.** A Playwright
+test walks the authenticated app and greps `localStorage`, `sessionStorage`, `document.cookie` and the
+served JS for planted canaries. Per this repository's established discipline, a clean scan counts only
+if the same scanner is first proven to find a planted canary — a negative result from an unvalidated
+scanner is not evidence.
+
+---
+
+### 4. D4 — Nonce-based CSP, report-only first, enforced before external users
+
+> **OLD:** `next.config.ts` sets only `reactStrictMode` and `output: "standalone"`. **No CSP, HSTS,
+> X-Frame-Options, Referrer-Policy, Permissions-Policy or X-Content-Type-Options.** No `middleware.ts`
+> exists, so there is no per-request nonce delivery point.
+> **NEW:** the policy below, delivered via middleware-generated per-request nonce.
+> **AUTHORITY:** SECURITY.md is the security authority; this extends it to the browser tier.
+> **IMPLEMENTATION:** **Not implemented by ADR-0044.** `next.config.ts` is untouched.
+
+```
+default-src 'self';
+script-src 'self' 'nonce-{RANDOM}' 'strict-dynamic';
+style-src  'self' 'unsafe-inline';
+img-src    'self' data: blob:;
+font-src   'self';
+connect-src 'self';
+frame-ancestors 'none';
+form-action 'self';
+base-uri 'none';
+object-src 'none';
+upgrade-insecure-requests
+```
+plus `Strict-Transport-Security: max-age=63072000; includeSubDomains; preload` (production/TLS only),
+`X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`,
+`Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=()`, and `X-Frame-Options: DENY`
+for user agents predating `frame-ancestors`.
+
+**`connect-src 'self'` is the load-bearing line.** Because the browser must never call FastAPI
+directly, CSP is made to *enforce* that invariant: a future client-side `fetch` to the API origin
+fails at the browser rather than being caught in review. The architectural rule and the security
+control agree.
+
+**Documented exception.** **WHAT:** `style-src 'unsafe-inline'`. **WHY:** Next's App Router injects
+inline style attributes/tags during streaming and hydration; a nonce cannot cover style attributes.
+**RISK:** CSS injection (exfiltration via selectors, UI redressing) — materially lower severity than
+script injection, which stays nonce-locked. **MITIGATION:** `frame-ancestors 'none'`, no
+user-controlled style input, tokens confined to the Tailwind config (FRONTEND_SPEC §6), and revisit if
+Next ships full nonce-based style support.
+
+**Rollout.** `Content-Security-Policy-Report-Only` first so violations are observed on real traffic,
+then enforcement. Enforcement is required before the first external customer. Local development and
+the reverse proxy must not strip or duplicate these headers.
+
+---
+
+### 5. D5 — The audit route renders an explicit authorization state; navigation is not hidden
+
+> **OLD:** no route exists. `audit:read` is OWNER/ADMIN; MEMBER and VIEWER get 403.
+> **NEW:** navigation is rendered for every authenticated member; the route itself performs a
+> **server-side** call and renders an explicit "requires Owner or Admin" state on 403.
+> **AUTHORITY:** `core/authz.py` is the sole authorization authority; the UI renders its answer.
+> **IMPLEMENTATION:** **Not implemented by ADR-0044.**
+
+| Caller | Behaviour |
+|---|---|
+| OWNER / ADMIN | Full audit viewer |
+| MEMBER / VIEWER | Navigation visible; route renders "Audit log requires the Owner or Admin role", no data, no shape of data |
+| Unauthenticated | Redirect to sign-in before any render (FRONTEND_SPEC §1) |
+| Direct URL entry | Identical server-side check and identical state — the UI is not the gate |
+| Machine token | Not applicable; there is no browser session for a machine identity (ADR-0002) |
+
+**Why not hide it.** Hiding leaks nothing but teaches nothing: the feature exists in public product
+material, so concealment buys no secrecy while making the product feel broken and making the nav
+reflow on every workspace switch. Showing the caller *their own* permission discloses nothing about
+other members' roles — the API already tells them by returning 403.
+
+**The rule that matters:** the frontend may use the resolved role to *render* the state, but the
+denial is the API's 403. Client-side role checks are never the security boundary.
+
+---
+
+### 6. Workspace cache invariant — release-critical
+
+Every workspace-sensitive cache entry is keyed by **`user + workspace + resource + parameters`**. An
+entry missing the workspace is a cross-tenant leak in the browser tier, which no backend control can
+compensate for.
+
+| Mechanism | Ruling |
+|---|---|
+| React `cache()` request memoization | **Allowed** — scoped to a single request |
+| `fetch` caching | **`no-store` for every workspace-scoped call**, stated explicitly rather than relying on a framework default that has changed between majors |
+| Full route cache / static rendering | **Forbidden** for `(dashboard)`; those routes are dynamic because they depend on the session |
+| `unstable_cache` / tag revalidation | **Only** with the workspace in the key and the tag |
+| Zustand | **Client state only** — active workspace selection, layout, wizard progress. Never server data (FRONTEND_SPEC §4) |
+| Browser/bfcache | Sensitive responses carry `no-store` |
+
+**Workspace switch** → full server re-render and client stores cleared; no view may survive the
+switch. **Logout** → stores cleared and session ended; server data was never cached client-side.
+**Role change** → takes effect within the JWT's bounded 900-second window (ADR-0018); there is no
+stateful revocation, and MC1 must not invent one.
+
+---
+
+### 7. Security invariants (non-negotiable for every MC1 slice)
+
+The browser is **never** a credential boundary. Provider API keys, access/refresh tokens, vault
+plaintext, decrypted credentials, service secrets, Better Auth signing material and the backend JWT
+never enter browser-visible state. The browser does not call FastAPI directly, does not treat
+`X-Workspace-Id` as authority, does not implement RBAC as the security boundary, does not reconstruct
+health logic, and never renders provider or Tool output as HTML or Markdown — it is inert
+preformatted text (FRONTEND_SPEC §8, AI_RUNTIME §7 prompt-injection hygiene). Credential entry forms
+never persist values to stores, `localStorage` or URL state (FRONTEND_SPEC §5).
+
+---
+
+### 8. Production-readiness classification (recorded, not fixed)
+
+| Item | Class |
+|---|---|
+| **F5** — M1 `p95 < 400 ms` never measured | **P1 — before external customer** (it is an M1 exit criterion) |
+| **Upstash `SET NX GET`** compatibility unverified | **P1 — before external customer**; notifications degrade silently if unsupported. No support is claimed here |
+| **D4** security headers / CSP | **P2 — MC1** |
+| **D2** typed client + CI drift detection | **P2 — MC1** |
+| `/accept-invite` route missing (live broken flow) | **P2 — MC1** |
+| **F4** `tool_calls` partition RLS | **P3 — future hardening**; not exploitable (no grant) |
+| **F2** Tool-name uniqueness · **F3** external I/O in a worker transaction | **P3 — future hardening** |
+
+---
+
+### 9. MC1 implementation sequence (derived, not assumed)
+
+**MC1.1** typed client + `lib/env.ts` (Zod) + server-only transport + CI drift check ·
+**MC1.2** frontend stack, minimal design system on the existing Tailwind config, middleware + CSP
+report-only · **MC1.3** `(auth)`/`(dashboard)` route groups, session resolution, workspace switcher,
+cache invariant, `/accept-invite` · **MC1.4** audit viewer · **MC1.5** OAuth UX + D1 terminal-page
+link · **MC1.6** Connection Health UI · **MC1.7** notification settings · **MC1.8** Playwright E2E,
+artifact secret scan with positive control, a11y, CSP enforcement · **MC1.9** readiness audit ·
+**MC1.10** promotion.
+
+`/accept-invite` sits in MC1.3 rather than later because a shipped backend flow is currently emailing
+customers a 404.
+
+**Consequences.** No implementation, no dependency, no generated code, no API change. D1 will require
+a small API-side template change in a later directive — recorded here, deliberately not made.
+Enforced CSP plus a server-only transport means a browser-side API call becomes a build error or a
+CSP violation rather than a review finding, which is the outcome worth engineering for.
+
+**Deferred decisions.** Design-system component inventory; log-viewer filter UX (M3 polishes it);
+onboarding flow (M3); billing surfaces (M3); AI-execution approval UI (M4 — no Runtime `pending`
+status exists, so MC1 must not invent one, and the audit viewer must render `status` from a closed
+vocabulary so a future value is additive).
+
+**Non-goals.** `client_credentials` (ADR-0043 B2 — MC1 has no dependency on it), FastMCP, MCP
+streaming, `listChanged`, `webhooks_outbox`, F2/F3 remediation, billing, marketing site, prebuilt
+connectors, and any M3 work.
