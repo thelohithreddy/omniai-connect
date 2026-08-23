@@ -13,6 +13,31 @@ entries move into a versioned section at release tag time (ADR-0005).
 
 ### Added
 
+- **M2 closure ruling (ADR-0043).** Decisions and documentation only: **no production code, no
+  tests, no migration, no dependency, no UI.** The M2.12 system audit found no technical blocker — all
+  three exit criteria pass, 16/16 cross-cutting mutations killed, tenant/credential/SSRF/MCP/OAuth/
+  health/notification probes clean — but M2 could not be closed on *authority*, because two ROADMAP
+  scope bullets named dashboard UI that no ADR had removed from M2. Four owner rulings now close that:
+
+  **A3** — the control-plane deficit becomes its own milestone, **`MC1 — Control Plane v1`**, between
+  M2 and M3. The audit surfaced that the gap is not M2-only: ROADMAP **M1** also requires a "minimal
+  dashboard viewer" that was never built, `apps/web` has zero product routes, and M3 is scoped as
+  *"Dashboard polish"* with exit criteria assuming paying users — so folding M2's UI halves into M3
+  would have turned polish into first-build on top of an M1 deficit. **B2** — `client_credentials` is
+  deferred beyond M2 with **no milestone**, superseding ADR-0038's `M2/P1` placement; it is blocked on
+  a ratified home for the client secret. **C2** — RLS on `tool_calls` partitions becomes a required
+  hardening item (not exploitable today: `omniai_app` holds no privilege on `tool_calls_default`).
+  **D1** — M1's *"p95 < 400 ms"* criterion stands unchanged and is **unmet** debt; no benchmark exists
+  and none was manufactured, so M1 is not fully evidenced against its own exit criteria.
+
+  ROADMAP is **not** edited — CLAUDE.md places DECISIONS.md above it in the authority order, the same
+  mechanism ADR-0035 and ADR-0041 used. ADR-0014 remains byte-identical.
+
+  > The M2 implementation scope is complete under the scope defined by ROADMAP + ADR-0043.
+
+  That wording is exact. **The dashboard UI is not implemented and `client_credentials` is not
+  implemented** — ADR-0043 relocates them, it does not deliver them.
+
 - **Connection Health failure notifications (M2.10, ADR-0042).** *Released to `main` as `18cd48d`.* ROADMAP §58's last unimplemented
   clause. Migration `0015` adds one nullable `workspaces.notification_email VARCHAR(320)` — no FK, no
   default, no identity access, and no mention of the `identity` schema, so **ADR-0014 is unchanged**.

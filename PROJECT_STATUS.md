@@ -120,18 +120,34 @@ MCP adapter DONE · tools/list DONE · tools/call DONE · workspace-scoped token
 (Streamable HTTP; ADR-0041 §12 — server→client SSE, `listChanged` and MCP notifications remain
 DEFERRED and are **not** implemented) · vault key rotation DONE · per-workspace data keys DONE ·
 redaction on all log sinks DONE · vault access audit DONE · OAuth auth-code + PKCE **backend** DONE
-(the ROADMAP's "dance **in the dashboard**" UI half is M3) · encrypted token storage DONE · automatic
+(the ROADMAP's "dance **in the dashboard**" UI half is **MC1**, ADR-0043 A3) · encrypted token storage DONE · automatic
 refresh DONE · `needs_reauth` DONE · Connection Health status states DONE (the "test-call **button**"
-UI half is M3) · **failure notifications RELEASED (M2.10, `18cd48d`)** · rate limits & quotas DONE ·
+UI half is **MC1**, ADR-0043 A3) · **failure notifications RELEASED (M2.10, `18cd48d`)** · rate limits & quotas DONE ·
 **EC1 PASS** · **EC2 PASS** · **EC3 PASS** (closed by SECURITY.md §2.4, this promotion) ·
-`client_credentials` **M2/P1 DEFERRED** (ADR-0038 D3 — explicitly *not* moved to M3) · dashboard/UI M3
-· M3 NOT STARTED.
+`client_credentials` **DEFERRED beyond M2, no milestone** (ADR-0043 B2, superseding ADR-0038's M2/P1
+placement) · dashboard/UI → **MC1** · MC1 NOT STARTED · M3 NOT STARTED.
 
-**All three canonical M2 exit criteria now PASS.** What remains is not an exit criterion but a scope
-question the owner must rule on explicitly: two ROADMAP scope bullets name dashboard UI ("dance in the
-dashboard", "test-call button") that `apps/web` does not have, and ADR-0038 keeps `client_credentials`
-as an open **M2/P1** item. **M2 is therefore NOT DECLARED COMPLETE here** — declaring it requires an
-owner ruling (and an ADR) that those items are M3/deferred rather than M2 obligations.
+**M2 SCOPE CLOSED BY ADR-0043 (2026-08-23).** All three canonical exit criteria pass (EC1
+`037e9de`, EC2 `bccf571`, EC3 closed by SECURITY.md §2.4 at `e97214c`), and the four owner rulings
+that were outstanding are now taken and authoritative:
+
+- **A3** — the control-plane deficit becomes its own milestone, **`MC1 — Control Plane v1`**, sequenced
+  after M2 and before M3. It owns the OAuth authorize/callback UI (§57), the Connection Health
+  test-call button (§58), **and M1's never-built "minimal dashboard viewer"** — the gap spans M1 and
+  M2 together, and M3 remains *polish* rather than silently becoming *first build*.
+- **B2** — `client_credentials` is deferred beyond M2 with **no milestone assigned**, superseding
+  ADR-0038's `M2/P1` placement. It is blocked on a ratified home for the client secret, so scheduling
+  it before that decision would schedule undetermined work.
+- **C2** — partition RLS on `tool_calls` is a required hardening item (MC1-or-later). Not exploitable
+  today (`omniai_app` holds no privilege on `tool_calls_default`), not implemented here.
+- **D1** — M1's *"p95 < 400 ms"* criterion stands unchanged and is **unmet** production-readiness debt.
+  No benchmark exists and none was manufactured. **M1 is not fully evidenced against its own exit
+  criteria.**
+
+> **The M2 implementation scope is complete under the scope defined by ROADMAP + ADR-0043.**
+
+That wording is exact. **The dashboard UI is not implemented and `client_credentials` is not
+implemented** — ADR-0043 relocates them; it does not deliver them. Neither may be described as done.
 
 **M2.5 (OAuth 2.0) is RELEASED to `main`** as the `--no-ff` merge `82cd651` (2026-08-21; implementation `f3d7e35`, audited tree
 `d568022`, tree byte-identical to the audited SHA), after an independent adversarial release audit:
