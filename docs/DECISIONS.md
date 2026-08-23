@@ -2483,3 +2483,147 @@ are policy. Durable exactly-once delivery is `webhooks_outbox`, which remains **
 health checks (no canonical source requires them), the dashboard surface for configuring the destination
 (`apps/web` has no product dashboard — M3), and notification channels other than email.
 **M2 is NOT complete until this slice is independently audited and promoted.**
+
+---
+
+## ADR-0043 — M2 closure ruling: the control-plane gap is its own milestone, `client_credentials` is deferred, and two readiness items are recorded as debt
+
+**Status:** Accepted · **Date:** 2026-08-23 · **Relates to:** ADR-0038 (supersedes its
+`client_credentials` and dashboard-UX deferral *placement*, not its technical decisions), ADR-0040
+(supersedes its "M2 is NOT complete" conclusion), ADR-0041, ADR-0042, ADR-0004 (RLS), ADR-0014
+(unchanged)
+
+**Context.** M2 shipped nine independently audited slices (M2.1–M2.10) plus two documentation
+promotions (M2.11, M2.12). The M2.12 system-level audit found **no technical blocker**: all three
+canonical exit criteria pass, 16/16 cross-cutting mutations are killed, and live probes of tenant
+isolation, credential custody, SSRF, MCP authorization, OAuth refresh, Connection Health and
+notifications all pass. It nonetheless returned **NOT COMPLETE — OWNER DECISION REMAINS**, because
+M2 could not be closed on *authority*: two ROADMAP scope bullets were undelivered and no ADR removed
+them from M2.
+
+**Problem.** Four items had no authoritative resolution.
+
+1. **ROADMAP §57/§58 name dashboard UI.** §57 asks for the OAuth "auth-code + PKCE dance **in the
+   dashboard**"; §58 asks for a Connection Health "**test-call button**". Both backends ship and are
+   audited; neither UI exists. ADR-0038 called the "dashboard UX slice" *deferred* and ADR-0040 called
+   the "dashboard test-call button" *deferred*, but **neither assigned a destination milestone**, and
+   ADR-0040 concluded "M2 is NOT complete" partly on that basis. The only statement placing this work
+   in M3 lived in `PROJECT_STATUS.md` prose, which is a living tracker and **not** in the authority
+   chain (CLAUDE.md: Bible → DECISIONS.md → ENGINEERING_PRINCIPLES → domain specs).
+2. **`client_credentials`.** ADR-0038 D3 shipped `authorization_code` only and recorded the grant as
+   *"M2/P1 deferred, **never silently moved to M3**"* — wording that makes an explicit ruling mandatory.
+3. **F4 (new, M2.12).** `tool_calls_default` — the audit ledger's DEFAULT partition — has RLS
+   disabled, FORCE disabled and zero policies, while its parent `tool_calls` is `ENABLE`+`FORCE` with
+   `tenant_isolation`. Postgres does not apply a parent's RLS to a partition queried **directly**.
+4. **F5 (new, M2.12).** M1's third exit criterion, *"Runtime overhead p95 < 400 ms on the demo path"*,
+   has never been evidenced: zero benchmarks, zero performance dependencies, no p95 assertion anywhere.
+
+**A finding that reframed the first problem.** The dashboard gap is **not** an M2 bookkeeping
+question. ROADMAP **M1** scope also requires *"Audit log: persisted Tool Call records + minimal
+dashboard viewer"* — never built. `apps/web` contains seven files (a layout, a placeholder page,
+global CSS, two `.gitkeep`s, the Better Auth config and its route) and **zero product routes**.
+Meanwhile ROADMAP **M3** is titled *"Dashboard **polish**"* and its scope assumes a dashboard exists
+to polish ("log viewer filters/drill-in/CSV", "onboarding flow tuned"), with exit criteria requiring
+≥ 20 external Workspaces and ≥ 3 paying customers. Folding M2's two UI halves into M3 would therefore
+have converted M3 silently from *polish* into *first build*, on top of an M1 deficit, and left M3's
+exit criteria unreachable. The control-plane deficit spans **M1 and M2 together** and needs to be
+owned somewhere that says so.
+
+**Decision.** Four owner rulings, taken 2026-08-23.
+
+1. **Decision A (ratified A3) — the control-plane deficit becomes its own milestone: `MC1 —
+   Control Plane v1`, sequenced after M2 and before M3.**
+
+   > **OLD:** ROADMAP §57 *"OAuth 2.0 flows: auth-code + PKCE dance **in the dashboard**"* (M2 scope);
+   > ROADMAP §58 *"Connection health: **test-call button**"* (M2 scope); ROADMAP M1 *"Audit log:
+   > persisted Tool Call records + **minimal dashboard viewer**"* (M1 scope).
+   > **NEW:** all three UI surfaces belong to **MC1 — Control Plane v1**, a new milestone this ADR
+   > establishes between M2 and M3.
+   > **AUTHORITY:** CLAUDE.md places `docs/DECISIONS.md` **above** the roadmap in the authority order,
+   > so an ADR re-scopes a milestone without rewriting canon — the same mechanism by which ADR-0035
+   > deviated from §55's literal "(FastMCP)" and ADR-0041 fixed §55's "streaming transport" reading,
+   > both leaving ROADMAP untouched. ROADMAP is **not** edited here.
+   > **IMPLEMENTATION:** **none exists.** No dashboard, no product route, no OAuth UI, no test-call
+   > button, no log viewer. Moving scope is a *placement* decision and is explicitly **not** a claim
+   > that any of it was built.
+
+   **The backend contracts these surfaces consume are M2-complete and audited**: `POST /v1/oauth/...`
+   authorize + callback (ADR-0038), `POST /v1/connections/{id}/test` (ADR-0040), `GET /v1/tool-calls`
+   (M1-Audit-v1), and `PATCH /v1/workspaces/me` + `GET /v1/workspaces/me/notification-settings`
+   (ADR-0042). MC1 is a *frontend* milestone consuming finished backends; it is not licence to change
+   them. M3 keeps its stated meaning — polish, billing and private beta — and its exit criteria become
+   reachable only after MC1.
+
+2. **Decision B (ratified B2) — `client_credentials` is deferred beyond M2 with no milestone assigned.**
+
+   > **OLD:** ADR-0038 D3 — *"`client_credentials` … remains **M2/P1 deferred**, never silently moved
+   > to M3."*
+   > **NEW:** **deferred beyond M2, unscheduled.** This ADR supersedes the `M2/P1` placement in
+   > ADR-0038's deferral list; ADR-0038's technical decisions (S256-only PKCE, `authorization_code`
+   > only, `auth_config` refusing `client_secret`) are unchanged and remain in force.
+   > **AUTHORITY:** ADR-0038 demanded an explicit ruling rather than silent movement. This is that
+   > ruling, taken explicitly and recorded.
+   > **IMPLEMENTATION:** **none.** No grant type, no secret storage, no dependency.
+
+   It is deliberately given **no milestone**. The blocking question is architectural, not schedule:
+   `client_credentials` requires a ratified home for a **client secret**, and `auth_config` is public
+   Connector metadata that explicitly refuses secret keys. Assigning a milestone before that decision
+   exists would schedule work whose design is undetermined. It re-enters a milestone only through a
+   future ADR that first rules on where the secret lives.
+
+3. **Decision C (ratified C2) — RLS on `tool_calls` partitions becomes a required hardening item,
+   assigned to MC1-or-later, and is not implemented here.**
+
+   > **OLD:** partition isolation rests on the **absence of a `GRANT`** to `omniai_app`.
+   > **NEW:** future partition management must `ENABLE` + `FORCE` RLS with the `tenant_isolation`
+   > policy on every partition, and must never grant `omniai_app` privileges on a partition directly.
+   > **AUTHORITY:** ADR-0004 makes `workspace_id` scoping plus RLS the tenancy mechanism; this
+   > extends it to partitions, which Postgres does not cover automatically.
+   > **IMPLEMENTATION:** **none in this ADR.** No migration is created.
+
+   Recorded precisely so the accepted risk is legible: today this is **not exploitable** — `omniai_app`
+   holds no privilege on `tool_calls_default` (`InsufficientPrivilegeError`, verified live) and no
+   migration uses `GRANT … ON ALL TABLES`. The exposure is prospective: `tool_calls` is
+   `PARTITION BY RANGE (created_at)`, so time-based partitions are the expected next step, and the
+   invariant currently depends on whoever writes that migration remembering not to grant. Severity
+   **low-medium**, **non-blocking for M2**.
+
+4. **Decision D (ratified D1) — M1's p95 criterion stands as written and is unmet production-readiness
+   debt.**
+
+   > **OLD / NEW:** ROADMAP M1 exit criterion *"Runtime overhead p95 < 400 ms on the demo path"* —
+   > **unchanged**, deliberately not redefined.
+   > **AUTHORITY:** this ADR classifies its status; it does not amend the criterion.
+   > **IMPLEMENTATION:** **never measured.** No benchmark exists and none was manufactured for this
+   > closure.
+
+   It is classified as **pre-MC1/pre-M3 production-readiness debt** and must be measured before
+   external users are onboarded. The audit ledger already persists `tool_calls.duration_ms`, so the
+   measurement capability exists and only the measurement is missing. **M1 is therefore not fully
+   evidenced against its own exit criteria**, independently of M2's status.
+
+**Consequences.** **Documentation only** — no production code, no test, no migration, no dependency,
+no UI, no API change. ADR-0014 is byte-for-byte unchanged and ROADMAP is unedited. ADR-0038, ADR-0040,
+ADR-0041 and ADR-0042 are not rewritten; where this ADR supersedes them it says so and confines itself
+to *placement*, never to their technical rulings. A new milestone `MC1 — Control Plane v1` now exists
+by ADR authority; a future documentation directive may reflect it in ROADMAP, which is a
+presentation change rather than a change in authority.
+
+**M2 closure interpretation.** With A3 and B2 taken, no requirement remains both authoritative and
+incomplete inside M2's scope. The three canonical exit criteria pass on audited evidence (EC1
+`037e9de`, EC2 `bccf571`, EC3 closed by SECURITY.md §2.4 at `e97214c`). Therefore:
+
+> **The M2 implementation scope is complete under the scope defined by ROADMAP + ADR-0043.**
+
+That sentence is exact and is not a claim that everything once written under M2 was built. **The
+dashboard UI is not implemented. `client_credentials` is not implemented.** Both are unimplemented
+future work that this ADR *relocates*, and neither may be described as delivered.
+
+**Deferred work.** `MC1 — Control Plane v1`: the OAuth authorize/callback UI, the Connection Health
+test-call button, M1's minimal audit-log viewer, and the notification-destination settings surface
+(ADR-0042). Unscheduled: `client_credentials` (blocked on a ratified secret home). Hardening: partition
+RLS (Decision C), and the M1 p95 measurement (Decision D). Unchanged deferrals: `webhooks_outbox` and
+durable exactly-once delivery, per-member notification preferences, scheduled health checks,
+server→client MCP streaming, `listChanged`, elicitation, resources/prompts, async/`pending` execution,
+protocol revision `2026-07-28`, the per-Connection circuit breaker, **F2** (Tool-name uniqueness) and
+**F3** (external I/O inside a worker transaction).
