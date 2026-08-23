@@ -87,6 +87,55 @@ describe("security middleware", () => {
     }
   });
 
+  describe("invitation token relocation (MC1.3, ADR-0017)", () => {
+    const TOKEN = "invitation-token-value-do-not-leak";
+
+    test("a token in the URL is redirected away and stored in an httpOnly cookie", () => {
+      const response = middleware(request(`/accept-invite?token=${TOKEN}`));
+
+      // 307 preserves the method; the point is that the address bar, history and every
+      // subsequent `Referer` lose the token on the very first request that carries it.
+      expect([307, 308]).toContain(response.status);
+
+      const location = response.headers.get("location")!;
+      expect(location).not.toContain(TOKEN);
+      expect(location).toContain("/accept-invite");
+      expect(new URL(location).searchParams.get("token")).toBeNull();
+
+      const cookie = response.cookies.get("omniai_invite");
+      expect(cookie?.value).toBe(TOKEN);
+      // Never readable from document.cookie: an XSS foothold must not be able to lift it.
+      expect(cookie?.httpOnly).toBe(true);
+      expect(cookie?.sameSite).toBe("lax");
+    });
+
+    test("the redirect still carries every security header", () => {
+      // A response that skips the header pass is a hole that only appears on one route.
+      const response = middleware(request(`/accept-invite?token=${TOKEN}`));
+
+      expect(response.headers.get(CSP_REPORT_ONLY_HEADER)).toContain("connect-src 'self';");
+      expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
+      expect(response.headers.get("X-Frame-Options")).toBe("DENY");
+      expect(response.headers.get("Referrer-Policy")).toBe("strict-origin-when-cross-origin");
+    });
+
+    test("the bare acceptance path is left alone", () => {
+      const response = middleware(request("/accept-invite"));
+
+      expect(response.headers.get("location")).toBeNull();
+      expect(response.cookies.get("omniai_invite")).toBeUndefined();
+    });
+
+    test("a token on any other path is ignored, not harvested", () => {
+      // Only the acceptance route is treated as invitation delivery; a `?token=` elsewhere is
+      // someone else's parameter and must not be copied into our cookie.
+      for (const path of ["/", "/dashboard?token=x", "/sign-in?token=x"]) {
+        const response = middleware(request(path));
+        expect(response.cookies.get("omniai_invite"), path).toBeUndefined();
+      }
+    });
+  });
+
   test("no request input can influence the policy", () => {
     // The policy is built from a server constant and a fresh nonce. Nothing a caller sends may
     // reach it — a reflected directive would be a CSP bypass handed to the attacker.

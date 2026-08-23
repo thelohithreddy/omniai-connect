@@ -22,6 +22,12 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 
+import {
+  ACCEPT_INVITE_PATH,
+  INVITE_COOKIE,
+  INVITE_COOKIE_OPTIONS,
+  INVITE_QUERY_PARAM,
+} from "@/lib/invitations/token";
 import { buildContentSecurityPolicy } from "@/lib/security/csp";
 import { buildSecurityHeaders } from "@/lib/security/headers";
 
@@ -45,17 +51,47 @@ function generateNonce(): string {
   return btoa(String.fromCharCode(...bytes));
 }
 
+/**
+ * Move an invitation token out of the URL before anything else can see it (MC1.3, ADR-0017).
+ *
+ * Returns a redirect to the bare path with the token stored in an `httpOnly` cookie, or `null`
+ * when there is nothing to do. This is the earliest point at which the token can be relocated: a
+ * Server Component may not set a cookie during render, and by the time a client component runs
+ * the token has already reached browser JavaScript.
+ *
+ * The redirect is what removes it from the address bar, from `history`, and from the `Referer` of
+ * every later navigation. Nothing is logged here — the value is copied and never inspected.
+ */
+function relocateInvitationToken(request: NextRequest): NextResponse | null {
+  if (request.nextUrl.pathname !== ACCEPT_INVITE_PATH) return null;
+
+  const token = request.nextUrl.searchParams.get(INVITE_QUERY_PARAM);
+  if (!token) return null;
+
+  const clean = request.nextUrl.clone();
+  clean.searchParams.delete(INVITE_QUERY_PARAM);
+
+  const response = NextResponse.redirect(clean);
+  response.cookies.set(INVITE_COOKIE, token, INVITE_COOKIE_OPTIONS);
+  return response;
+}
+
 export function middleware(request: NextRequest): NextResponse {
   const nonce = generateNonce();
   const isDevelopment = process.env.NODE_ENV === "development";
   const policy = buildContentSecurityPolicy({ nonce, isDevelopment });
+
+  // Before the normal response path: the redirect must still carry the security headers, which is
+  // why the headers are applied to whatever response we end up returning rather than only to
+  // `NextResponse.next()`.
+  const relocation = relocateInvitationToken(request);
 
   // Forwarded to the renderer so Next can find the nonce and stamp its own script tags.
   const requestHeaders = new Headers(request.headers);
   requestHeaders.set(CSP_REPORT_ONLY_HEADER, policy);
   requestHeaders.set("x-nonce", nonce);
 
-  const response = NextResponse.next({ request: { headers: requestHeaders } });
+  const response = relocation ?? NextResponse.next({ request: { headers: requestHeaders } });
 
   response.headers.set(CSP_REPORT_ONLY_HEADER, policy);
   // HSTS only where TLS actually terminates. `NODE_ENV` is the signal available in the Edge

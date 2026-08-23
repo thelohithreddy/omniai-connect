@@ -16,6 +16,7 @@
 import "server-only";
 
 import type {
+  AcceptedInvitation,
   AuthorizeStartRead,
   ConnectionHealthRead,
   MembershipList,
@@ -52,6 +53,31 @@ export function getCurrentWorkspace(identity: RequestIdentity): Promise<Workspac
     method: "GET",
     path: "/v1/workspaces/me",
     identity,
+  });
+}
+
+// ------------------------------------------------------------------------------ invitations
+
+/**
+ * Accept an invitation and join the Workspace (MC1.3, ADR-0017).
+ *
+ * Binds **no** workspace, and cannot: acceptance is what creates the membership, so requiring one
+ * first would be circular. Like `listMyWorkspaces` it opts out explicitly rather than by omission.
+ *
+ * The token travels in the **body**, never the path or query — the API's own schema says so, and
+ * it is what keeps the token out of access logs, `Referer` headers and any proxy in between.
+ *
+ * The API answers 404 uniformly for "no such invitation", "expired" and "already consumed"
+ * (documented in the contract as "uniform, no oracle"). Callers must preserve that: rendering
+ * three different messages client-side would rebuild the oracle the backend deliberately removed.
+ */
+export function acceptInvitation(headers: Headers, token: string): Promise<AcceptedInvitation> {
+  return apiRequest<AcceptedInvitation, { token: string }>({
+    method: "POST",
+    path: "/v1/invitations/accept",
+    identity: { headers },
+    allowMissingWorkspace: true,
+    body: { token },
   });
 }
 

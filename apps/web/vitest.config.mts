@@ -20,7 +20,22 @@ import { defineConfig } from "vitest/config";
  */
 export default defineConfig({
   plugins: [react()],
-  resolve: { tsconfigPaths: true },
+  resolve: {
+    tsconfigPaths: true,
+    alias: {
+      /*
+       * `server-only` throws on import outside a Server Component — the mechanism that makes the
+       * MC1.1 boundary a build error. That also makes every module it guards impossible to unit
+       * test, so this lane substitutes an empty module.
+       *
+       * The guard is NOT taken on trust: `tests/server-only-boundary.test.mts` imports the real
+       * package and asserts it throws, the production build fails on a client import, and
+       * `src/lib/security-boundary.test.ts` asserts from source that each module still declares
+       * it. Removing a guard therefore still fails — here and in two other places.
+       */
+      "server-only": new URL("./vitest.server-only-stub.ts", import.meta.url).pathname,
+    },
+  },
   test: {
     environment: "jsdom",
     globals: true,

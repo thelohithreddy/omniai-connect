@@ -20,6 +20,25 @@ CMD ["pnpm", "--filter", "web", "dev"]
 # ---- build ----
 FROM deps AS build
 COPY . .
+
+# `NEXT_PUBLIC_*` values are compiled into the browser bundle, so they must exist at BUILD time,
+# not merely at run time — providing one only via `docker run -e` is too late, and the variable
+# would be `undefined` in the shipped JavaScript.
+#
+# It became mandatory in MC1.3: `(dashboard)` is the first route to transitively import the API
+# client, and `lib/env.ts` validates `publicEnv` eagerly on purpose ("a missing app URL should
+# fail the build, not the first request that needs it"). `next build` evaluates every route
+# module to collect page data, so without this the image build fails with
+# "Failed to collect configuration for /dashboard".
+#
+# The default is a placeholder that keeps CI and local image builds working. **Any real
+# deployment must pass its own value** (`--build-arg NEXT_PUBLIC_APP_URL=https://…`), because
+# whatever is set here is baked into the client bundle. It is a public URL, never a secret — no
+# server-only variable belongs in this stage, and `getAuth()` stays deferred behind a function
+# precisely so the build never demands a real secret or a reachable database.
+ARG NEXT_PUBLIC_APP_URL=http://localhost:3000
+ENV NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL}
+
 RUN pnpm --filter web build
 
 # ---- production ----
