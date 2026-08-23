@@ -83,6 +83,17 @@ jobs:
       - name: OpenAPI contract drift
         run: pnpm --filter @omniai/types openapi:check
 
+      # Vitest + React Testing Library (MC1.2, ADR-0044 D3): component behaviour, keyboard
+      # navigation, ARIA wiring, axe accessibility scans, the CSP/security-header builders and
+      # WCAG contrast computed from the real design tokens.
+      #
+      # Placed before the database-backed steps on purpose: it needs no services, so a broken
+      # component or a weakened CSP fails in seconds rather than after Postgres provisioning.
+      # It runs the `src/**` lane only — the `tests/*.test.mts` contract suite below is a
+      # separate lane against real Better Auth and real Postgres, and is not replaced by this.
+      - name: Component and security-policy tests (Vitest)
+        run: pnpm --filter web test:unit
+
       # Same provisioning as infra/docker/postgres-init/02-identity-role.sh, which service
       # containers never run. Better Auth owns this schema and migrates it itself.
       - name: Provision the Better Auth identity schema

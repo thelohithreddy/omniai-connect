@@ -1,3 +1,104 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/**
+ * Design tokens (MC1.2, ADR-0044 §9 — "minimal design system on the existing Tailwind config").
+ *
+ * Colours are declared as raw HSL channel triplets rather than finished colours so Tailwind can
+ * compose them with an alpha value (`bg-primary/10`). FRONTEND_SPEC §6 makes hard-coded hex a
+ * review reject; every colour a component may use is named here and nowhere else.
+ *
+ * Contrast is not asserted by eye. `tokens.test.ts` parses these values and computes WCAG 2.1
+ * ratios for each foreground/background pair, in both themes, and fails below AA — so a token
+ * edit that quietly breaks legibility breaks the build instead.
+ */
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 222 47% 11%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+
+    --muted: 210 40% 96%;
+    /* 5.6:1 on --background. Secondary text still has to be readable. */
+    --muted-foreground: 215 16% 40%;
+
+    --primary: 221 83% 45%;
+    --primary-foreground: 0 0% 100%;
+
+    --destructive: 0 72% 38%;
+    --destructive-foreground: 0 0% 100%;
+
+    --success: 152 69% 24%;
+    --success-foreground: 0 0% 100%;
+
+    --border: 214 32% 88%;
+    --input: 214 32% 84%;
+    --ring: 221 83% 45%;
+
+    --radius: 0.5rem;
+  }
+
+  .dark {
+    --background: 222 47% 11%;
+    --foreground: 210 40% 98%;
+
+    --card: 222 44% 14%;
+    --card-foreground: 210 40% 98%;
+
+    --muted: 217 33% 20%;
+    --muted-foreground: 215 20% 72%;
+
+    /* Lightened so dark text sits on it at AA; white-on-blue fails at this size. */
+    --primary: 213 94% 72%;
+    --primary-foreground: 222 47% 11%;
+
+    --destructive: 0 84% 74%;
+    --destructive-foreground: 222 47% 11%;
+
+    --success: 152 62% 68%;
+    --success-foreground: 222 47% 11%;
+
+    --border: 217 33% 24%;
+    --input: 217 33% 28%;
+    --ring: 213 94% 72%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-synthesis-weight: none;
+    text-rendering: optimizeLegibility;
+  }
+
+  /**
+   * A single, global, visible focus ring.
+   *
+   * `:focus-visible` rather than `:focus` so a mouse click does not leave a ring behind, while
+   * every keyboard path keeps one. Tailwind's preflight removes the UA outline, so without this
+   * rule the application would ship with no keyboard focus indication at all — the most common
+   * way an otherwise accessible interface becomes unusable without a mouse.
+   */
+  :focus-visible {
+    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
+  }
+
+  /* Honour a user's OS-level motion preference (FRONTEND_SPEC §6). */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
