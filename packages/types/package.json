@@ -8,9 +8,13 @@
     "lint": "echo \"no lint yet\" && exit 0",
     "typecheck": "tsc --noEmit",
     "build": "echo \"consumed as source\" && exit 0",
-    "test": "echo \"no tests yet\" && exit 0"
+    "test": "echo \"no tests yet\" && exit 0",
+    "openapi:export": "python3 ../../scripts/export-openapi.py",
+    "openapi:generate": "openapi-typescript ./openapi.json -o ./src/generated/api.ts",
+    "openapi:check": "node ./scripts/check-drift.mjs"
   },
   "devDependencies": {
+    "openapi-typescript": "^7.13.0",
     "typescript": "^5.7.2"
   }
 }

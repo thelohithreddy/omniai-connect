@@ -1,0 +1,3887 @@
+{
+  "components": {
+    "schemas": {
+      "AcceptedInvitation": {
+        "description": "What the recipient joined: the workspace and their new role. No invitation details.",
+        "properties": {
+          "role": {
+            "title": "Role",
+            "type": "string"
+          },
+          "workspace_id": {
+            "format": "uuid",
+            "title": "Workspace Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "role"
+        ],
+        "title": "AcceptedInvitation",
+        "type": "object"
+      },
+      "ApiTokenCreate": {
+        "additionalProperties": false,
+        "description": "The entire client-controlled surface of token issuance: a display name.\n\n`extra=\"forbid\"` is load-bearing. Pydantic's default is to *ignore* unknown fields, so\na client posting `{\"name\": \"ci\", \"created_by_member_id\": \"<someone else>\"}` would get\na silent 201 and be left believing the value was honoured. Forbidding turns every\nattempt to supply a server-owned field \u2014 `workspace_id`, `token_hash`, `token_prefix`,\n`created_by_member_id`, `revoked_at` \u2014 into a 422 instead of a quiet no-op. The\nsecurity property comes from the field's absence; this makes the absence audible.\n\n`scopes` is deliberately not accepted. PRD.md FR-IF-3 describes a token scope as a\n\"subset of Connections\", and Connections do not exist yet, so there is no vocabulary\nagainst which a submitted scope could be validated. Accepting free-form strings would\nmanufacture a permission language by accident and mint tokens whose recorded authority\nmeans nothing. Tokens are issued unscoped (`[]`) until the vocabulary is defined.",
+        "properties": {
+          "name": {
+            "description": "Human-readable label, e.g. 'ci-deploy'. Not a secret and not unique.",
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "ApiTokenCreate",
+        "type": "object"
+      },
+      "ApiTokenCreated": {
+        "description": "The creation response \u2014 the **only** place token plaintext is ever emitted.\n\nDeliberately not `from_attributes`: there is no `plaintext` column to read, and the\nfield cannot be populated by validating an ORM row. Construction requires the caller to\nhand over the secret explicitly, so nothing can accidentally serialize a stored token.\n\nSeparate from `ApiTokenRead` for the same reason. `ApiTokenRead` is what every list and\ndetail response returns and it has no `token` field at all; if one model served both,\na future read endpoint would only ever be one forgotten `exclude` away from emitting\ncredentials it does not even possess.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "created_by_member_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By Member Id"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "scopes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Scopes",
+            "type": "array"
+          },
+          "token": {
+            "description": "The plaintext token. Shown exactly once, in this response. It is stored only as a SHA-256 hash, so it cannot be recovered \u2014 issue a new token if lost.",
+            "title": "Token",
+            "type": "string"
+          },
+          "token_prefix": {
+            "title": "Token Prefix",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "token",
+          "token_prefix",
+          "scopes",
+          "created_by_member_id",
+          "expires_at",
+          "created_at"
+        ],
+        "title": "ApiTokenCreated",
+        "type": "object"
+      },
+      "ApiTokenList": {
+        "description": "The list envelope from API_GUIDELINES.md \u00a73 \u2014 `data` / `next_cursor` / `has_more`.\n\nNamed fields rather than a bare array, and that is the contract's choice, not a\npreference: a top-level JSON array cannot grow a pagination field later without\nbreaking every client, and it is the shape that makes \"there are more\" expressible at\nall.\n\nItems are `ApiTokenRead`, the same model every other token read uses. It has no\n`token`, `plaintext`, or `token_hash` field, so this endpoint is structurally incapable\nof emitting a credential \u2014 the guarantee comes from the model's shape, not from\nremembering to exclude something here.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/ApiTokenRead"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "has_more": {
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Opaque; pass back as `?cursor=`. Null when `has_more` is false.",
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "data",
+          "has_more"
+        ],
+        "title": "ApiTokenList",
+        "type": "object"
+      },
+      "ApiTokenRead": {
+        "description": "Token metadata. Never the secret \u2014 that exists once, at creation.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "last_used_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Used At"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "revoked_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revoked At"
+          },
+          "scopes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Scopes",
+            "type": "array"
+          },
+          "token_prefix": {
+            "description": "Display-only fragment, e.g. 'omc_A1b2C3d4'.",
+            "title": "Token Prefix",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "token_prefix",
+          "scopes",
+          "last_used_at",
+          "expires_at",
+          "revoked_at",
+          "created_at"
+        ],
+        "title": "ApiTokenRead",
+        "type": "object"
+      },
+      "AuthorizeStartRead": {
+        "description": "The response of starting an authorization: where to send the browser, and until when.",
+        "properties": {
+          "authorize_url": {
+            "description": "Provider authorization URL. Redirect the user agent here; it expires.",
+            "title": "Authorize Url",
+            "type": "string"
+          },
+          "expires_at": {
+            "description": "When this in-flight authorization stops being redeemable (RFC 3339 UTC).",
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "authorize_url",
+          "expires_at"
+        ],
+        "title": "AuthorizeStartRead",
+        "type": "object"
+      },
+      "CallUsage": {
+        "description": "Non-secret usage metering for one Tool Call.",
+        "properties": {
+          "duration_ms": {
+            "title": "Duration Ms",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "duration_ms"
+        ],
+        "title": "CallUsage",
+        "type": "object"
+      },
+      "ConnectionCreate": {
+        "additionalProperties": false,
+        "description": "The client-controlled surface of creating a Connection.\n\n`extra=\"forbid\"` so a server-owned field \u2014 `workspace_id`, `status`, `credential_id`, `id`,\n`role`, `member_id`, `kind` \u2014 is a `400`, never a silent no-op. The workspace comes from the\nauthenticated context; `connector_id` is validated to be a live connector *in that workspace*;\n`config_overrides.base_url` (if present) is SSRF-linted in the service.",
+        "properties": {
+          "config_overrides": {
+            "additionalProperties": true,
+            "description": "Non-secret per-connection config (e.g. base_url override). Never authority.",
+            "title": "Config Overrides",
+            "type": "object"
+          },
+          "connector_id": {
+            "description": "A live Connector in this workspace to bind.",
+            "format": "uuid",
+            "title": "Connector Id",
+            "type": "string"
+          },
+          "name": {
+            "description": "Human-readable connection name.",
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "connector_id",
+          "name"
+        ],
+        "title": "ConnectionCreate",
+        "type": "object"
+      },
+      "ConnectionHealthRead": {
+        "description": "The result of one health check \u2014 classified metadata only.\n\nDeliberately narrow. It carries no provider response body, no headers, no credential, no\nupstream URL, no resolved address and no exception text; `reason` is a canonical Runtime error\ncode from a closed vocabulary, so a hostile provider cannot use our own error path to smuggle\ncontent into an operator's console.",
+        "properties": {
+          "checked_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "When the check completed (RFC 3339 UTC). Null when nothing was executed.",
+            "title": "Checked At"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Canonical failure code when the check failed, or `health_check_unavailable` when the Connector exposes no Tool that is safe to run unattended.",
+            "title": "Reason"
+          },
+          "status": {
+            "description": "Derived health: healthy | unhealthy | unknown | needs_reauth.",
+            "title": "Status",
+            "type": "string"
+          },
+          "tool_call_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The audit row this check produced, for correlation.",
+            "title": "Tool Call Id"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "ConnectionHealthRead",
+        "type": "object"
+      },
+      "ConnectionList": {
+        "description": "The list envelope from API_GUIDELINES.md \u00a73 \u2014 `data` / `next_cursor` / `has_more`.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/ConnectionRead"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "has_more": {
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Opaque; pass back as `?cursor=`. Null when `has_more` is false.",
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "data",
+          "has_more"
+        ],
+        "title": "ConnectionList",
+        "type": "object"
+      },
+      "ConnectionRead": {
+        "description": "A Connection as returned to an authorized caller. No `workspace_id`, no secret.\n\n`credential_id` is a non-secret opaque id (a pointer to the future Credential, `null` until one\nis attached) \u2014 it reveals only whether a credential is bound, never any secret material.",
+        "properties": {
+          "config_overrides": {
+            "additionalProperties": true,
+            "title": "Config Overrides",
+            "type": "object"
+          },
+          "connector_id": {
+            "format": "uuid",
+            "title": "Connector Id",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "credential_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Id"
+          },
+          "health": {
+            "title": "Health",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "last_health_check_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Health Check At"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "needs_reauth": {
+            "title": "Needs Reauth",
+            "type": "boolean"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "connector_id",
+          "name",
+          "status",
+          "config_overrides",
+          "credential_id",
+          "last_health_check_at",
+          "health",
+          "needs_reauth",
+          "created_at"
+        ],
+        "title": "ConnectionRead",
+        "type": "object"
+      },
+      "ConnectionUpdate": {
+        "additionalProperties": false,
+        "description": "The mutable surface of a Connection: `name` and `config_overrides` only.\n\n`extra=\"forbid\"` so `status`, `credential_id`, `connector_id`, `workspace_id`, `role`, \u2026 are a\n`400` \u2014 a client cannot re-tenant a connection, reassign its connector, forge a lifecycle\ntransition, or attach a credential through PATCH.",
+        "properties": {
+          "config_overrides": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Config Overrides"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          }
+        },
+        "title": "ConnectionUpdate",
+        "type": "object"
+      },
+      "ConnectorCreate": {
+        "additionalProperties": false,
+        "description": "The client-controlled surface of creating a manual Connector.\n\n`extra=\"forbid\"` so a server-owned field \u2014 `workspace_id`, `source_type`, `status`,\n`current_version_id`, `id` \u2014 is a `400`, never a silent no-op. The workspace comes from\n`X-Workspace-Id`; `source_type` is fixed to `manual` by the service; `status` starts at\n`draft`. `base_url` is SSRF-linted in the service (the single source of truth), so a\nnon-HTTP caller (MCP, Celery) is guarded too, not only this endpoint.",
+        "properties": {
+          "auth_config": {
+            "additionalProperties": true,
+            "description": "Auth REQUIREMENTS only (key name/location, scheme) \u2014 never secret values.",
+            "title": "Auth Config",
+            "type": "object"
+          },
+          "base_url": {
+            "description": "The external API base URL (https only).",
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Base Url",
+            "type": "string"
+          },
+          "name": {
+            "description": "Human-readable connector name.",
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "slug": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional URL-safe slug, unique per workspace. Derived from name if omitted.",
+            "title": "Slug"
+          }
+        },
+        "required": [
+          "name",
+          "base_url"
+        ],
+        "title": "ConnectorCreate",
+        "type": "object"
+      },
+      "ConnectorList": {
+        "description": "The list envelope from API_GUIDELINES.md \u00a73 \u2014 `data` / `next_cursor` / `has_more`.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/ConnectorRead"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "has_more": {
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Opaque; pass back as `?cursor=`. Null when `has_more` is false.",
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "data",
+          "has_more"
+        ],
+        "title": "ConnectorList",
+        "type": "object"
+      },
+      "ConnectorRead": {
+        "description": "A Connector as returned to an authorized caller. No `workspace_id`.\n\n`auth_config` is safe to return: it holds auth requirements, never secret values\n(CONNECTOR_ENGINE.md \u00a78) \u2014 the secret lives in a Connection's Credential.",
+        "properties": {
+          "auth_config": {
+            "additionalProperties": true,
+            "title": "Auth Config",
+            "type": "object"
+          },
+          "base_url": {
+            "title": "Base Url",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "slug": {
+            "title": "Slug",
+            "type": "string"
+          },
+          "source_type": {
+            "title": "Source Type",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "slug",
+          "source_type",
+          "base_url",
+          "auth_config",
+          "status",
+          "created_at"
+        ],
+        "title": "ConnectorRead",
+        "type": "object"
+      },
+      "CredentialRead": {
+        "description": "A Credential's **metadata** \u2014 never its secret (SECURITY.md \u00a72.2). No ciphertext, no DEK, no\nnonce, no plaintext, no secret-derived field.",
+        "properties": {
+          "connection_id": {
+            "format": "uuid",
+            "title": "Connection Id",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "credential_type": {
+            "title": "Credential Type",
+            "type": "string"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "key_version": {
+            "title": "Key Version",
+            "type": "integer"
+          },
+          "rotated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rotated At"
+          }
+        },
+        "required": [
+          "id",
+          "connection_id",
+          "credential_type",
+          "key_version",
+          "expires_at",
+          "rotated_at",
+          "created_at"
+        ],
+        "title": "CredentialRead",
+        "type": "object"
+      },
+      "CredentialWrite": {
+        "additionalProperties": false,
+        "description": "The client-controlled surface of attaching/rotating a Credential (M1 types only).\n\n`extra=\"forbid\"` so a server-owned field is a `400`. Exactly one secret shape per type:\n`api_key`/`bearer` carry a single `value`; `basic` carries `username` + `password`\n(CONNECTOR_SPECIFICATION \u00a75). Secrets are `SecretStr` so they never render into logs.",
+        "properties": {
+          "credential_type": {
+            "enum": [
+              "api_key",
+              "bearer",
+              "basic"
+            ],
+            "title": "Credential Type",
+            "type": "string"
+          },
+          "password": {
+            "anyOf": [
+              {
+                "format": "password",
+                "type": "string",
+                "writeOnly": true
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Password"
+          },
+          "username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Username"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "format": "password",
+                "type": "string",
+                "writeOnly": true
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value"
+          }
+        },
+        "required": [
+          "credential_type"
+        ],
+        "title": "CredentialWrite",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "InvitationAccept": {
+        "additionalProperties": false,
+        "description": "The acceptance request: the raw invitation token, in the body (never the URL/logs).",
+        "properties": {
+          "token": {
+            "description": "The opaque invitation token from the email.",
+            "minLength": 1,
+            "title": "Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token"
+        ],
+        "title": "InvitationAccept",
+        "type": "object"
+      },
+      "InvitationCreate": {
+        "additionalProperties": false,
+        "description": "The client-controlled surface of creating an invitation: an email and a role.\n\n`extra=\"forbid\"` so an attempt to supply a server-owned field \u2014 `workspace_id`,\n`invited_by`, `token`, `status`, `expires_at` \u2014 is a 400, never a silent no-op. The\nworkspace is the `X-Workspace-Id` selection, the inviter is the authenticated member, and\nthe token is server-generated; none of them are inputs. `role` is validated against the\ncanonical domain in the service (the single source of truth), exactly as\n`MemberRoleUpdate` is.",
+        "properties": {
+          "email": {
+            "description": "The invitee's email address.",
+            "maxLength": 320,
+            "minLength": 3,
+            "title": "Email",
+            "type": "string"
+          },
+          "role": {
+            "description": "The role the resulting membership will carry.",
+            "title": "Role",
+            "type": "string"
+          }
+        },
+        "required": [
+          "email",
+          "role"
+        ],
+        "title": "InvitationCreate",
+        "type": "object"
+      },
+      "InvitationList": {
+        "description": "This workspace's invitations. Envelope shape per API_GUIDELINES.md \u00a73.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/InvitationRead"
+            },
+            "title": "Data",
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "InvitationList",
+        "type": "object"
+      },
+      "InvitationRead": {
+        "description": "An invitation as returned to a `members:manage` holder in its workspace.\n\nDeliberately narrow: no `token`, no `token_hash`, no `invited_by`. The token never\nleaves the creation email; the hash is a secret at rest; provenance is omitted for the\nsame reason `MemberRead` omits `invited_by`. This model is structurally incapable of\nleaking the token.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "invited_email": {
+            "title": "Invited Email",
+            "type": "string"
+          },
+          "role": {
+            "title": "Role",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "invited_email",
+          "role",
+          "status",
+          "expires_at",
+          "created_at"
+        ],
+        "title": "InvitationRead",
+        "type": "object"
+      },
+      "MemberList": {
+        "description": "The list envelope from API_GUIDELINES.md \u00a73 \u2014 identical in shape to `ApiTokenList`.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/MemberRead"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "has_more": {
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Opaque; pass back as `?cursor=`. Null when `has_more` is false.",
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "data",
+          "has_more"
+        ],
+        "title": "MemberList",
+        "type": "object"
+      },
+      "MemberRead": {
+        "description": "A Member as returned to a caller holding `members:manage`.\n\nDeliberately narrow. `invited_by` is omitted for the same reason `ApiTokenRead` omits\n`created_by_member_id`: exposing provenance is an information-disclosure decision no\ncanonical document has made, and it is not needed to manage a Workspace's members.\nAdding it later is additive; removing it after clients depend on it is not.\n\n`user_id` is the Better Auth subject (DATABASE_DESIGN.md \u00a73). It is the only handle an\nadministrator has for identifying who a Member is, so a management API that withheld it\ncould not be used to manage anything.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "role": {
+            "title": "Role",
+            "type": "string"
+          },
+          "user_id": {
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "user_id",
+          "role",
+          "created_at"
+        ],
+        "title": "MemberRead",
+        "type": "object"
+      },
+      "MemberRoleUpdate": {
+        "additionalProperties": false,
+        "description": "The entire mutable surface of a Member: its role.\n\n`role` is typed as a plain `str`, not an enum or `Literal`, on purpose. The canonical\nrole domain already exists twice \u2014 the `members.role` CHECK constraint and\n`models.MEMBER_ROLES` \u2014 and `MemberService._require_valid_role` validates against the\nlatter. Restating the four values here would create a third copy that could drift from\nthe database, and the failure mode of drift is a role that validates at the door and is\nrejected by the constraint as a 500.\n\n`extra=\"forbid\"` so an attempt to PATCH `user_id`, `workspace_id`, or `invited_by` is a\n400 rather than a silent no-op that leaves the caller believing it worked.",
+        "properties": {
+          "role": {
+            "description": "One of the canonical member roles.",
+            "title": "Role",
+            "type": "string"
+          }
+        },
+        "required": [
+          "role"
+        ],
+        "title": "MemberRoleUpdate",
+        "type": "object"
+      },
+      "MembershipList": {
+        "description": "The caller's workspaces. A bounded personal set, returned whole (ADR-0016 \u00a77).",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/MembershipRead"
+            },
+            "title": "Data",
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "MembershipList",
+        "type": "object"
+      },
+      "MembershipRead": {
+        "description": "One of the authenticated human's own workspace memberships (ADR-0016 \u00a77).\n\n`id` is the Workspace id \u2014 the value the client echoes back in `X-Workspace-Id` to\nselect it. `role` is the caller's persisted role there, for DISPLAY only: it is never\nan authorization input (authorization always re-resolves the role under RLS after the\nworkspace binds). Deliberately narrow \u2014 no other tenant's existence, name, member\ncount, or metadata is disclosed.",
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "role": {
+            "title": "Role",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "role"
+        ],
+        "title": "MembershipRead",
+        "type": "object"
+      },
+      "ToolCallCreate": {
+        "additionalProperties": false,
+        "description": "The request body of `POST /v1/tool-calls`.\n\n`mode` is `sync` only in M1 \u2014 the async (job + poll/webhook) contract is deferred (AI_RUNTIME.md\n\u00a73, ROADMAP M4), so any other value is a 422. `extra=\"forbid\"` makes an unknown field a loud 422\nrather than a silent no-op \u2014 a caller cannot smuggle `workspace_id`, `connection`, or a\ncredential field and believe it was honored.",
+        "properties": {
+          "arguments": {
+            "additionalProperties": true,
+            "description": "Tool arguments, validated against the Tool input schema.",
+            "title": "Arguments",
+            "type": "object"
+          },
+          "connection_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Explicit Connection to run against; required only when the Connector has more than one active Connection.",
+            "title": "Connection Id"
+          },
+          "mode": {
+            "const": "sync",
+            "default": "sync",
+            "title": "Mode",
+            "type": "string"
+          },
+          "tool_name": {
+            "description": "Canonical Tool name.",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Tool Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tool_name"
+        ],
+        "title": "ToolCallCreate",
+        "type": "object"
+      },
+      "ToolCallLogList": {
+        "description": "The list envelope from API_GUIDELINES \u00a73 \u2014 `data` / `next_cursor` / `has_more`.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/ToolCallLogRead"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "has_more": {
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Opaque; pass back as `?cursor=`. Null when `has_more` is false.",
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "data",
+          "has_more"
+        ],
+        "title": "ToolCallLogList",
+        "type": "object"
+      },
+      "ToolCallLogRead": {
+        "description": "One Tool Call audit record \u2014 redacted metadata only, never a secret or a raw body.",
+        "properties": {
+          "caller": {
+            "additionalProperties": true,
+            "title": "Caller",
+            "type": "object"
+          },
+          "connection_id": {
+            "format": "uuid",
+            "title": "Connection Id",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "duration_ms": {
+            "title": "Duration Ms",
+            "type": "integer"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "input_summary": {
+            "additionalProperties": true,
+            "title": "Input Summary",
+            "type": "object"
+          },
+          "output_summary": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output Summary"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "tool_id": {
+            "format": "uuid",
+            "title": "Tool Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "connection_id",
+          "tool_id",
+          "request_id",
+          "caller",
+          "status",
+          "error_code",
+          "input_summary",
+          "output_summary",
+          "duration_ms",
+          "created_at"
+        ],
+        "title": "ToolCallLogRead",
+        "type": "object"
+      },
+      "ToolCallRead": {
+        "description": "Audit-row projection returned by `GET /v1/tool-calls/{id}` \u2014 redacted metadata only, never\nthe raw response body or a secret (DATABASE_DESIGN.md `tool_calls`).",
+        "properties": {
+          "connection_id": {
+            "format": "uuid",
+            "title": "Connection Id",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "duration_ms": {
+            "title": "Duration Ms",
+            "type": "integer"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "input_summary": {
+            "additionalProperties": true,
+            "title": "Input Summary",
+            "type": "object"
+          },
+          "output_summary": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output Summary"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "tool_id": {
+            "format": "uuid",
+            "title": "Tool Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "connection_id",
+          "tool_id",
+          "request_id",
+          "status",
+          "error_code",
+          "input_summary",
+          "output_summary",
+          "duration_ms",
+          "created_at"
+        ],
+        "title": "ToolCallRead",
+        "type": "object"
+      },
+      "ToolCallResult": {
+        "description": "The `200` response of a *successful* `POST /v1/tool-calls`. Failures return the error\nenvelope instead (with `tool_call_id` in `details`).",
+        "properties": {
+          "connection_id": {
+            "format": "uuid",
+            "title": "Connection Id",
+            "type": "string"
+          },
+          "content": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Normalized, truncation-aware payload for LLM consumption.",
+            "title": "Content"
+          },
+          "id": {
+            "description": "Tool Call id \u2014 the audit row; fetch it at GET /v1/tool-calls/{id}.",
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "status": {
+            "const": "succeeded",
+            "title": "Status",
+            "type": "string"
+          },
+          "tool_name": {
+            "title": "Tool Name",
+            "type": "string"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/CallUsage"
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "tool_name",
+          "connection_id",
+          "usage",
+          "request_id"
+        ],
+        "title": "ToolCallResult",
+        "type": "object"
+      },
+      "ToolList": {
+        "description": "The list envelope from API_GUIDELINES \u00a73 \u2014 `data` / `next_cursor` / `has_more`.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/ToolRead"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "has_more": {
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Opaque; pass back as `?cursor=`. Null when `has_more` is false.",
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "data",
+          "has_more"
+        ],
+        "title": "ToolList",
+        "type": "object"
+      },
+      "ToolRead": {
+        "description": "The public projection of a Tool. Metadata only \u2014 never a secret or an execution detail.",
+        "properties": {
+          "annotations": {
+            "additionalProperties": true,
+            "title": "Annotations",
+            "type": "object"
+          },
+          "connector_id": {
+            "format": "uuid",
+            "title": "Connector Id",
+            "type": "string"
+          },
+          "connector_version_id": {
+            "format": "uuid",
+            "title": "Connector Version Id",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "input_schema": {
+            "additionalProperties": true,
+            "title": "Input Schema",
+            "type": "object"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "output_hints": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output Hints"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "connector_id",
+          "connector_version_id",
+          "name",
+          "description",
+          "input_schema",
+          "output_hints",
+          "annotations",
+          "enabled",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "ToolRead",
+        "type": "object"
+      },
+      "ToolUpdate": {
+        "additionalProperties": false,
+        "description": "The mutable surface of a Tool in M1: `enabled` only.\n\n`extra=\"forbid\"` is load-bearing \u2014 it turns any attempt to rewrite a canonical field\n(`name`, `description`, `input_schema`, `connector_id`, `connector_version_id`, `workspace_id`)\ninto a 422 rather than a silent no-op. Those fields originate from connector ingestion/promotion\nand are immutable here; per-Tool description editing (FR-CE-4) is deferred.",
+        "properties": {
+          "enabled": {
+            "description": "Enable (executable) or disable (blocked from execution) the Tool.",
+            "title": "Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "title": "ToolUpdate",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      },
+      "WorkspaceNotificationSettings": {
+        "description": "The Workspace's Connection Health notification destination (M2.10, ADR-0041).\n\nA response model of its own rather than a field on `WorkspaceRead`, and the reason is a\nsecurity boundary: `GET /v1/workspaces/me` authenticates with `CurrentWorkspace`, which any\n**machine token** satisfies (ADR-0002 \u2014 a token has no membership and therefore no\npermissions). Widening that response would hand the destination address to every MCP client\nholding a workspace token. The destination is PII a human typed, so it is read and written\nonly through the `workspace:manage` endpoints below.",
+        "properties": {
+          "notification_email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Notification Email"
+          }
+        },
+        "required": [
+          "notification_email"
+        ],
+        "title": "WorkspaceNotificationSettings",
+        "type": "object"
+      },
+      "WorkspaceNotificationUpdate": {
+        "additionalProperties": false,
+        "description": "Set or clear the Workspace's notification destination.\n\n`extra=\"forbid\"`: `name`, `slug`, `plan`, `stripe_customer_id` and `id` are **not**\nupdatable here. This endpoint exists to configure one thing, and accepting-then-ignoring a\n`plan` field would look like a working billing change to the caller.\n\n`None` is meaningful and distinct from omission \u2014 it is how an owner turns notifications off,\nand the field is required precisely so \"clear it\" cannot be confused with \"leave it alone\".",
+        "properties": {
+          "notification_email": {
+            "anyOf": [
+              {
+                "maxLength": 320,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Where Connection Health failure notifications are sent; null disables them.",
+            "title": "Notification Email"
+          }
+        },
+        "required": [
+          "notification_email"
+        ],
+        "title": "WorkspaceNotificationUpdate",
+        "type": "object"
+      },
+      "WorkspaceRead": {
+        "description": "A Workspace as returned to an authenticated caller.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "plan": {
+            "title": "Plan",
+            "type": "string"
+          },
+          "slug": {
+            "title": "Slug",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "slug",
+          "plan",
+          "created_at"
+        ],
+        "title": "WorkspaceRead",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "OmniAI Connect API",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/health": {
+      "get": {
+        "description": "Liveness probe: the process is up and the event loop is responsive.\n\nDeliberately checks no dependencies \u2014 a Neon or Upstash blip must not restart-loop\notherwise-healthy processes (OBSERVABILITY.md \u00a76). Readiness (`/health/ready`), which\ndoes check them, lands with the first dependency the request path actually needs.\n\nReturns no environment detail: it is unauthenticated, so every field is public.",
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Health Health Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health",
+        "tags": [
+          "ops"
+        ]
+      }
+    },
+    "/health/ready": {
+      "get": {
+        "description": "Readiness probe: can this process actually serve production traffic?\n\nVerifies the two dependencies OBSERVABILITY.md \u00a76 names \u2014 PostgreSQL with a cheap\n`SELECT 1`, and a Redis `PING` \u2014 and reports one boolean. \u00a76 assigns the two probes\ndifferent jobs: *\"Railway uses readiness for deploy gating; liveness for restarts.\"*\nFailing readiness withdraws this process from the load balancer; failing liveness gets\nit killed. That is why `/health` above checks nothing external and this one does.\n\n**503 on failure**, because deploy gating requires an unready process to answer\nnon-2xx and RFC 9110 \u00a715.6.4 defines 503 as exactly \"temporarily unable to handle the\nrequest\". `Retry-After` is deliberately omitted: nothing here can honestly predict when\na dependency will return, and a wrong hint is worse than none.\n\n**The body names no dependency.** This endpoint is unauthenticated and, per \u00a76,\nmonitored from the public internet; which dependency is failing is diagnosis, and\ndiagnosis belongs in the structured log the probes already emit. The orchestrator needs\nthe status code, and an operator needs the log line.\n\nNo authentication, no tenant context, no database *state*. Infrastructure must be able\nto call this before any credential exists, and a probe that bound a workspace would\nleave that binding on a pooled connection for the next request to inherit.",
+        "operationId": "readiness_health_ready_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Readiness Health Ready Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Every required dependency answered."
+          },
+          "503": {
+            "description": "A required dependency is unavailable; send no traffic here."
+          }
+        },
+        "summary": "Readiness",
+        "tags": [
+          "ops"
+        ]
+      }
+    },
+    "/mcp/v1/{workspace_slug}": {
+      "post": {
+        "description": "One MCP message per request (sessionless Streamable HTTP, JSON responses).",
+        "operationId": "mcp_endpoint_mcp_v1__workspace_slug__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_slug",
+            "required": true,
+            "schema": {
+              "title": "Workspace Slug",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "A JSON-RPC response (result or protocol error)."
+          },
+          "202": {
+            "description": "Notification accepted."
+          },
+          "400": {
+            "description": "Malformed JSON, or an unsupported MCP protocol revision."
+          },
+          "401": {
+            "description": "Missing/invalid token, human session, or token/slug mismatch."
+          },
+          "403": {
+            "description": "Browser-origin request refused."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Workspace MCP endpoint (Streamable HTTP)",
+        "tags": [
+          "mcp"
+        ]
+      }
+    },
+    "/v1/api-tokens": {
+      "get": {
+        "description": "Page through this Workspace's tokens, newest first.\n\n**Metadata only, always.** The response carries `token_prefix` \u2014 the public fragment\nthat lets a human recognise a credential in a revocation UI, exactly as GitHub shows\n`ghp_\u2026` \u2014 and never the secret or its hash. That is not enforced by a filter here: the\nplaintext was never stored, and `ApiTokenRead` has no field able to carry either value.\n\nThe Workspace comes from the authenticated context and appears in no parameter of this\nfunction. There is no request field \u2014 query, path, body, or header \u2014 through which a\ncaller could name a different tenant, so cross-workspace listing is not a request this\nAPI can express.\n\nRequires `api_tokens:manage`, the same capability as issuance (SECURITY.md \u00a74.1). A\nmachine token therefore cannot enumerate the Workspace's credentials, for the same\nreason it cannot mint one: it resolves to no membership (ADR-0002).",
+        "operationId": "list_api_tokens_v1_api_tokens_get",
+        "parameters": [
+          {
+            "description": "Page size. Defaults to 50, maximum 100.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "description": "Page size. Defaults to 50, maximum 100.",
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Opaque cursor from a prior page.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Opaque cursor from a prior page.",
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiTokenList"
+                }
+              }
+            },
+            "description": "A page of token metadata. Never contains a secret."
+          },
+          "400": {
+            "description": "Unknown query parameter, bad limit, or an invalid cursor."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `api_tokens:manage` in this Workspace."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List the Workspace's API tokens",
+        "tags": [
+          "api-tokens"
+        ]
+      },
+      "post": {
+        "description": "Mint a machine credential for the caller's Workspace.\n\nThe response body carries the plaintext token, and it is the only time it will ever\nexist outside the client. It is stored as a SHA-256 hash; there is no read-back\nendpoint and no recovery path.\n\n**Provenance comes from the authenticated context, never the request.**\n`created_by_member_id` is taken from `ctx.caller.member_id` \u2014 a value produced by token\nresolution and membership lookup \u2014 and `ApiTokenCreate` forbids extra fields, so a\nclient attempting to supply it is rejected rather than ignored. Reaching this line at\nall proves the caller is a human-plane member of this Workspace holding\n`api_tokens:manage`: `resolve_member_role` returns `None` for any other identity, and\n`None` denies. The attribution therefore cannot be forged or absent.\n\n`Cache-Control: no-store` per RFC 6749 \u00a75.1, which governs exactly this shape of\nresponse \u2014 a bearer credential in a JSON body. Without it a proxy, a browser cache, or\na logging middleware that records response bodies for cacheable 2xx replies is free to\nretain the secret.",
+        "operationId": "create_api_token_v1_api_tokens_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApiTokenCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiTokenCreated"
+                }
+              }
+            },
+            "description": "Created. Contains the plaintext token, shown once."
+          },
+          "400": {
+            "description": "Invalid name, or an attempt to set a server-owned field."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `api_tokens:manage` in this Workspace."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create a workspace API token",
+        "tags": [
+          "api-tokens"
+        ]
+      }
+    },
+    "/v1/api-tokens/{token_id}": {
+      "delete": {
+        "description": "Stop a credential from working, immediately and permanently.\n\n**`DELETE` on a state transition.** The row is not removed \u2014 `revoked_at` is set, and\nthe token stays visible in listings with that field populated, which is how an operator\nlater sees that a credential existed and when it was cut off. From the client's side the\ncredential ceases to exist, which is what `DELETE` means; retention is an audit\nimplementation detail. There is no un-revoke: the guidelines define no such operation\nand inventing one would let a compromised credential be restored (ADR-0012).\n\n**Effective immediately**, with no cache to wait for. `get_workspace_context` re-reads\nthe token row on every request and rejects a revoked one (MCP_RUNTIME.md \u00a75: revoking\n\"severs every client using it immediately\"). Nothing here duplicates that check \u2014 this\nendpoint only writes the state that the single existing resolver already enforces.\n\nRequires `api_tokens:manage`. A machine token cannot revoke anything, including itself,\nbecause it resolves to no membership (ADR-0002) \u2014 which also means a stolen credential\ncannot be used to revoke the *other* tokens an operator would need during a response.",
+        "operationId": "revoke_api_token_v1_api_tokens__token_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "token_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Token Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Revoked. Also returned if it was already revoked."
+          },
+          "400": {
+            "description": "Malformed token id."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `api_tokens:manage` in this Workspace."
+          },
+          "404": {
+            "description": "No such token in this Workspace."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revoke a workspace API token",
+        "tags": [
+          "api-tokens"
+        ]
+      }
+    },
+    "/v1/connections": {
+      "get": {
+        "description": "Page through this Workspace's live connections, newest first. The Workspace comes from the\nauthenticated context and appears in no parameter, so a cross-workspace listing is not a request\nthis API can express.",
+        "operationId": "list_connections_v1_connections_get",
+        "parameters": [
+          {
+            "description": "Page size. Defaults to 50, maximum 100.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "description": "Page size. Defaults to 50, maximum 100.",
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Opaque cursor from a prior page.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Opaque cursor from a prior page.",
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionList"
+                }
+              }
+            },
+            "description": "A page of this Workspace's live connections, newest first."
+          },
+          "400": {
+            "description": "Unknown query parameter, bad limit, or an invalid cursor."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `connections:manage` in this Workspace."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List the Workspace's Connections",
+        "tags": [
+          "connections"
+        ]
+      },
+      "post": {
+        "description": "Create a `pending_auth` Connection binding a live Connector in the selected Workspace.\n\n`connector_id` is validated to be a live Connector *in this Workspace* \u2014 a foreign or deleted\nconnector is a uniform 404, so a cross-tenant binding cannot be expressed. `status` and\n`credential_id` are server-controlled (never body fields); credential attachment (\u2192 `active`)\nis a later module. `config_overrides.base_url`, if present, is SSRF-linted. An optional\n`Idempotency-Key` header (a UUID, API_GUIDELINES \u00a75) makes retries safe: the same key + body\nreplays the original response; the same key + a different body is a 409.",
+        "operationId": "create_connection_v1_connections_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectionCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionRead"
+                }
+              }
+            },
+            "description": "The created Connection (status=pending_auth). No credential yet."
+          },
+          "400": {
+            "description": "Invalid body, an unsafe base_url override, or a bad Idempotency-Key."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `connections:manage` in this Workspace."
+          },
+          "404": {
+            "description": "No such live Connector in this Workspace."
+          },
+          "409": {
+            "description": "A live connection with that name exists, or an Idempotency-Key clash."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create a Connection to a Connector",
+        "tags": [
+          "connections"
+        ]
+      }
+    },
+    "/v1/connections/{connection_id}": {
+      "delete": {
+        "description": "Revoke a Connection (soft delete \u2192 `revoked`, retained for audit). Workspace-scoped: a\nforeign id is simply not found. A second revoke is a uniform 404 (the row is no longer live).",
+        "operationId": "revoke_connection_v1_connections__connection_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Connection Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Revoked (soft delete \u2192 `revoked`). Its name is free to reuse."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `connections:manage` in this Workspace."
+          },
+          "404": {
+            "description": "No such live connection in this Workspace."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revoke a Connection",
+        "tags": [
+          "connections"
+        ]
+      },
+      "get": {
+        "description": "One Connection by id. Workspace-scoped: a foreign or revoked id is a uniform 404, byte-\nidentical to one that never existed, so the endpoint is not a cross-tenant oracle.",
+        "operationId": "get_connection_v1_connections__connection_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Connection Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionRead"
+                }
+              }
+            },
+            "description": "The Connection."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `connections:manage` in this Workspace."
+          },
+          "404": {
+            "description": "No such live connection in this Workspace."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get one Connection",
+        "tags": [
+          "connections"
+        ]
+      },
+      "patch": {
+        "description": "Update a Connection's `name`/`config_overrides` only. `status`, `credential_id`, and\n`connector_id` are immutable here \u2014 a client cannot forge a lifecycle transition, attach a\ncredential, or re-tenant/re-target the connection through PATCH. A `base_url` override is\nre-linted; a foreign id is a uniform 404.",
+        "operationId": "update_connection_v1_connections__connection_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Connection Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectionUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionRead"
+                }
+              }
+            },
+            "description": "The updated Connection."
+          },
+          "400": {
+            "description": "Invalid body or an unsafe base_url override."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `connections:manage` in this Workspace."
+          },
+          "404": {
+            "description": "No such live connection in this Workspace."
+          },
+          "409": {
+            "description": "The new name collides with another live connection."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update a Connection's name / config",
+        "tags": [
+          "connections"
+        ]
+      }
+    },
+    "/v1/connections/{connection_id}/credential": {
+      "delete": {
+        "description": "Hard-delete the Credential (revocation destroys the material \u2014 no soft delete) and return the\nConnection to `pending_auth`. A missing connection/credential is a uniform 404.",
+        "operationId": "revoke_credential_v1_connections__connection_id__credential_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Connection Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Revoked; the row is destroyed, the Connection returns to pending_auth."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `connections:manage` in this Workspace."
+          },
+          "404": {
+            "description": "No such live connection (or credential) in this Workspace."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revoke (hard-delete) a Connection's Credential",
+        "tags": [
+          "credentials"
+        ]
+      },
+      "get": {
+        "description": "The Credential's **metadata** (type, key_version, timestamps) \u2014 never the secret. Absent or\nforeign is a uniform 404, so the endpoint is not a cross-tenant oracle.",
+        "operationId": "get_credential_v1_connections__connection_id__credential_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Connection Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CredentialRead"
+                }
+              }
+            },
+            "description": "The Credential metadata (no secret)."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `connections:manage` in this Workspace."
+          },
+          "404": {
+            "description": "No such live connection (or credential) in this Workspace."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get a Connection's Credential metadata",
+        "tags": [
+          "credentials"
+        ]
+      },
+      "post": {
+        "description": "Attach a Credential (api_key/bearer/basic). The secret enters over TLS once, is\nenvelope-encrypted (AES-256-GCM, per-Credential DEK, workspace\u2016connection AAD), and is **never**\nreturned, logged, or persisted in plaintext. The Connection transitions `pending_auth \u2192 active`.\nA foreign/revoked connection is a uniform 404; an already-credentialed connection is a 409.",
+        "operationId": "attach_credential_v1_connections__connection_id__credential_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Connection Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CredentialWrite"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CredentialRead"
+                }
+              }
+            },
+            "description": "The Credential metadata (no secret). The Connection is now `active`."
+          },
+          "400": {
+            "description": "Invalid body for the credential type."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `connections:manage` in this Workspace."
+          },
+          "404": {
+            "description": "No such live connection (or credential) in this Workspace."
+          },
+          "409": {
+            "description": "This connection already has a credential; rotate it instead."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Attach an encrypted Credential to a Connection",
+        "tags": [
+          "credentials"
+        ]
+      },
+      "put": {
+        "description": "Re-seal the Credential with a fresh DEK + nonce and new secret material; `rotated_at` is set.\nThe old ciphertext is replaced atomically. A missing connection/credential is a uniform 404.",
+        "operationId": "rotate_credential_v1_connections__connection_id__credential_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Connection Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CredentialWrite"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CredentialRead"
+                }
+              }
+            },
+            "description": "The rotated Credential metadata (fresh DEK + nonce, `rotated_at` set)."
+          },
+          "400": {
+            "description": "Invalid body for the credential type."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `connections:manage` in this Workspace."
+          },
+          "404": {
+            "description": "No such live connection (or credential) in this Workspace."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rotate a Connection's Credential",
+        "tags": [
+          "credentials"
+        ]
+      }
+    },
+    "/v1/connections/{connection_id}/oauth/authorize": {
+      "post": {
+        "description": "Start the dance. The response carries the provider URL and its expiry \u2014 never the `state`\nas a separate field, never the PKCE verifier, never a token.",
+        "operationId": "start_authorization_v1_connections__connection_id__oauth_authorize_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Connection Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthorizeStartRead"
+                }
+              }
+            },
+            "description": "Where to send the user agent, and when the link expires."
+          },
+          "400": {
+            "description": "The Connector does not use the oauth2 auth model."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `connections:manage` in this Workspace."
+          },
+          "404": {
+            "description": "No such live Connection in this Workspace."
+          },
+          "409": {
+            "description": "OAuth is disabled, or the Connection is revoked."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Begin an OAuth authorization for a Connection",
+        "tags": [
+          "oauth"
+        ]
+      }
+    },
+    "/v1/connections/{connection_id}/test": {
+      "post": {
+        "description": "Execute one health check against a Connection and return its classified outcome.\n\nA thin door onto the Execution Runtime (AI_RUNTIME \u00a74): this handler performs no HTTP, decrypts\nnothing, validates no egress, enforces no limits and writes no audit row. It picks a Tool that\nis safe to run unattended and hands a canonical Tool Call to the Runtime, which applies the\nidentical pipeline \u2014 rate limits and quota, argument validation, credential decrypt-at-use,\nSSRF and timeout, audit \u2014 that every other Tool Call gets.\n\nThe response is **200 for an unhealthy Connection**. The check itself succeeded; what it found\nis reported in `status`/`reason`. Mapping a provider's 500 onto our own 5xx would tell the\ncaller our API failed, which is a different and much less useful fact.",
+        "operationId": "test_connection_v1_connections__connection_id__test_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Connection Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionHealthRead"
+                }
+              }
+            },
+            "description": "The check completed; classified health metadata."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller may not execute Tools in this Workspace."
+          },
+          "404": {
+            "description": "No such live Connection in this Workspace."
+          },
+          "409": {
+            "description": "Connection health checks are disabled."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Test a Connection's health",
+        "tags": [
+          "connections"
+        ]
+      }
+    },
+    "/v1/connectors": {
+      "get": {
+        "description": "Page through this Workspace's live connectors, newest first.\n\nThe Workspace comes from the authenticated context and appears in no parameter here, so a\ncross-workspace listing is not a request this API can express. Soft-deleted connectors are\nabsent by construction (the repository filters `deleted_at IS NULL`).",
+        "operationId": "list_connectors_v1_connectors_get",
+        "parameters": [
+          {
+            "description": "Page size. Defaults to 50, maximum 100.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "description": "Page size. Defaults to 50, maximum 100.",
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Opaque cursor from a prior page.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Opaque cursor from a prior page.",
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorList"
+                }
+              }
+            },
+            "description": "A page of this Workspace's live connectors, newest first."
+          },
+          "400": {
+            "description": "Unknown query parameter, bad limit, or an invalid cursor."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `connectors:manage` in this Workspace."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List the Workspace's Connectors",
+        "tags": [
+          "connectors"
+        ]
+      },
+      "post": {
+        "description": "Create a manual Connector in the selected Workspace.\n\n`source_type` is server-set to `manual` and `status` to `draft` \u2014 neither is a request\nfield, so a client cannot mint a Connector that falsely claims to be OpenAPI-ingested.\n`base_url` is SSRF-linted (https only; no private/loopback/link-local/metadata hosts; no\nembedded credentials) before it is stored, because it is a wire destination the runtime\nwill later call. `auth_config` carries auth *requirements* only, never secrets.",
+        "operationId": "create_connector_v1_connectors_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectorCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorRead"
+                }
+              }
+            },
+            "description": "The created Connector (source_type=manual, status=draft)."
+          },
+          "400": {
+            "description": "Invalid name/slug, or a base_url that fails the SSRF lint."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `connectors:manage` in this Workspace."
+          },
+          "409": {
+            "description": "A live connector with that slug already exists here."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Define a manual Connector",
+        "tags": [
+          "connectors"
+        ]
+      }
+    },
+    "/v1/connectors/{connector_id}": {
+      "delete": {
+        "description": "Soft-delete a Connector (retained with `deleted_at` set). Workspace-scoped: a foreign id\nis simply not found. A second delete is a uniform 404 (the row is no longer live).",
+        "operationId": "delete_connector_v1_connectors__connector_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Connector Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Soft-deleted. Its slug is free to reuse."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `connectors:manage` in this Workspace."
+          },
+          "404": {
+            "description": "No such live connector in this Workspace."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete a Connector",
+        "tags": [
+          "connectors"
+        ]
+      },
+      "get": {
+        "description": "One Connector by id. Workspace-scoped: a foreign or soft-deleted id is a uniform 404,\nbyte-identical to one that never existed, so the endpoint is not a cross-tenant oracle.",
+        "operationId": "get_connector_v1_connectors__connector_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Connector Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorRead"
+                }
+              }
+            },
+            "description": "The Connector."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `connectors:manage` in this Workspace."
+          },
+          "404": {
+            "description": "No such live connector in this Workspace."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get one Connector",
+        "tags": [
+          "connectors"
+        ]
+      }
+    },
+    "/v1/connectors/{connector_id}/versions": {
+      "post": {
+        "description": "Start asynchronous OpenAPI ingestion for a Connector (M1.4-B1.1/B1.2).\n\n`multipart/form-data` with **exactly one** of a `source_url` field (URL ingestion) or a `file`\nupload. The Connector transitions to `ingesting` and a post-commit trigger enqueues the Celery\npipeline. The workspace is the authenticated context \u2014 the URL/upload names only *where* the\nspec is, never *which tenant* \u2014 so a client cannot ingest into another Workspace. Returns 202\nwith the Connector in `ingesting`; the terminal state is the worker's.\n\nAn uploaded file is validated (bounded size, non-empty) and staged to the tenant ObjectStore\nhere (the worker cannot re-fetch it, \u00a718); the filename is discarded \u2014 never trusted for type,\npath, or logging. The multipart part size is bounded explicitly (never the 1 MB framework\ndefault) so an oversized upload fails at parse time.",
+        "operationId": "ingest_connector_version_v1_connectors__connector_id__versions_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Connector Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorRead"
+                }
+              }
+            },
+            "description": "Accepted; the Connector is now `ingesting`. The Celery pipeline gets the bytes (guarded fetch of the URL, or the staged upload), normalizes, persists an immutable version, and publishes `connector.ingested`. Poll for `active`/`failed`."
+          },
+          "400": {
+            "description": "Not exactly one of `source_url`/`file`; a non-https URL; an empty, oversized, or malformed upload."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `connectors:manage` in this Workspace."
+          },
+          "404": {
+            "description": "No such live connector in this Workspace."
+          },
+          "409": {
+            "description": "The Connector is already ingesting."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Ingest an OpenAPI spec (async) \u2014 by URL or file upload",
+        "tags": [
+          "connectors"
+        ]
+      }
+    },
+    "/v1/connectors/{connector_id}/versions/{version}/promote": {
+      "post": {
+        "description": "Promote a persisted version to the Connector's active definition (M1.4-B1.4).\n\nA first or purely-additive version auto-promotes during ingestion; a **breaking** version\n(a required argument added, an argument removed, or a type narrowed \u2014 CONNECTOR_SPECIFICATION\n\u00a7185) is persisted un-promoted and activated here so the change is a deliberate act. The\nConnector keeps serving its current version until this succeeds. The workspace is the\nauthenticated context and appears in no field, so a cross-workspace promotion is not a request\nthis API can express; a foreign/deleted connector or an unknown version is a uniform 404.\nIdempotent and concurrency-safe (the connector row is locked for the transaction).",
+        "operationId": "promote_connector_version_v1_connectors__connector_id__versions__version__promote_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Connector Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The monotonic version number to promote.",
+            "in": "path",
+            "name": "version",
+            "required": true,
+            "schema": {
+              "description": "The monotonic version number to promote.",
+              "minimum": 1,
+              "title": "Version",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorRead"
+                }
+              }
+            },
+            "description": "The version is now active: the tools projection was swapped to it and `connector.ingested` published. Idempotent \u2014 promoting the current version is a no-op."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `connectors:manage` in this Workspace."
+          },
+          "404": {
+            "description": "No such live connector, or no such version, in this Workspace."
+          },
+          "409": {
+            "description": "The Connector is ingesting; promote after it settles."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Promote a version to the Connector's active definition",
+        "tags": [
+          "connectors"
+        ]
+      }
+    },
+    "/v1/invitations": {
+      "get": {
+        "description": "Pending invitations for the selected Workspace only.\n\nWorkspace-scoped by the same context every management endpoint uses, so another\ntenant's invitations are not a request this API can express. Tokens and hashes are\nabsent from `InvitationRead` by construction.",
+        "operationId": "list_invitations_v1_invitations_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvitationList"
+                }
+              }
+            },
+            "description": "Pending invitations for the selected Workspace, newest first."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `members:manage` in this Workspace."
+          }
+        },
+        "summary": "List this Workspace's pending invitations",
+        "tags": [
+          "invitations"
+        ]
+      },
+      "post": {
+        "description": "Create a targeted invitation and email it (ADR-0017).\n\nThe Workspace is the `X-Workspace-Id` selection, the inviter is the authenticated\nmember (`ctx.caller.member_id`, never a request field), and the role is server-persisted\nat creation \u2014 the recipient can neither see nor change it. The response is the invitation\nrecord **without** the token: the raw token exists only in the email and is never\nreturned or logged.",
+        "operationId": "create_invitation_v1_invitations_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InvitationCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvitationRead"
+                }
+              }
+            },
+            "description": "Created and emailed. The token is never in the response."
+          },
+          "400": {
+            "description": "Invalid email, unknown role, or a server-owned field."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `members:manage` in this Workspace."
+          },
+          "409": {
+            "description": "A pending invitation already exists for that email here."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Invite a person to the Workspace by email",
+        "tags": [
+          "invitations"
+        ]
+      }
+    },
+    "/v1/invitations/accept": {
+      "post": {
+        "description": "Accept an invitation with the token from its email (ADR-0017 \u00a78).\n\nNot workspace-scoped and not RBAC-gated: the invitation, resolved from its token,\nestablishes the Workspace, and the gate is the verified-email binding, not a permission.\nThe token is in the body \u2014 never the URL \u2014 so it stays out of access logs. The whole\nsequence (resolve, verify email, bind, consume, create membership) is one transaction;\nany failure rolls all of it back. Every unacceptable case returns the one uniform 404.",
+        "operationId": "accept_invitation_v1_invitations_accept_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InvitationAccept"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AcceptedInvitation"
+                }
+              }
+            },
+            "description": "Joined. Returns the workspace and the granted role."
+          },
+          "401": {
+            "description": "Missing or invalid human credential."
+          },
+          "404": {
+            "description": "Invitation not found or not acceptable (uniform, no oracle)."
+          },
+          "409": {
+            "description": "You are already a member of this Workspace."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Accept an invitation and join the Workspace",
+        "tags": [
+          "invitations"
+        ]
+      }
+    },
+    "/v1/invitations/{invitation_id}": {
+      "delete": {
+        "description": "Cancel a pending invitation. Workspace-scoped: a foreign id is simply not found.\n\nA cancelled invitation can never be accepted \u2014 its status leaves `pending`, so the\nacceptance guard fails.",
+        "operationId": "cancel_invitation_v1_invitations__invitation_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "invitation_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Invitation Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Cancelled. It can never be accepted."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `members:manage` in this Workspace."
+          },
+          "404": {
+            "description": "No such pending invitation in this Workspace."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel a pending invitation",
+        "tags": [
+          "invitations"
+        ]
+      }
+    },
+    "/v1/members": {
+      "get": {
+        "description": "Page through this Workspace's Members, newest first.\n\nThe Workspace comes from the authenticated context and appears in no parameter of this\nfunction, so listing another tenant's members is not a request this API can express.\n\nRequires `members:manage` (SECURITY.md \u00a74.1), which owner and admin hold. A machine\ntoken resolves to no membership and is therefore denied \u2014 a leaked credential cannot\nenumerate who works at the customer.",
+        "operationId": "list_members_v1_members_get",
+        "parameters": [
+          {
+            "description": "Page size. Defaults to 50, maximum 100.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "description": "Page size. Defaults to 50, maximum 100.",
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Opaque cursor from a prior page.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Opaque cursor from a prior page.",
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemberList"
+                }
+              }
+            },
+            "description": "A page of Members, newest first."
+          },
+          "400": {
+            "description": "Unknown query parameter, bad limit, or an invalid cursor."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `members:manage` in this Workspace."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List the Workspace's Members",
+        "tags": [
+          "members"
+        ]
+      }
+    },
+    "/v1/members/{member_id}": {
+      "delete": {
+        "description": "Remove a Member. Their membership, and the authority it carried, ends immediately.\n\n**404 for a Member that is absent *or* belongs to another Workspace**, byte-identical in\nboth cases. API_GUIDELINES.md \u00a72 also says \"deleting a deleted resource is 204\", but the\nsame section requires cross-tenant access to answer 404 \u2014 and for a hard-deleted row,\n\"already deleted\", \"never existed\" and \"not yours\" are indistinguishable. Answering 204\nfor absence would therefore mean answering 204 for another tenant's id too, or\ndistinguishing them and becoming the existence oracle SECURITY.md \u00a73 forbids. Security\nwins, matching ADR-0012's treatment of the analogous token endpoint.\n\nRemoving a Member does **not** revoke the API tokens they created: those are\nworkspace-owned credentials whose provenance is simply cleared (M1.2-A's composite FK\nwith `ON DELETE SET NULL`). Revoking them is a separate, explicit act.",
+        "operationId": "remove_member_v1_members__member_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "member_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Member Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed."
+          },
+          "400": {
+            "description": "Malformed member id."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `members:manage` in this Workspace."
+          },
+          "404": {
+            "description": "No such Member in this Workspace."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Remove a Member from the Workspace",
+        "tags": [
+          "members"
+        ]
+      },
+      "patch": {
+        "description": "Set a Member's role. Takes effect on that member's very next request.\n\nThe role is read from the persisted row on every authorization check (M1.2-E), so a\ndemotion binds immediately \u2014 there is no cached role and nothing to invalidate.\n\n**No role-transition rules are enforced**, and that is deliberate rather than an\noversight: no canonical document defines whether an admin may re-role an owner, or\nwhether the last owner may be demoted. `MemberService` records both as open questions.\nInventing them here would place authorization policy in an HTTP adapter and prejudge a\ndecision that belongs in SECURITY.md \u00a74.1.",
+        "operationId": "change_member_role_v1_members__member_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "member_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Member Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemberRoleUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemberRead"
+                }
+              }
+            },
+            "description": "The updated Member."
+          },
+          "400": {
+            "description": "Malformed id, unknown field, or a role outside the domain."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `members:manage` in this Workspace."
+          },
+          "404": {
+            "description": "No such Member in this Workspace."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Change a Member's role",
+        "tags": [
+          "members"
+        ]
+      }
+    },
+    "/v1/oauth/callback": {
+      "get": {
+        "description": "Complete the dance.\n\nAuthority is the state row alone: `code` and `state` are attacker-influencable, so the\nworkspace and connection are read from the row this request atomically consumes. Every\nfailure \u2014 provider error, missing parameters, unknown/expired/replayed state, a refused\ntoken exchange \u2014 renders the same terminal page, so the endpoint is not an oracle.",
+        "operationId": "oauth_callback_v1_oauth_callback_get",
+        "parameters": [
+          {
+            "description": "Authorization code from the provider.",
+            "in": "query",
+            "name": "code",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Authorization code from the provider.",
+              "title": "Code"
+            }
+          },
+          {
+            "description": "Opaque state issued at authorize time.",
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Opaque state issued at authorize time.",
+              "title": "State"
+            }
+          },
+          {
+            "description": "Provider-reported error code.",
+            "in": "query",
+            "name": "error",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Provider-reported error code.",
+              "title": "Error"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The authorization completed; the Connection is now active."
+          },
+          "400": {
+            "description": "The provider reported an error, or the link is invalid/expired."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "OAuth provider redirect target (unauthenticated by design)",
+        "tags": [
+          "oauth"
+        ]
+      }
+    },
+    "/v1/tool-calls": {
+      "get": {
+        "description": "Page through this Workspace's Tool Call audit log, newest first, with the canonical UJ-5.3\nfilters. Redacted metadata only \u2014 credentials, tokens, and raw bodies never appear (they were\nscrubbed at write time). The Workspace comes from the authenticated context and appears in no\nparameter, so a cross-workspace listing is not a request this API can express.",
+        "operationId": "list_tool_call_log_v1_tool_calls_get",
+        "parameters": [
+          {
+            "description": "Page size. Defaults to 50, maximum 100.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "description": "Page size. Defaults to 50, maximum 100.",
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Opaque cursor from a prior page.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Opaque cursor from a prior page.",
+              "title": "Cursor"
+            }
+          },
+          {
+            "description": "Filter by Connection.",
+            "in": "query",
+            "name": "connection_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by Connection.",
+              "title": "Connection Id"
+            }
+          },
+          {
+            "description": "Filter by Tool.",
+            "in": "query",
+            "name": "tool_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by Tool.",
+              "title": "Tool Id"
+            }
+          },
+          {
+            "description": "Filter by status (succeeded|failed|denied|timeout).",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by status (succeeded|failed|denied|timeout).",
+              "title": "Status"
+            }
+          },
+          {
+            "description": "Filter by Interface (e.g. rest).",
+            "in": "query",
+            "name": "interface",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by Interface (e.g. rest).",
+              "title": "Interface"
+            }
+          },
+          {
+            "description": "Only records at/after this RFC 3339 time.",
+            "in": "query",
+            "name": "created_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only records at/after this RFC 3339 time.",
+              "title": "Created After"
+            }
+          },
+          {
+            "description": "Only records at/before this RFC 3339 time.",
+            "in": "query",
+            "name": "created_before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only records at/before this RFC 3339 time.",
+              "title": "Created Before"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolCallLogList"
+                }
+              }
+            },
+            "description": "A page of this Workspace's Tool Call audit records, newest first."
+          },
+          "400": {
+            "description": "Unknown query parameter, bad limit/status, or an invalid cursor."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `audit:read` in this Workspace."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List the Workspace's Tool Call audit log",
+        "tags": [
+          "audit"
+        ]
+      },
+      "post": {
+        "description": "Execute one Tool Call synchronously and return its normalized result (or a safe error).\n\nThe Tool is named by canonical `tool_name`; the Connection is explicit (`connection_id`) or the\nsingle active one for the Connector (ambiguity is a 400, never a guess). Arguments are validated\nagainst the Tool's input schema before any egress. The credential is decrypted in memory for the\nsingle outbound request and never returned. An optional `Idempotency-Key` (a UUID) replays the\noriginal response on retry rather than executing twice.",
+        "operationId": "create_tool_call_v1_tool_calls_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ToolCallCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolCallResult"
+                }
+              }
+            },
+            "description": "The Tool Call succeeded; the normalized result and its audit id."
+          },
+          "400": {
+            "description": "Invalid arguments, ambiguous connection, or a bad Idempotency-Key."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller may not execute Tools, or egress was blocked (ssrf_blocked)."
+          },
+          "404": {
+            "description": "No such live Tool, or no matching active Connection."
+          },
+          "409": {
+            "description": "Connection not active / no credential, or an Idempotency-Key clash."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "502": {
+            "description": "The upstream API errored or the connector auth is misconfigured."
+          },
+          "504": {
+            "description": "The upstream API timed out."
+          }
+        },
+        "summary": "Execute a Tool Call",
+        "tags": [
+          "tool-calls"
+        ]
+      }
+    },
+    "/v1/tool-calls/{tool_call_id}": {
+      "get": {
+        "description": "One Tool Call audit record by id. Workspace-scoped: a foreign id is a uniform 404, so the\nendpoint is not a cross-tenant oracle. Returns redacted metadata only, never the body.",
+        "operationId": "get_tool_call_v1_tool_calls__tool_call_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tool_call_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tool Call Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolCallRead"
+                }
+              }
+            },
+            "description": "The Tool Call audit row (redacted metadata)."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller may not read Tool Calls in this Workspace."
+          },
+          "404": {
+            "description": "No such Tool Call in this Workspace."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Fetch a Tool Call audit record",
+        "tags": [
+          "tool-calls"
+        ]
+      }
+    },
+    "/v1/tools": {
+      "get": {
+        "description": "Page through this Workspace's live tools, newest first. The Workspace comes from the\nauthenticated context and appears in no parameter, so a cross-workspace listing is not a request\nthis API can express. Disabled tools are listed (still manageable); deprecated tools are not.",
+        "operationId": "list_tools_v1_tools_get",
+        "parameters": [
+          {
+            "description": "Page size. Defaults to 50, maximum 100.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "description": "Page size. Defaults to 50, maximum 100.",
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Opaque cursor from a prior page.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Opaque cursor from a prior page.",
+              "title": "Cursor"
+            }
+          },
+          {
+            "description": "Optional: only tools of this Connector.",
+            "in": "query",
+            "name": "connector_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional: only tools of this Connector.",
+              "title": "Connector Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolList"
+                }
+              }
+            },
+            "description": "A page of this Workspace's live tools (enabled and disabled)."
+          },
+          "400": {
+            "description": "Unknown query parameter, bad limit, or an invalid cursor."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `tools:execute` in this Workspace."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List the Workspace's Tools",
+        "tags": [
+          "tools"
+        ]
+      }
+    },
+    "/v1/tools/{tool_id}": {
+      "get": {
+        "description": "One Tool by id. Workspace-scoped: a foreign or deprecated id is a uniform 404, byte-identical\nto one that never existed, so the endpoint is not a cross-tenant oracle.",
+        "operationId": "get_tool_v1_tools__tool_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tool_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tool Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolRead"
+                }
+              }
+            },
+            "description": "The Tool metadata."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `tools:execute` in this Workspace."
+          },
+          "404": {
+            "description": "No such live tool in this Workspace."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get one Tool",
+        "tags": [
+          "tools"
+        ]
+      },
+      "patch": {
+        "description": "Enable or disable a Tool. `enabled` is the only mutable field \u2014 `extra=\"forbid\"` rejects any\nattempt to rewrite the name, description, schema, or connector identity (those come from\ningestion/promotion). Idempotent and race-safe; a disabled Tool cannot be executed by the\nRuntime, and a deprecated Tool is a uniform 404 (it cannot be revived here).",
+        "operationId": "update_tool_v1_tools__tool_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tool_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tool Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ToolUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolRead"
+                }
+              }
+            },
+            "description": "The updated Tool."
+          },
+          "400": {
+            "description": "Invalid body (only `enabled` is accepted)."
+          },
+          "401": {
+            "description": "Missing or invalid credentials."
+          },
+          "403": {
+            "description": "Caller does not hold `connectors:manage` in this Workspace."
+          },
+          "404": {
+            "description": "No such live tool in this Workspace."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Enable or disable a Tool",
+        "tags": [
+          "tools"
+        ]
+      }
+    },
+    "/v1/workspaces": {
+      "get": {
+        "description": "The workspaces the authenticated human belongs to, with their role in each (ADR-0016 \u00a77).\n\nHuman-only and pre-selection: a human calls this to discover what they may put in\n`X-Workspace-Id` before selecting a workspace, so it authenticates via the verified JWT\nsubject **without** binding a workspace. It reads only the caller's own memberships\nthrough the `auth.resolve_member_workspace_roles` bootstrap function \u2014 no other tenant's\nexistence, name, members, or metadata is reachable, and `role` is display-only (never an\nauthorization input). A machine token is not a human credential and fails the human\nverifier uniformly.",
+        "operationId": "list_my_workspaces_v1_workspaces_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MembershipList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List the authenticated human's own workspace memberships",
+        "tags": [
+          "workspaces"
+        ]
+      }
+    },
+    "/v1/workspaces/me": {
+      "get": {
+        "description": "Resolve the Workspace bound to the presented API token.\n\nThe canonical \"does my token work?\" probe: it exercises token resolution, tenant\nbinding, RLS, and the response envelope in one call.\n\nDeliberately does **not** carry `notification_email`. This endpoint authenticates with\n`CurrentWorkspace`, which every machine token satisfies, so a field added here is a field\nhanded to every MCP client holding a workspace token. The destination is read through the\n`workspace:manage` endpoint below instead (M2.10, ADR-0041).",
+        "operationId": "get_current_workspace_v1_workspaces_me_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceRead"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get the caller's Workspace",
+        "tags": [
+          "workspaces"
+        ]
+      },
+      "patch": {
+        "description": "Configure Connection Health failure notifications for the caller's own Workspace.\n\nThe Workspace is the one the caller is already authenticated against \u2014 there is no\n`workspace_id` in the path or the body, so this endpoint is structurally incapable of being\naimed at another tenant. `notification_email: null` (or an emptied field) disables\nnotifications; the Connection Health path then simply has nowhere to send and does not send.\n\n`extra=\"forbid\"` on the payload means this cannot become a general workspace mutator by\naccident: an attempt to set `plan`, `slug`, or `name` here is a 422, not a silent no-op.",
+        "operationId": "update_current_workspace_v1_workspaces_me_patch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkspaceNotificationUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceNotificationSettings"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The destination is not a valid email address."
+          },
+          "403": {
+            "description": "The caller does not hold workspace:manage (OWNER only)."
+          },
+          "404": {
+            "description": "Workspace not found."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set the Workspace's notification destination",
+        "tags": [
+          "workspaces"
+        ]
+      }
+    },
+    "/v1/workspaces/me/notification-settings": {
+      "get": {
+        "description": "Where this Workspace's Connection Health failure notifications are sent (M2.10).\n\nOWNER-only on both read and write: the value is an address a human typed, so exposing it to\nADMIN \u2014 let alone to a machine token \u2014 would widen PII for no operational gain.",
+        "operationId": "get_notification_settings_v1_workspaces_me_notification_settings_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceNotificationSettings"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "403": {
+            "description": "The caller does not hold workspace:manage (OWNER only)."
+          },
+          "404": {
+            "description": "Workspace not found."
+          }
+        },
+        "summary": "Read the Workspace's notification destination",
+        "tags": [
+          "workspaces"
+        ]
+      }
+    }
+  }
+}

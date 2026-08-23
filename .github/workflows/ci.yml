@@ -72,6 +72,17 @@ jobs:
       - run: pnpm lint
       - run: pnpm typecheck
 
+      # The API owns the contract; the frontend consumes a generated copy of it (ADR-0044 D2).
+      # This fails when `packages/types/src/generated/api.ts` no longer matches what the
+      # generator produces from the committed `openapi.json` — i.e. someone edited the schema
+      # (or the generated file) without regenerating. It writes to a temp directory and never
+      # mutates the checkout, so a failure leaves nothing behind to clean up.
+      #
+      # The other drift direction — the FastAPI app moved but `openapi.json` was not
+      # re-exported — is checked in the `api` job, which is where the Python app is installed.
+      - name: OpenAPI contract drift
+        run: pnpm --filter @omniai/types openapi:check
+
       # Same provisioning as infra/docker/postgres-init/02-identity-role.sh, which service
       # containers never run. Better Auth owns this schema and migrates it itself.
       - name: Provision the Better Auth identity schema
@@ -94,6 +105,16 @@ jobs:
           pnpm --filter web test
 
       - run: pnpm --filter web build
+
+      # The built client bundle — not the source — is the security boundary (ADR-0044). This
+      # runs *after* the build because it scans `.next/static`, and it refuses to pass when it
+      # finds zero artifacts rather than reporting a vacuous clean result. Its scanner proves
+      # itself against a planted canary first.
+      - name: Browser artifact secret scan
+        env:
+          NEXT_PUBLIC_APP_URL: http://localhost:3000
+          API_BASE_URL: http://localhost:8000
+        run: pnpm --filter web exec tsx --test tests/browser-artifact-secrets.test.mts
 
   api:
     name: API — lint, typecheck, test
@@ -267,6 +288,20 @@ jobs:
       - run: |
           export CREDENTIAL_MASTER_KEY="$(openssl rand -base64 32)"
           uv run pytest -q
+
+      # The second half of the OpenAPI drift gate (ADR-0044 D2). The `web` job proves the
+      # generated types match the committed schema; this proves the committed schema still
+      # matches the application. Without it, a backend response-model change would sail past
+      # a green frontend gate that was comparing two equally stale artifacts.
+      #
+      # Re-exports and diffs. It never commits — a difference is a failure telling the author
+      # to run `pnpm --filter @omniai/types openapi:export` and review the contract change.
+      - name: OpenAPI schema is current
+        run: |
+          export CREDENTIAL_MASTER_KEY="$(openssl rand -base64 32)"
+          uv run python ../../scripts/export-openapi.py
+          git diff --exit-code -- ../../packages/types/openapi.json \
+            || { echo "::error::openapi.json is stale — run: pnpm --filter @omniai/types openapi:export"; exit 1; }
 
   security:
     name: Security — secret scan
