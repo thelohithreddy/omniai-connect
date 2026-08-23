@@ -54,6 +54,15 @@ jobs:
     env:
       BETTER_AUTH_URL: http://localhost:3000
       BETTER_AUTH_DATABASE_URL: postgresql://omniai_identity:omniai_identity@localhost:5432/omniai
+      # `NEXT_PUBLIC_*` is compiled into the browser bundle, so it must exist at BUILD time.
+      # Required since MC1.3: `(dashboard)` is the first route to transitively import the API
+      # client, and `lib/env.ts` validates `publicEnv` eagerly on purpose ("a missing app URL
+      # should fail the build, not the first request that needs it"). `next build` evaluates every
+      # route module to collect page data, so without this the build fails with
+      # "Failed to collect configuration for /dashboard".
+      #
+      # A public URL, never a secret — no server-only variable belongs in this block.
+      NEXT_PUBLIC_APP_URL: http://localhost:3000
 
     steps:
       - uses: actions/checkout@v4
