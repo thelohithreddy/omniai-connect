@@ -41,7 +41,9 @@ def test_success_and_failure_carry_a_byte_identical_link() -> None:
     assert len(_hrefs(_success_html())) == 1
 
 
-def test_the_link_does_not_vary_with_any_provider_parameter(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_link_does_not_vary_with_any_provider_parameter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Anti-reflection: the renderers take no request input at all.
 
     `_success_html` and `_failure_html` accept no arguments, so there is no parameter for `code`,
