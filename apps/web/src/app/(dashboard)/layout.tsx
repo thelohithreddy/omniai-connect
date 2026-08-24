@@ -1,4 +1,8 @@
+import { headers } from "next/headers";
+import Link from "next/link";
 import type { ReactNode } from "react";
+
+import { REQUEST_PATH_HEADER } from "@/middleware";
 
 import { WorkspaceSwitcher } from "@/components/workspace-switcher";
 import { SignOutButton } from "@/components/sign-out-button";
@@ -30,7 +34,13 @@ export const dynamic = "force-dynamic";
 export default async function DashboardLayout({ children }: { children: ReactNode }) {
   // Order matters: authenticate first, then resolve tenancy. Resolving a workspace for an
   // unauthenticated caller would mean asking the API "who is this" with no identity to offer.
-  await requireSession("/dashboard");
+  //
+  // The return target is the path actually requested, taken from the header middleware sets from
+  // `nextUrl` — not a hardcoded "/dashboard", which sent anyone following a link to another
+  // dashboard route to the wrong page after signing in. It is still validated by `safeNextPath`
+  // inside `requireSession`, so a bad value degrades to a plain "/sign-in" rather than becoming a
+  // redirect target.
+  await requireSession((await headers()).get(REQUEST_PATH_HEADER) ?? "/dashboard");
 
   const resolution = await resolveWorkspace();
 
@@ -39,13 +49,27 @@ export default async function DashboardLayout({ children }: { children: ReactNod
       <header className="border-b border-border">
         <Container>
           <div className="flex h-14 items-center justify-between gap-4">
-            <span className="font-semibold">OmniAI Connect</span>
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-6">
+              <span className="font-semibold">OmniAI Connect</span>
               {/*
-                Rendered for every authenticated member regardless of role (ADR-0044 §5): hiding
-                navigation teaches nothing and makes the product feel broken, while the route
-                itself is still gated server-side by the API's answer.
+                Navigation is rendered for **every** authenticated member, including the MEMBER and
+                VIEWER roles that `audit:read` refuses (ADR-0044 D5). Hiding the link would buy no
+                secrecy — the feature is in public product material — while making the product feel
+                broken and the nav reflow on every workspace switch. The route itself is gated by
+                the API's 403, which it renders as an explicit "requires Owner or Admin" state.
               */}
+              {resolution.ok ? (
+                <nav aria-label="Control plane" className="flex items-center gap-4 text-sm">
+                  <Link href="/dashboard" className="text-muted-foreground hover:text-foreground">
+                    Overview
+                  </Link>
+                  <Link href="/logs" className="text-muted-foreground hover:text-foreground">
+                    Tool Call log
+                  </Link>
+                </nav>
+              ) : null}
+            </div>
+            <div className="flex items-center gap-3">
               <WorkspaceSwitcher
                 memberships={resolution.ok ? resolution.context.memberships : resolution.memberships}
                 activeWorkspaceId={resolution.ok ? resolution.context.workspaceId : null}

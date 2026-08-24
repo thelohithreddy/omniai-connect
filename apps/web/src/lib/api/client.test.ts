@@ -21,7 +21,9 @@ vi.mock("@/lib/api/transport", () => ({
   apiRequest: (...args: unknown[]) => apiRequest(...args),
 }));
 
-const { acceptInvitation, listMyWorkspaces, getCurrentWorkspace } = await import("./client");
+const { acceptInvitation, listMyWorkspaces, getCurrentWorkspace, listToolCalls } = await import(
+  "./client"
+);
 
 beforeEach(() => {
   apiRequest.mockReset().mockResolvedValue({});
@@ -56,6 +58,41 @@ describe("the invitation token stays out of the URL", () => {
     expect(request.path).toBe("/v1/invitations/accept");
     expect(JSON.stringify(request.query ?? {})).not.toContain("token-value");
     expect(request.method).toBe("POST");
+  });
+});
+
+describe("the audit log call stays workspace-bound (MC1.4)", () => {
+  test("listToolCalls does not opt out of the workspace requirement", async () => {
+    // The whole point of the audit surface: without a bound workspace the transport must refuse
+    // rather than ask the API for "the caller's tool calls" with nothing selected.
+    await listToolCalls({ headers: new Headers(), workspaceId: "w1" }, { limit: 25 });
+
+    const request = apiRequest.mock.calls[0]![0] as Record<string, unknown>;
+    expect(request.allowMissingWorkspace).toBeUndefined();
+    expect(request.method).toBe("GET");
+    expect(request.path).toBe("/v1/tool-calls");
+  });
+
+  test("the opaque cursor is passed through verbatim, never reconstructed", async () => {
+    const cursor = "eyJvZmZzZXQiOjI1fQ==";
+    await listToolCalls({ headers: new Headers(), workspaceId: "w1" }, { limit: 25, cursor });
+
+    const request = apiRequest.mock.calls[0]![0] as Record<string, unknown>;
+    expect((request.query as Record<string, unknown>).cursor).toBe(cursor);
+  });
+
+  test("a caller cannot smuggle a workspace override into the query", async () => {
+    // `workspaceId` travels as a header the transport controls. Even if a query key named
+    // `workspace_id` were supplied, it must not become the tenant — the transport's own tests
+    // assert the header wins, and this asserts the client never invents such a key itself.
+    await listToolCalls({ headers: new Headers(), workspaceId: "w1" }, { limit: 25 });
+
+    const query = (apiRequest.mock.calls[0]![0] as Record<string, unknown>).query as Record<
+      string,
+      unknown
+    >;
+    expect(Object.keys(query)).not.toContain("workspace_id");
+    expect(Object.keys(query)).not.toContain("workspaceId");
   });
 });
 
