@@ -5,7 +5,7 @@
   "description": "Connect Any API. Use It From Any AI.",
   "packageManager": "pnpm@9.15.0",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "scripts": {
     "dev": "turbo run dev",

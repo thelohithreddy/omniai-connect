@@ -1,5 +1,5 @@
 # OmniAI Connect Web — Next.js
-FROM node:20-alpine AS base
+FROM node:22-alpine AS base
 RUN corepack enable
 WORKDIR /repo
 
@@ -42,7 +42,7 @@ ENV NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL}
 RUN pnpm --filter web build
 
 # ---- production ----
-FROM node:20-alpine AS prod
+FROM node:22-alpine AS prod
 WORKDIR /app
 ENV NODE_ENV=production
 COPY --from=build /repo/apps/web/.next/standalone ./

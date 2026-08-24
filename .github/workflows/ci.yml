@@ -72,7 +72,7 @@ jobs:
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: pnpm
       # --frozen-lockfile: fail on lockfile drift rather than silently resolving to
       # different versions than a developer has locally (P-59). The previous
@@ -126,10 +126,6 @@ jobs:
 
       - run: pnpm --filter web build
 
-      # The built client bundle — not the source — is the security boundary (ADR-0044). This
-      # runs *after* the build because it scans `.next/static`, and it refuses to pass when it
-      # finds zero artifacts rather than reporting a vacuous clean result. Its scanner proves
-      # itself against a planted canary first.
       # Re-runs the one Vitest file that needs build output (MC1.3). The main `test:unit` step
       # deliberately runs before the build for fast feedback, and this file skips loudly when
       # `.next/prerender-manifest.json` is absent — so without this step it would skip on every
@@ -144,11 +140,15 @@ jobs:
           NEXT_PUBLIC_APP_URL: http://localhost:3000
         run: pnpm --filter web exec vitest run src/app/rendering-mode.test.ts
 
+      # The built client bundle — not the source — is the security boundary (ADR-0044). This
+      # runs *after* the build because it scans `.next/static`, and it refuses to pass when it
+      # finds zero artifacts rather than reporting a vacuous clean result. Its scanner proves
+      # itself against a planted canary first.
       - name: Browser artifact secret scan
         env:
           NEXT_PUBLIC_APP_URL: http://localhost:3000
           API_BASE_URL: http://localhost:8000
-        run: pnpm --filter web exec tsx --test tests/browser-artifact-secrets.test.mts
+        run: pnpm --filter web exec tsx --test tests/post-build/browser-artifact-secrets.test.mts
 
   api:
     name: API — lint, typecheck, test
@@ -231,7 +231,7 @@ jobs:
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: pnpm
 
       # Create Better Auth's tables before the Alembic steps below, for two reasons.

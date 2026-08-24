@@ -20,7 +20,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, test } from "node:test";
 
-const webRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+const webRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 /** What the browser is actually served. `.next/server` is deliberately excluded. */
 const CLIENT_DIRS = [join(webRoot, ".next", "static")];
 

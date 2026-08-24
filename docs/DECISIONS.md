@@ -2928,3 +2928,62 @@ vocabulary so a future value is additive).
 **Non-goals.** `client_credentials` (ADR-0043 B2 — MC1 has no dependency on it), FastMCP, MCP
 streaming, `listChanged`, `webhooks_outbox`, F2/F3 remediation, billing, marketing site, prebuilt
 connectors, and any M3 work.
+
+---
+
+## ADR-0045 — Node 22 LTS is the runtime baseline for CI, Docker and development
+
+**Status:** Accepted · **Date:** 2026-08-24 · **Relates to:** ADR-0002 (Better Auth runs in the
+Next tier), ADR-0044 (MC1 test lanes) · **Supersedes:** the implicit `node:20` baseline
+
+**Context.** The repository pinned Node 20 in three independent places — `actions/setup-node` in
+both CI jobs, `node:20-alpine` in `infra/docker/web.Dockerfile` (build *and* production stages),
+and `engines.node: ">=20"` — while developers ran newer Node locally. Two problems surfaced
+together during the MC1.3 release audit.
+
+**Node 20 reached end of life on 2026-04-30.** As of this decision it has been unsupported for
+almost four months, so the *production* web image was running a runtime that receives no security
+patches. That is the material fact here, and it is independent of any test failure.
+
+**The test failure that exposed it.** `apps/web/tests/api-transport.test.mts` (MC1.1) stubs the
+auth provider by pre-populating `require.cache`, then relies on the transport's
+`await import("@/lib/auth")` resolving through the CJS registry. Under Node 20 that dynamic import
+is served by the ESM loader, which keeps its own registry and never consults `require.cache`, so
+the real Better Auth module is evaluated, no session exists, and 29 tests fail with the transport's
+uniform `unauthenticated` result. Measured: **Node 20 → 9 pass / 20 fail; Node 22 → 29 / 0;
+Node 24 → 29 / 0.**
+
+This had been failing on `main` since MC1.1 was promoted (`525560c`, then `9dd0aae`). It was never
+seen because those releases were audited on a developer machine running Node 26 and promoted
+without inspecting GitHub Actions. The lesson is recorded in ENGINEERING_PRINCIPLES terms: a local
+green result is evidence about the developer's machine, not about the product.
+
+**Decision.** Node **22 LTS** is the single baseline: `setup-node` in both CI jobs,
+`node:22-alpine` for both web image stages, and `engines.node: ">=22"`.
+
+**Why 22 and not 24.** Both pass the full suite. Node 22 is the conservative Active LTS with the
+longer production track record for Next 15 and Better Auth, and it is supported until 2027-04-30 —
+enough runway that this is not a recurring migration. Moving two majors at once would enlarge the
+change surface without buying anything the blocker requires. A later 22 → 24 step is small and
+independent.
+
+**Why not rewrite the MC1.1 stub instead.** That was the considered alternative and it was
+rejected: it fixes the symptom while leaving an end-of-life runtime in production, it modifies an
+audited security test to accommodate an unsupported platform, and the resulting test would still
+depend on module-registry behaviour rather than on anything guaranteed. Keeping the stub means the
+transport keeps zero test-only branches in shipping code, which is the property MC1.1 was designed
+around.
+
+**Consequences.** `pnpm install --frozen-lockfile` is unchanged; no dependency is added or
+removed. `jsdom` stays pinned at 29 (pinned during this same recovery when Node 20 was still the
+baseline) — 29 is fully supported on 22 and re-floating it is churn without benefit.
+`packages/types` and the Python API are untouched; `api.Dockerfile` is `python:3.11-slim` and
+carries no Node.
+
+**Verification.** The transport suite and the Vitest lane were run inside `node:22-alpine` and
+`node:24-alpine` containers with a clean `--frozen-lockfile` install, not merely on the developer's
+Node 26. The authoritative check is the GitHub Actions result on the pushed SHA.
+
+**Future impact.** The runtime that CI tests, the runtime the image ships, and the runtime
+`engines` advertises are now one version. Any future divergence should be treated as a defect,
+because this incident is what divergence costs: two releases promoted onto a red trunk.
