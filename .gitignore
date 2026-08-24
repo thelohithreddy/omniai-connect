@@ -41,7 +41,12 @@ htmlcov/
 
 # Logs
 *.log
-logs/
+# Root-anchored on purpose. A bare `logs/` matches a directory of that name at ANY depth, which
+# silently swallowed `apps/web/src/app/(dashboard)/logs/` — the audit-viewer route FRONTEND_SPEC §1
+# names explicitly. `git add -A` skipped it without a word, and CI would have built an application
+# with no /logs route at all. Runtime log output only ever lands at the repository root, so
+# anchoring loses nothing and stops the pattern reaching source directories.
+/logs/
 
 # Misc
 .vercel

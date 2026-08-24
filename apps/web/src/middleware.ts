@@ -38,6 +38,15 @@ import { buildSecurityHeaders } from "@/lib/security/headers";
 export const CSP_REPORT_ONLY_HEADER = "Content-Security-Policy-Report-Only";
 
 /**
+ * Carries the requested path to the renderer (MC1.4).
+ *
+ * Written by middleware from `nextUrl`, never read from the incoming request, so a client cannot
+ * influence it. Consumers still validate it with `safeNextPath` before navigating — a path used to
+ * build a redirect is exactly where an unvalidated value becomes an open redirect.
+ */
+export const REQUEST_PATH_HEADER = "x-omniai-path";
+
+/**
  * Generate a 128-bit nonce as base64.
  *
  * `crypto.getRandomValues` rather than `node:crypto` because middleware runs on the Edge runtime,
@@ -90,6 +99,14 @@ export function middleware(request: NextRequest): NextResponse {
   const requestHeaders = new Headers(request.headers);
   requestHeaders.set(CSP_REPORT_ONLY_HEADER, policy);
   requestHeaders.set("x-nonce", nonce);
+  /*
+    The requested path, so a server component can build an accurate sign-in return target
+    (MC1.4). A layout cannot otherwise see its own URL, and MC1.3 hardcoded "/dashboard" — which
+    meant an emailed link to any other dashboard route silently landed the user somewhere else
+    after signing in. Set from `nextUrl`, which is the framework's parsed path rather than a
+    client-supplied header, and still passed through `safeNextPath` before it is used to navigate.
+  */
+  requestHeaders.set(REQUEST_PATH_HEADER, request.nextUrl.pathname);
 
   const response = relocation ?? NextResponse.next({ request: { headers: requestHeaders } });
 

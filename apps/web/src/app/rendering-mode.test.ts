@@ -25,6 +25,8 @@ import { describe, expect, test } from "vitest";
 
 const WEB_ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 const MANIFEST = join(WEB_ROOT, ".next", "prerender-manifest.json");
+/** The build's own record of which routes exist, used to prove the dynamic list is not vacuous. */
+const APP_ROUTES = join(WEB_ROOT, ".next", "app-path-routes-manifest.json");
 
 /**
  * Public routes that carry no user or workspace data and are allowed to be static.
@@ -35,8 +37,14 @@ const MANIFEST = join(WEB_ROOT, ".next", "prerender-manifest.json");
  */
 const STATIC_ALLOWLIST = ["/", "/_not-found"];
 
-/** Routes that must never be prerendered, because they depend on a session or a workspace. */
-const MUST_BE_DYNAMIC = ["/dashboard", "/sign-in", "/sign-up", "/accept-invite"];
+/**
+ * Routes that must never be prerendered, because they depend on a session or a workspace.
+ *
+ * `/logs` (MC1.4) is the sharpest case in this list: it renders workspace-scoped audit records
+ * that only OWNER and ADMIN may read. Prerendering it would build one copy at deploy time, with
+ * no session, and serve it to every caller of every workspace.
+ */
+const MUST_BE_DYNAMIC = ["/dashboard", "/logs", "/sign-in", "/sign-up", "/accept-invite"];
 
 describe("rendering mode", () => {
   if (!existsSync(MANIFEST)) {
@@ -48,6 +56,21 @@ describe("rendering mode", () => {
     (JSON.parse(readFileSync(MANIFEST, "utf8")) as { routes?: Record<string, unknown> }).routes ??
       {},
   );
+
+  test("every route that must be dynamic actually exists in the build", () => {
+    // Guards against a vacuous pass. `MUST_BE_DYNAMIC` asserts routes are *absent* from the
+    // prerender manifest, which is trivially true for a route that was never built at all — and
+    // that is not hypothetical: a bare `logs/` pattern in .gitignore silently excluded the entire
+    // audit-viewer directory from the repository, so CI would have tested an application with no
+    // /logs route while this file reported success.
+    // The manifest maps source module -> served route, so the routes are the values.
+    const built = Object.values(
+      JSON.parse(readFileSync(APP_ROUTES, "utf8")) as Record<string, string>,
+    );
+
+    const missing = MUST_BE_DYNAMIC.filter((route) => !built.includes(route));
+    expect(missing, "a route that does not exist cannot be proven dynamic").toEqual([]);
+  });
 
   test("no authenticated or workspace-scoped route is prerendered", () => {
     const leaked = MUST_BE_DYNAMIC.filter((route) => prerendered.includes(route));
