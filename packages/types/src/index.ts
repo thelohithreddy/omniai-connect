@@ -68,6 +68,15 @@ export type WorkspaceNotificationUpdate = Schemas["WorkspaceNotificationUpdate"]
 export type ToolCallLogRead = Schemas["ToolCallLogRead"];
 export type ToolCallLogList = Schemas["ToolCallLogList"];
 
+/**
+ * A Connection as the control plane sees it (MC1.5).
+ *
+ * `needs_reauth` is **derived** by the API (`status == 'error'` and an oauth2 credential), not a
+ * fifth status — ADR-0038 D5. The frontend renders it and never recomputes it.
+ */
+export type ConnectionRead = Schemas["ConnectionRead"];
+export type ConnectionList = Schemas["ConnectionList"];
+
 /** One Connection health check result. Classified metadata only — never a provider body. */
 export type ConnectionHealthRead = Schemas["ConnectionHealthRead"];
 

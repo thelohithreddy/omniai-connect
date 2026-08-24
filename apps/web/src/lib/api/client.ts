@@ -19,6 +19,7 @@ import type {
   AcceptedInvitation,
   AuthorizeStartRead,
   ConnectionHealthRead,
+  ConnectionList,
   MembershipList,
   ToolCallLogList,
   ToolCallLogRead,
@@ -166,6 +167,28 @@ export function testConnection(
     method: "POST",
     path: `/v1/connections/${encodeURIComponent(connectionId)}/test`,
     identity,
+  });
+}
+
+// ---------------------------------------------------------------------------------- connections
+
+/**
+ * The Workspace's Connections (MC1.5).
+ *
+ * Workspace-scoped, so it keeps the transport's default requirement: without a bound workspace the
+ * call must fail closed rather than ask the API for "the caller's connections" with nothing
+ * selected. `needs_reauth` arrives derived by the API (ADR-0038 D5) and is rendered, never
+ * recomputed here.
+ */
+export function listConnections(
+  identity: RequestIdentity,
+  query: { limit?: number; cursor?: string } = {},
+): Promise<ConnectionList> {
+  return apiRequest<ConnectionList>({
+    method: "GET",
+    path: "/v1/connections",
+    identity,
+    query: { ...query },
   });
 }
 
