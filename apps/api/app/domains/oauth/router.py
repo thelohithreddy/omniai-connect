@@ -18,6 +18,7 @@ attacker-controlled interpolation — only static text plus the outcome.
 from __future__ import annotations
 
 import uuid
+from html import escape
 from typing import Annotated, Final
 
 from fastapi import APIRouter, Depends, Query, Response
@@ -25,6 +26,7 @@ from fastapi.responses import HTMLResponse
 
 from app.core.authorization import require_permission
 from app.core.authz import Permission
+from app.core.config import settings
 from app.core.db import UnitOfWork, get_uow
 from app.core.exceptions import DomainError
 from app.core.logging import get_logger
@@ -41,21 +43,46 @@ AuthorizedConnectionManager = Annotated[
     WorkspaceContext, Depends(require_permission(Permission.CONNECTIONS_MANAGE))
 ]
 
-_SUCCESS_HTML: Final = (
-    "<!doctype html><html><head><title>Connection authorized</title>"
-    '<meta name="robots" content="noindex"></head><body>'
-    "<h1>Connection authorized</h1>"
-    "<p>You can close this window and return to OmniAI Connect.</p>"
-    "</body></html>"
-)
-_FAILURE_HTML: Final = (
-    "<!doctype html><html><head><title>Authorization failed</title>"
-    '<meta name="robots" content="noindex"></head><body>'
-    "<h1>Authorization failed</h1>"
-    "<p>This authorization link is invalid or has expired. "
-    "Start the connection again from OmniAI Connect.</p>"
-    "</body></html>"
-)
+
+def _return_link() -> str:
+    """The control plane's Connections page, from configuration alone (ADR-0044 D1).
+
+    The href is a **server constant**. It is not derived from `code`, `state`, any query parameter
+    or the consumed state row, so no attacker-influencable value can reach it — which is what keeps
+    open-redirect structurally impossible here rather than merely guarded. `escape` is belt and
+    braces: the value is operator-set, but a configuration string still has no business being
+    interpolated into markup unescaped.
+
+    Deliberately still **not a redirect**. ADR-0044 D1 keeps the terminal page terminal: a 302
+    carrying an outcome would begin to differentiate the failure modes this page deliberately makes
+    identical, and would couple the API's response contract to the frontend's deployment.
+    """
+    return escape(f"{settings.next_public_app_url.rstrip('/')}/connections", quote=True)
+
+
+def _success_html() -> str:
+    return (
+        "<!doctype html><html><head><title>Connection authorized</title>"
+        '<meta name="robots" content="noindex"></head><body>'
+        "<h1>Connection authorized</h1>"
+        "<p>You can close this window and return to OmniAI Connect.</p>"
+        f'<p><a href="{_return_link()}">Return to your connections</a></p>'
+        "</body></html>"
+    )
+
+
+def _failure_html() -> str:
+    return (
+        "<!doctype html><html><head><title>Authorization failed</title>"
+        '<meta name="robots" content="noindex"></head><body>'
+        "<h1>Authorization failed</h1>"
+        "<p>This authorization link is invalid or has expired. "
+        "Start the connection again from OmniAI Connect.</p>"
+        f'<p><a href="{_return_link()}">Return to your connections</a></p>'
+        "</body></html>"
+    )
+
+
 #: The address bar holds a spent code; never let an intermediary or the browser cache this page.
 _NO_STORE: Final = {"Cache-Control": "no-store", "Pragma": "no-cache"}
 
@@ -113,7 +140,7 @@ async def oauth_callback(
         # RFC 6749 §4.1.2.1: the user denied consent, or the redirect is malformed. Log the
         # provider's error *code* only (never its description, which can echo request data).
         log.info("oauth.callback_rejected", provider_error=error or "missing_parameters")
-        return HTMLResponse(_FAILURE_HTML, status_code=400, headers=_NO_STORE)
+        return HTMLResponse(_failure_html(), status_code=400, headers=_NO_STORE)
 
     try:
         await complete_callback(uow, code=code, state=state)
@@ -126,8 +153,8 @@ async def oauth_callback(
         # propagate would roll the consume back and hand an attacker a replay window on a state
         # that has already been presented. Nothing partial is committed with it — the only write
         # after the consume is the credential seal, which happens after a successful exchange.
-        return HTMLResponse(_FAILURE_HTML, status_code=400, headers=_NO_STORE)
-    return HTMLResponse(_SUCCESS_HTML, status_code=200, headers=_NO_STORE)
+        return HTMLResponse(_failure_html(), status_code=400, headers=_NO_STORE)
+    return HTMLResponse(_success_html(), status_code=200, headers=_NO_STORE)
 
 
 __all__ = ["oauth_router"]

@@ -44,7 +44,14 @@ const STATIC_ALLOWLIST = ["/", "/_not-found"];
  * that only OWNER and ADMIN may read. Prerendering it would build one copy at deploy time, with
  * no session, and serve it to every caller of every workspace.
  */
-const MUST_BE_DYNAMIC = ["/dashboard", "/logs", "/sign-in", "/sign-up", "/accept-invite"];
+const MUST_BE_DYNAMIC = [
+  "/dashboard",
+  "/logs",
+  "/connections",
+  "/sign-in",
+  "/sign-up",
+  "/accept-invite",
+];
 
 describe("rendering mode", () => {
   if (!existsSync(MANIFEST)) {

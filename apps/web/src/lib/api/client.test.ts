@@ -21,9 +21,8 @@ vi.mock("@/lib/api/transport", () => ({
   apiRequest: (...args: unknown[]) => apiRequest(...args),
 }));
 
-const { acceptInvitation, listMyWorkspaces, getCurrentWorkspace, listToolCalls } = await import(
-  "./client"
-);
+const { acceptInvitation, listMyWorkspaces, getCurrentWorkspace, listToolCalls, listConnections } =
+  await import("./client");
 
 beforeEach(() => {
   apiRequest.mockReset().mockResolvedValue({});
@@ -93,6 +92,17 @@ describe("the audit log call stays workspace-bound (MC1.4)", () => {
     >;
     expect(Object.keys(query)).not.toContain("workspace_id");
     expect(Object.keys(query)).not.toContain("workspaceId");
+  });
+});
+
+describe("connections stay workspace-bound (MC1.5)", () => {
+  test("listConnections does not opt out of the workspace requirement", async () => {
+    await listConnections({ headers: new Headers(), workspaceId: "w1" }, { limit: 50 });
+
+    const request = apiRequest.mock.calls[0]![0] as Record<string, unknown>;
+    expect(request.allowMissingWorkspace).toBeUndefined();
+    expect(request.path).toBe("/v1/connections");
+    expect(request.method).toBe("GET");
   });
 });
 

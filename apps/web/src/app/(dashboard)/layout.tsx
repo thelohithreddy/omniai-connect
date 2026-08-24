@@ -63,6 +63,9 @@ export default async function DashboardLayout({ children }: { children: ReactNod
                   <Link href="/dashboard" className="text-muted-foreground hover:text-foreground">
                     Overview
                   </Link>
+                  <Link href="/connections" className="text-muted-foreground hover:text-foreground">
+                    Connections
+                  </Link>
                   <Link href="/logs" className="text-muted-foreground hover:text-foreground">
                     Tool Call log
                   </Link>
