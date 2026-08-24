@@ -53,6 +53,13 @@ export type WorkspaceRead = Schemas["WorkspaceRead"];
 export type MembershipRead = Schemas["MembershipRead"];
 export type MembershipList = Schemas["MembershipList"];
 
+/**
+ * What an invitation recipient joined (MC1.3, ADR-0017): the workspace and the granted role.
+ * Deliberately carries no invitation detail — the API discloses nothing about the invitation
+ * itself, and the acceptance surface has nothing extra to leak.
+ */
+export type AcceptedInvitation = Schemas["AcceptedInvitation"];
+
 /** The Workspace's notification destination. OWNER-only on read and write (ADR-0042). */
 export type WorkspaceNotificationSettings = Schemas["WorkspaceNotificationSettings"];
 export type WorkspaceNotificationUpdate = Schemas["WorkspaceNotificationUpdate"];

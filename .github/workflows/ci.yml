@@ -54,6 +54,15 @@ jobs:
     env:
       BETTER_AUTH_URL: http://localhost:3000
       BETTER_AUTH_DATABASE_URL: postgresql://omniai_identity:omniai_identity@localhost:5432/omniai
+      # `NEXT_PUBLIC_*` is compiled into the browser bundle, so it must exist at BUILD time.
+      # Required since MC1.3: `(dashboard)` is the first route to transitively import the API
+      # client, and `lib/env.ts` validates `publicEnv` eagerly on purpose ("a missing app URL
+      # should fail the build, not the first request that needs it"). `next build` evaluates every
+      # route module to collect page data, so without this the build fails with
+      # "Failed to collect configuration for /dashboard".
+      #
+      # A public URL, never a secret — no server-only variable belongs in this block.
+      NEXT_PUBLIC_APP_URL: http://localhost:3000
 
     steps:
       - uses: actions/checkout@v4
@@ -63,7 +72,7 @@ jobs:
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: pnpm
       # --frozen-lockfile: fail on lockfile drift rather than silently resolving to
       # different versions than a developer has locally (P-59). The previous
@@ -117,6 +126,20 @@ jobs:
 
       - run: pnpm --filter web build
 
+      # Re-runs the one Vitest file that needs build output (MC1.3). The main `test:unit` step
+      # deliberately runs before the build for fast feedback, and this file skips loudly when
+      # `.next/prerender-manifest.json` is absent — so without this step it would skip on every
+      # CI run and the invariant it guards would be silently unenforced.
+      #
+      # What it guards is not cosmetic: that no authenticated or workspace-scoped route is
+      # statically prerendered (a prerendered authenticated page is built once, with no session,
+      # then served to everyone), and that the set of static routes stays exactly the reviewed
+      # allowlist — every entry on it being a route F6 will break when MC1.8 enforces CSP.
+      - name: Rendering-mode invariants (needs build output)
+        env:
+          NEXT_PUBLIC_APP_URL: http://localhost:3000
+        run: pnpm --filter web exec vitest run src/app/rendering-mode.test.ts
+
       # The built client bundle — not the source — is the security boundary (ADR-0044). This
       # runs *after* the build because it scans `.next/static`, and it refuses to pass when it
       # finds zero artifacts rather than reporting a vacuous clean result. Its scanner proves
@@ -125,7 +148,7 @@ jobs:
         env:
           NEXT_PUBLIC_APP_URL: http://localhost:3000
           API_BASE_URL: http://localhost:8000
-        run: pnpm --filter web exec tsx --test tests/browser-artifact-secrets.test.mts
+        run: pnpm --filter web exec tsx --test tests/post-build/browser-artifact-secrets.test.mts
 
   api:
     name: API — lint, typecheck, test
@@ -208,7 +231,7 @@ jobs:
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: pnpm
 
       # Create Better Auth's tables before the Alembic steps below, for two reasons.
